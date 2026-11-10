@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible problem with the-pilot.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities, follow SECURITY.md instead of posting details here. Redact secrets, private paths, and sensitive session transcripts from all examples and logs."
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Which the-pilot release or commit are you using?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, Orca version, and host agent CLI (Antigravity, Claude Code, Codex) if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include the exact command or trailing autopilot tag and a minimal, sanitized profile/project overlay example.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exit code and relevant redacted output from `pilot status --json` or `pilot log`.
+    validations:
+      required: true

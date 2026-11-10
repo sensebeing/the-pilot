@@ -5,11 +5,30 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "the-pilot"
 version = "0.1.0"
-description = "Scene-based turn automation and Orca orchestration governance"
+description = "Scene-based Turn Autopilot and Orca Coordinator/Worker governance for AI coding sessions"
 requires-python = ">=3.11"
-dependencies = []
 license = "MIT"
 readme = "README.md"
+authors = [{name = "SenseBeing"}]
+dependencies = []
+keywords = ["ai-coding", "coding-agents", "orca", "turn-autopilot", "workflow-automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/sensebeing/the-pilot"
+Repository = "https://github.com/sensebeing/the-pilot"
+Issues = "https://github.com/sensebeing/the-pilot/issues"
+Changelog = "https://github.com/sensebeing/the-pilot/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pilot = "the_pilot.cli:main"

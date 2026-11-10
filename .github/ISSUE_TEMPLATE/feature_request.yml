@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose an improvement to Turn Autopilot or Orca orchestration governance.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: What concrete multi-turn workflow or Coordinator/Worker invariant is underserved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the desired observable outcome and the owner module of any new decision.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Could an existing preset, profile setting, or `.pilot/project.json` overlay address the problem more simply?
+  - type: textarea
+    id: verification
+    attributes:
+      label: Acceptance criteria
+      description: How would you verify the improvement offline while preserving delivery safety gates?
