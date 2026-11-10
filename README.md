@@ -49,7 +49,7 @@ PreInvocation → shortcut/worker reload → agent turn → Stop → Orca termin
 
 The coordinator owns intent, architecture and review. Workers implement in their
 assigned branches and report completion. The runtime mechanically gates delivery
-on answered questions, visible candidates, turn limits and session locks. It
+on answered questions, structured tag candidates, turn limits and session locks. It
 never replaces the agent's semantic judgment or grants deployment/send authority.
 Pending/unknown delivery remains reserved until a new user turn or explicit
 recovery; ambiguous effects are never automatically replayed.
@@ -111,7 +111,7 @@ Personal preferences remain in `profile.json`; an overlay never replaces them.
 | `pilot sync` | Refresh guidance from installed scene files |
 | `pilot set r 'Review {arg}'` | Persist a shortcut template |
 | `pilot log` | Inspect delivery events |
-| `,1`, `,2`, `,3` | Select visible candidates |
+| `,1`, `,2`, `,3` | Select structured tag candidates |
 | `,autopilot recover` | Explicit recovery from ambiguous delivery |
 
 Installer commands accept `--gemini-dir`; runtime commands use
@@ -131,7 +131,7 @@ guard review --repo-root .
 
 Tests use temporary roots, fake Orca and explicit isolation. The imported
 regression suite covers question settlement, transcript hydration, delivery
-locking, candidate parsing and executor hot reload. Frozen pre-extraction
+locking, candidate parsing and executor hot reload. Reviewed compilation
 hashes verify all artifacts across presets, delivery strategies, notification
 preferences and custom shortcuts. They are evidence, not another compiler.
 

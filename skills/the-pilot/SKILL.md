@@ -19,8 +19,13 @@ skill. Inspect `pilot --help` and subcommand help for current argument syntax.
   checking what the previous send actually did. Never blindly replay a send.
 
 The model owns scene and intent decisions; the runtime owns mechanical delivery,
-question settlement, turn limits and session locking. Visible suggestions are
-the execution source; hidden tags cannot introduce an unseen candidate.
+question settlement, turn limits and session locking. Visible `,1` / `,2` lines
+are human display only. The single trailing structured JSON comment is the sole
+execution source, parsed with `json.loads`:
+`<!-- autopilot: {"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"} -->`.
+Omit optional alternatives when absent. For no next step, use
+`<!-- autopilot: {"scene": "NONE"} -->` (legacy `<!-- autopilot: scene=NONE -->`
+is also accepted). Earlier prose and code examples are not candidates.
 Do not invent authorization from a scene or change existing write safety gates.
 
 Runtime commands select the installation with `ORCA_AUTOPILOT_GEMINI_DIR`.

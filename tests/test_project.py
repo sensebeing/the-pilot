@@ -3,7 +3,7 @@
 resident-fact: settlement: installed overlays survive cwd changes and upgrades;
 explicit universal selection and uninstall remove only the owned project link.
 resident-fact: admission: invalid overlays cannot escape scene paths or write an
-installation; project compilation is byte-identical to the pre-extraction owner.
+installation; project compilation matches the reviewed structured-tag contract.
 """
 import copy
 import hashlib
@@ -55,8 +55,10 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0 if ok else 2, result.stderr)
         return json.loads(result.stdout)
 
-    def test_legacy_bytes_and_parallel_project_isolation(self):
+    def test_compiled_contract_and_parallel_project_isolation(self):
         baseline = json.loads((FIXTURES / "legacy-compilation.json").read_text())
+        self.assertEqual(hashlib.sha256((ROOT / "src/the_pilot/assets/autopilot.py").read_bytes()).hexdigest(),
+                         baseline["runtime_sha256"])
         for case in baseline["cases"]:
             with self.subTest(preset=case["preset"], overrides=case["overrides"]):
                 profile = resolve_profile(self.base, preset=case["preset"],

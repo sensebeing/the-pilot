@@ -5,7 +5,7 @@ The engine is deliberately small and mechanical:
 
 * PreInvocation expands `,mode`, `,1`/`,2`/`,3`, custom `,` commands and the
   short entry commands, then records whether the new turn was auto-submitted.
-* Stop reads the visible suggestion the model already showed, stores the
+* Stop reads the trailing structured suggestion tag, stores the
   candidates and asks Orca to pre-fill (or submit) exactly that sentence.
 * Everything durable lives in `profile.json` (preferences) and a per-session
   JSON file (conversation turn state). No delivery ledger, no install marker.
@@ -22,7 +22,6 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -70,11 +69,6 @@ STRUCTURED_ANSWER_TOOLS = frozenset({"AskUserQuestion", "request_user_input"})
 STRUCTURED_COMPLETED_STATUSES = frozenset(
     {"ok", "done", "completed", "answered", "submitted"}
 )
-# The runtime prefixes a tool response with `Created At:` / `Completed At:`
-# lines; they timestamp the call and are not part of the user's answer.
-RESPONSE_HEADER_RE = re.compile(r"^(?:Created|Completed)\s+At\s*:", re.IGNORECASE)
-# Owner receipt for `ask_question`: `A1: <answer>` followed by continuation lines.
-QUESTION_ANSWER_HEADER_RE = re.compile(r"^A([1-9]\d*):(?:[ \t]*(.*))?$")
 TAG_FIELDS = frozenset(
     {
         "scene",
@@ -93,61 +87,44 @@ TAG_FIELDS = frozenset(
     }
 )
 
-USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
-WORKER_PREAMBLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Task ID|Dispatch ID)\s*:\s*(?:task_|disp_|[a-z0-9_-]{6,})",
-    re.IGNORECASE,
-)
-# Quote/box/list decoration in front of a suggestion line. Leading decoration is
-# presentation, never content: the classifier looks at the label after `:`.
-# A numeric list prefix (`1.`) is left in place; it is part of the label grammar.
-LINE_PREFIX_RE = re.compile(
-    r"^\s*(?:>\s*)?(?:│\s*)?(?:↳|->|→|-|\*|•)?\s*(?:💡\s*)?"
-)
-# A candidate label is a whole grammar, not a prefix: marker + optional index +
-# optional parenthetical annotation, then end of label. Trailing prose
-# （主推方案的风险…、候选1的风险…）never becomes an executable suggestion.
-_LABEL_ANNOTATION = r"(?:[（(][^（）()]*[)）])?"
-SUGGESTION_LABEL_RE = re.compile(
-    r"^(?:"
-    r"(?P<primary>下一步建议|建议下一步|(?i:nextsteps?)|主推)(?:[,，]1)?"
-    r"|(?P<indexed>,[123])"
-    r"|(?P<candidate>候选[123])"
-    r"|(?P<alt>备选)(?:[,，](?P<alt_index>[23])|(?P<alt_attached>[23])"
-    r"|(?P<alt_paren>[（(][,，]?[23][)）]))?"
-    r")" + _LABEL_ANNOTATION + r"$"
-)
-# A bare `下一步建议` / `Next Steps` header line carries no prompt; it only opens
-# a section scope. Inside that scope contiguous items may be labelled with a
-# bare index.
-SECTION_HEADER_RE = re.compile(
-    r"^(?:下一步建议|建议下一步|(?i:nextsteps?))" + _LABEL_ANNOTATION + r"$"
-)
-BARE_SUGGESTION_LABEL_RE = re.compile(
-    r"^(?P<bare>[123])(?:[.)、])?" + _LABEL_ANNOTATION + r"$"
-)
-FENCE_LINE_RE = re.compile(
-    r"^(?P<prefix>(?:[ \t]*>[ \t]*)*[ \t]*"
-    r"(?:(?:[-*+]|\d+[.)、])[ \t]+)?[ \t]*)"
-    r"(?P<fence>`{3,}|~{3,})(?P<info>.*)$"
-)
-AUTOPILOT_TAG_RE = re.compile(
-    r"<!--\s*autopilot\s*:?\s*(.*?)\s*-->", re.IGNORECASE | re.DOTALL
-)
-TAG_KV_RE = re.compile(
-    r'([a-zA-Z0-9_][a-zA-Z0-9_-]*)\s*=\s*'
-    r'(?:"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|([^\s,|;>]+))'
-)
-TAG_KV_RESIDUE_TRANSLATION = str.maketrans("", "", " \t\r\n,|;")
-TRAILING_ALT_RE = re.compile(
-    r"\s*[（(]\s*备选\s*,2\s*[：:][^）)]*[）)]\s*$"
-)
-WORKER_RE = re.compile(r"^,\s*(?:worker|agent)(?:\s+(codex|claude|claude-code|cc|status))?\s*$", re.IGNORECASE)
-MODE_RE = re.compile(r"^,\s*mode\s+(gate|confirm|off|status)\s*$", re.IGNORECASE)
-RECOVERY_RE = re.compile(r"^,\s*autopilot\s+recover\s*$", re.IGNORECASE)
-CANDIDATE_RE = re.compile(r"^,\s*([123])(?:\s+(.*))?$", re.DOTALL)
-COMMA_RE = re.compile(r"^(,[a-z0-9_-]+)(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
-ENTRY_RE = re.compile(r"^([a-z][a-z0-9_-]*)(?:\s+(.*))?$", re.DOTALL)
+def _find_all_positions(text: str, marker: str) -> list[int]:
+    positions: list[int] = []
+    start = text.find(marker)
+    while start >= 0:
+        positions.append(start)
+        start = text.find(marker, start + len(marker))
+    return positions
+
+
+def _command_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
+    if comma:
+        if not text.startswith(","):
+            return "", ""
+        text = text[1:].lstrip()
+    parts = text.split(maxsplit=1)
+    return (parts[0], parts[1].strip() if len(parts) == 2 else "") if parts else ("", "")
+
+
+def _named_command(text: str, names: set[str], targets: set[str], default: str = "") -> str:
+    name, arg = _command_parts(text, comma=True)
+    if name.lower() not in names:
+        return ""
+    target = arg.lower() or default
+    return target if target in targets else ""
+
+
+def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
+    # Custom aliases do not allow whitespace between the comma and their name.
+    raw = text[1:] if comma and text.startswith(",") else text
+    if comma and (not text.startswith(",") or not raw or raw[0].isspace()):
+        return "", ""
+    key, arg = _command_parts(raw)
+    checked = key.lower() if comma else key
+    if not checked or not all(char in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in checked):
+        return "", ""
+    if not comma and checked[0] not in "abcdefghijklmnopqrstuvwxyz":
+        return "", ""
+    return ("," + checked if comma else checked), arg
 
 
 def read_payload() -> dict[str, Any]:
@@ -255,24 +232,60 @@ def compile_worker_hot_reload(workers: list[str]) -> str:
     )
 
 
+def _replace_until(text: str, marker: str, stops: str, replacement: str) -> str:
+    position = 0
+    while (start := text.find(marker, position)) >= 0:
+        start += len(marker)
+        end = start
+        while end < len(text) and text[end] not in stops:
+            end += 1
+        text = text[:start] + replacement + text[end:]
+        position = start + len(replacement)
+    return text
+
+
 def replace_worker_guidance(text: str, workers: list[str]) -> str:
     """Replace executor slots without owning or reproducing orchestration rules."""
     priority = " > ".join(AGENT_LABELS[agent] for agent in workers)
     primary, secondary = workers
-    text = re.sub(r"(Orca Orchestration：|执行器优先级：)[^）\n]+", lambda m: m[1] + priority, text)
-    text = re.sub(
-        r"((?:默认优先(?:使用\s*|\s+)|优先使用\s*))(?:Claude Code|Codex)"
-        r"（`--agent (?:claude|codex)`）(?:，其次使用 (?:Claude Code|Codex)（`--agent (?:claude|codex)`）)?",
-        lambda m: f"{m[1]}{AGENT_LABELS[primary]}（`--agent {primary}`），其次使用 {AGENT_LABELS[secondary]}（`--agent {secondary}`）",
-        text,
-    )
-    text = re.sub(r"(--worktree [^`\n]*?--agent )(?:claude|codex)\b", lambda m: m[1] + primary, text)
-    text = re.sub(r"次选 `--agent (?:claude|codex)`", f"次选 `--agent {secondary}`", text)
-    return re.sub(
-        r"（(?=或 `task-create`|`orca worktree create`)",
-        f"（次选 `--agent {secondary}`；",
-        text,
-    )
+    for marker in ("Orca Orchestration：", "执行器优先级："):
+        text = _replace_until(text, marker, "）\n", priority)
+    for old_agent, label in (("codex", "Codex"), ("claude", "Claude Code")):
+        old = f"{label}（`--agent {old_agent}`）"
+        # Only the explicitly labelled default slot is executable guidance.
+        for prefix in ("默认优先使用 ", "默认优先使用", "默认优先 ", "优先使用 ", "优先使用"):
+            start = 0
+            while (index := text.find(prefix + old, start)) >= 0:
+                end = index + len(prefix + old)
+                for other, other_label in (("codex", "Codex"), ("claude", "Claude Code")):
+                    suffix = f"，其次使用 {other_label}（`--agent {other}`）"
+                    if text.startswith(suffix, end):
+                        end += len(suffix)
+                        break
+                replacement = f"{prefix}{AGENT_LABELS[primary]}（`--agent {primary}`），其次使用 {AGENT_LABELS[secondary]}（`--agent {secondary}`）"
+                text = text[:index] + replacement + text[end:]
+                start = index + len(replacement)
+    lines = []
+    for line in text.splitlines(keepends=True):
+        position = 0
+        while (start := line.find("--worktree ", position)) >= 0:
+            end = start
+            while end < len(line) and line[end] not in "`\n":
+                end += 1
+            segment = line[start:end]
+            before, marker, after = segment.partition("--agent ")
+            token = after.split(maxsplit=1)[0] if after else ""
+            if marker and token in {"codex", "claude"}:
+                segment = before + marker + primary + after[len(token):]
+                line = line[:start] + segment + line[end:]
+            position = start + len(segment)
+        lines.append(line)
+    text = "".join(lines)
+    for old_agent in ("codex", "claude"):
+        text = text.replace(f"次选 `--agent {old_agent}`", f"次选 `--agent {secondary}`")
+    for marker in ("（或 `task-create`", "（`orca worktree create`"):
+        text = text.replace(marker, f"（次选 `--agent {secondary}`；" + marker[1:])
+    return text
 
 
 def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
@@ -290,13 +303,17 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
         try:
             if GEMINI_MD_PATH.is_file():
                 text = GEMINI_MD_PATH.read_text(encoding="utf-8")
-                pattern = r"(<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->)(.*?)(?=## 个人研发状态机与 Turn Autopilot 规范|<!-- END ORCA_AUTOPILOT_PROFILE -->)"
-                text, count = re.subn(
-                    pattern, lambda m: m[1] + replace_worker_guidance(m[2], new_workers),
-                    text, count=1, flags=re.DOTALL,
-                )
-                if count != 1:
+                marker = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
+                start = text.find(marker)
+                content_start = start + len(marker)
+                boundaries = [text.find(end, content_start) for end in (
+                    "## 个人研发状态机与 Turn Autopilot 规范", "<!-- END ORCA_AUTOPILOT_PROFILE -->"
+                )]
+                boundaries = [end for end in boundaries if end >= 0]
+                if start < 0 or not boundaries:
                     return False, old_workers, updated
+                end = min(boundaries)
+                text = text[:content_start] + replace_worker_guidance(text[content_start:end], new_workers) + text[end:]
                 prepared.append((GEMINI_MD_PATH, text))
             if (not os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
                     and GEMINI_DIR.resolve() == (Path.home() / ".gemini").resolve()):
@@ -475,19 +492,30 @@ def is_first_invocation_of_turn(steps: list[dict[str, Any]]) -> bool:
 def extract_user_text(raw: str) -> str:
     if not isinstance(raw, str):
         return ""
-    match = USER_REQUEST_RE.search(raw)
-    return (match.group(1) if match else raw).strip()
+    start = raw.find("<USER_REQUEST>")
+    end = raw.find("</USER_REQUEST>", start + len("<USER_REQUEST>")) if start >= 0 else -1
+    return (raw[start + len("<USER_REQUEST>"):end] if end >= 0 else raw).strip()
+
+
+def _has_worker_preamble(text: str) -> bool:
+    for line in text.splitlines():
+        key, colon, value = line.partition(":")
+        token = value.strip()
+        if colon and key.strip().lower() in {"task id", "dispatch id"} and len(token) >= 6:
+            if all(char.isascii() and (char.isalnum() or char in "_-") for char in token):
+                return True
+    return False
 
 
 def is_dispatched_worker(steps: list[dict[str, Any]], text: str = "") -> bool:
     for key in ("ORCA_DISPATCH_ID", "ORCA_TASK_ID", "ORCA_WORKER_DISPATCH_ID"):
         if os.environ.get(key, "").strip():
             return True
-    if text and WORKER_PREAMBLE_RE.search(text):
+    if text and _has_worker_preamble(text):
         return True
     for step in steps[:4]:
         if step.get("type") == "USER_INPUT":
-            return bool(WORKER_PREAMBLE_RE.search(str(step.get("content") or "")))
+            return bool(_has_worker_preamble(str(step.get("content") or "")))
     return False
 
 
@@ -502,226 +530,6 @@ def render_template(template: str, arg: str = "", note: str = "") -> str:
     if note.strip():
         text = f"{text}（补充要求：{note.strip()}）"
     return text.strip()
-
-
-def _strip_wrapping_markdown(text: str) -> str:
-    """Remove balanced Markdown wrappers (``**`` / backticks) from both ends."""
-    current = text.strip()
-    changed = True
-    while changed and current:
-        changed = False
-        for marker in ("**", "`"):
-            if (
-                len(current) >= 2 * len(marker)
-                and current.startswith(marker)
-                and current.endswith(marker)
-            ):
-                current = current[len(marker) : -len(marker)].strip()
-                changed = True
-    return current
-
-
-def clean_prompt(raw: str) -> str:
-    """Remove only provable outer Markdown wrappers; keep everything else literal."""
-    text = _strip_wrapping_markdown(raw.strip())
-    text = TRAILING_ALT_RE.sub("", text).strip()
-    text = _strip_wrapping_markdown(text)
-    joined = " ".join(line.strip() for line in text.splitlines() if line.strip())
-    if not re.search(r"[\w一-鿿]", joined):
-        return ""
-    return joined
-
-
-def _is_suggestion_header(label: str) -> bool:
-    """Whether a label is a bare `下一步建议` / `建议下一步` / `Next Steps` header."""
-    compact = re.sub(r"\s+", "", re.sub(r"^#+\s*", "", label))
-    compact = re.sub(r"^\d+[.)、]💡?", "", compact)
-    return SECTION_HEADER_RE.match(compact) is not None
-
-
-def _suggestion_kind(label: str, *, in_section: bool = False) -> int:
-    """Classify a compact label grammar: 1 primary, 2/3 alternative, 0 prose.
-
-    The label must match the whole grammar (marker + optional index + optional
-    annotation), so 主推方案的风险…, 候选1的风险…, 备选2的风险… and ,10 stay
-    prose instead of overriding the real suggestion. A numbered list prefix
-    (`1. 主推`) belongs to the label grammar, and only inside an open
-    suggestion section may a bare `1 (Recommended)` / `1. (Recommended)` /
-    `1` / `2` / `3` label count; the same list item in ordinary prose stays
-    prose.
-    """
-    compact = re.sub(r"\s+", "", label)
-    stripped = re.sub(r"^\d+[.)、]💡?", "", compact)
-    match = SUGGESTION_LABEL_RE.match(stripped)
-    if match is None:
-        if not in_section:
-            return 0
-        bare_match = BARE_SUGGESTION_LABEL_RE.match(compact)
-        return int(bare_match.group("bare")) if bare_match else 0
-    if match.group("primary"):
-        return 1
-    if match.group("indexed"):
-        return int(match.group("indexed")[1])
-    if match.group("candidate"):
-        return int(match.group("candidate")[2])
-    for name in ("alt_index", "alt_attached", "alt_paren"):
-        value = match.group(name)
-        if value:
-            return int(next(char for char in value if char.isdigit()))
-    return 2
-
-
-def _split_label_and_content(line: str) -> tuple[str, str] | None:
-    """Split at the first fullwidth/ASCII colon without rewriting the content."""
-    indexes = [index for index in (line.find("："), line.find(":")) if index >= 0]
-    if not indexes:
-        return None
-    cut = min(indexes)
-    return line[:cut], line[cut + 1 :]
-
-
-def _fence_line(line: str) -> tuple[str, int, str, str] | None:
-    """Return (char, length, container prefix, info) for a fence-shaped line."""
-    match = FENCE_LINE_RE.match(line)
-    if match is None:
-        return None
-    fence = match.group("fence")
-    info = match.group("info").strip()
-    if fence[0] in info:
-        return None
-    return fence[0], len(fence), match.group("prefix"), info
-
-
-def _strip_comments(line: str, in_comment: bool) -> tuple[str, bool]:
-    """Consume every comment boundary in order; return (visible text, state).
-
-    Closing one comment may reveal another opener on the same line, and a
-    comment left open carries into the next line. Both directions share this
-    single scan so no hidden region can leak into a candidate.
-    """
-    visible: list[str] = []
-    position = 0
-    while position < len(line):
-        if in_comment:
-            end = line.find("-->", position)
-            if end == -1:
-                return "".join(visible), True
-            position = end + 3
-            in_comment = False
-            continue
-        start = line.find("<!--", position)
-        if start == -1:
-            visible.append(line[position:])
-            break
-        visible.append(line[position:start])
-        position = start + 4
-        in_comment = True
-    return "".join(visible), in_comment
-
-
-def _visible_lines(text: str) -> list[str | None]:
-    """Lines outside fenced code blocks and HTML comment regions.
-
-    A fence is closed only by the same character, an equal-or-longer run, and
-    the same container prefix as its opener, so a ``> ``` `` literal inside an
-    outer code block cannot close it. Hidden or undecidable regions never
-    become executable. Every hidden line is returned as a ``None`` boundary
-    instead of being dropped: a blank line is transparent prose, while a
-    hidden line proves a break, so the two sides can never be glued into one
-    contiguous suggestion section.
-    """
-    lines: list[str | None] = []
-    fence_char = ""
-    fence_length = 0
-    fence_prefix = ""
-    in_comment = False
-    for raw_line in text.splitlines():
-        if fence_char:
-            closing = _fence_line(raw_line)
-            if (
-                closing is not None
-                and closing[0] == fence_char
-                and closing[1] >= fence_length
-                and closing[2] == fence_prefix
-                and not closing[3]
-            ):
-                fence_char = ""
-                fence_length = 0
-                fence_prefix = ""
-            lines.append(None)
-            continue
-        was_hidden = in_comment
-        visible_text, in_comment = _strip_comments(raw_line, in_comment)
-        if was_hidden or "<!--" in raw_line or "-->" in raw_line:
-            # A line touching a comment boundary was only partially visible;
-            # never execute reconstructed text（行内代码里的 <!-- 也无法区分）.
-            lines.append(None)
-            continue
-        if not visible_text.strip():
-            continue
-        opening = _fence_line(visible_text)
-        if opening is not None:
-            fence_char, fence_length, fence_prefix = opening[0], opening[1], opening[2]
-            lines.append(None)
-            continue
-        lines.append(visible_text)
-    return lines
-
-
-def _visible_candidates(
-    text: str,
-) -> tuple[str, list[dict[str, Any]], str]:
-    """Read visible suggestion lines; return (primary, alternatives, error)."""
-    primary = ""
-    alternatives: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    in_section = False
-    for entry in _visible_lines(text):
-        if entry is None:
-            # A hidden line (code fence or comment boundary) is a break, not
-            # invisible glue: the section ends here, so numbered prose on the
-            # other side can never join it.
-            in_section = False
-            continue
-        line = LINE_PREFIX_RE.sub("", entry).strip()
-        if not line:
-            continue
-        parts = _split_label_and_content(line)
-        if parts is None:
-            in_section = _is_suggestion_header(
-                line.replace("*", "").replace("`", "").strip()
-            )
-            continue
-        raw_label, raw_content = parts
-        prompt = clean_prompt(raw_content)
-        clean_label = raw_label.replace("*", "").replace("`", "").strip()
-        if not prompt:
-            in_section = _is_suggestion_header(clean_label)
-            continue
-        kind = _suggestion_kind(clean_label, in_section=in_section)
-        if kind == 1:
-            # Only the last primary block counts: an earlier suggestion the
-            # model already replaced must not keep contributing alternatives.
-            # A headerless primary never opens a section, so a bare `1` list
-            # item in the following prose cannot overwrite it.
-            primary = prompt
-            alternatives = []
-            seen = set()
-            continue
-        if kind == 0 or not primary:
-            # Any non-suggestion line immediately closes the section, so the
-            # numbered lists in later prose can never become candidates.
-            in_section = False
-            continue
-        if prompt == primary:
-            continue
-        if kind in seen:
-            return "", [], "duplicate_alternative"
-        if any(item["prompt"] == prompt for item in alternatives):
-            continue
-        seen.add(kind)
-        alternatives.append({"index": kind, "prompt": prompt})
-    return primary, alternatives, ""
 
 
 class _DuplicateTagField(ValueError):
@@ -751,8 +559,6 @@ def _parse_json_tag(text: str) -> tuple[dict[str, str], str]:
     for key, value in parsed.items():
         if isinstance(value, str):
             values[key] = value.strip()
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            values[key] = str(value)
         else:
             return {}, "invalid_json"
     return values, ""
@@ -763,16 +569,55 @@ def _parse_tag_body(body: str) -> tuple[dict[str, str], str]:
     if text.startswith("{"):
         return _parse_json_tag(text)
     values: dict[str, str] = {}
-    for match in TAG_KV_RE.finditer(text):
-        key = match.group(1).lower()
+    separators = " \t\r\n,|;"
+    while text:
+        text = text.lstrip(separators)
+        if not text:
+            break
+        key, equals, rest = text.partition("=")
+        key = key.strip().lower()
+        if not equals or not key or not all(
+            char in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in key
+        ):
+            return {}, "unknown_field"
+        rest = rest.lstrip()
+        if rest.startswith(('"', "'")):
+            quote = rest[0]
+            chars: list[str] = []
+            index = 1
+            while index < len(rest) and rest[index] != quote:
+                if rest[index] == "\\" and index + 1 < len(rest):
+                    index += 1
+                chars.append(rest[index])
+                index += 1
+            if index == len(rest):
+                return {}, "invalid_json"
+            value, text = "".join(chars), rest[index + 1:]
+        else:
+            index = 0
+            while index < len(rest) and rest[index] not in separators:
+                index += 1
+            value, text = rest[:index], rest[index:]
         if key in values:
             return {}, "duplicate_field"
-        raw_value = match.group(2) or match.group(3) or match.group(4) or ""
-        values[key] = raw_value.replace('\\"', '"').strip()
-    remainder = TAG_KV_RE.sub("", text).translate(TAG_KV_RESIDUE_TRANSLATION)
-    if remainder and values:
-        return {}, "unknown_field"
+        values[key] = value.strip()
     return values, ""
+
+
+def _trailing_tag(text: str) -> tuple[str, str] | None:
+    trimmed = text.rstrip()
+    if not trimmed.endswith("-->"):
+        return None
+    prefix, opener, body = trimmed[:-3].rpartition("<!--")
+    if not opener or "-->" in body:
+        return None
+    body = body.strip()
+    if not body.lower().startswith("autopilot"):
+        return None
+    payload = body[len("autopilot"):]
+    if payload and not (payload[0].isspace() or payload[0] == ":"):
+        return None
+    return prefix, payload.lstrip().removeprefix(":").strip()
 
 
 def _tag_field(values: dict[str, str], names: tuple[str, ...]) -> tuple[str, bool]:
@@ -791,14 +636,13 @@ def _tag_field(values: dict[str, str], names: tuple[str, ...]) -> tuple[str, boo
 
 
 def parse_suggestion(text: str) -> dict[str, Any]:
-    source = text or ""
-    visible_primary, visible_alternatives, visible_error = _visible_candidates(source)
-    if visible_error:
-        return _invalid_suggestion(visible_error)
-    tags = list(AUTOPILOT_TAG_RE.finditer(source))
-    if len(tags) != 1:
-        return _invalid_suggestion("missing_tag" if not tags else "multiple_tags")
-    values, tag_error = _parse_tag_body(tags[0].group(1))
+    tag = _trailing_tag(text or "")
+    if tag is None:
+        return _invalid_suggestion("missing_tag")
+    prefix, body = tag
+    if _trailing_tag(prefix) is not None:
+        return _invalid_suggestion("multiple_tags")
+    values, tag_error = _parse_tag_body(body)
     if tag_error:
         return _invalid_suggestion(tag_error)
     if not values:
@@ -838,37 +682,24 @@ def parse_suggestion(text: str) -> dict[str, Any]:
             "invalid": "",
         }
 
-    # The visible suggestion is the only execution source（所见即所填）; tag
-    # candidates may only cross-check it and never introduce unseen text.
-    if not visible_primary:
+    primary, conflict = _tag_field(values, ("1", "p1", "prompt"))
+    if conflict:
+        return _invalid_suggestion("conflicting_prompt")
+    if not primary:
         return _invalid_suggestion("missing_prompt")
-    tag_primary, primary_conflict = _tag_field(values, ("1", "p1", "prompt"))
-    if primary_conflict:
-        return _invalid_suggestion("conflicting_prompt")
-    if tag_primary and tag_primary != visible_primary:
-        return _invalid_suggestion("conflicting_prompt")
+    alternatives: list[dict[str, Any]] = []
+    seen = {primary}
     for index, names in ((2, ("2", "p2", "alt")), (3, ("3", "p3"))):
         value, conflict = _tag_field(values, names)
         if conflict:
             return _invalid_suggestion("duplicate_alternative")
-        if not value:
-            continue
-        visible = next(
-            (
-                item["prompt"]
-                for item in visible_alternatives
-                if item["index"] == index
-            ),
-            "",
-        )
-        if not visible:
-            return _invalid_suggestion("missing_alternative")
-        if value != visible:
-            return _invalid_suggestion("duplicate_alternative")
+        if value and value not in seen:
+            alternatives.append({"index": index, "prompt": value})
+            seen.add(value)
     return {
         "scene": scene,
-        "prompt": visible_primary,
-        "alternatives": visible_alternatives,
+        "prompt": primary,
+        "alternatives": alternatives,
         "gate": gate,
         "invalid": "",
     }
@@ -960,9 +791,14 @@ def _positional_tool_responses(
     return responses
 
 
+def _is_response_header(line: str) -> bool:
+    header, colon, _ = line.partition(":")
+    return bool(colon) and " ".join(header.lower().split()) in {"created at", "completed at"}
+
+
 def _answer_body_lines(content: str) -> list[str]:
     """Return the answer lines without the runtime's timestamp header."""
-    return [line for line in content.splitlines() if not RESPONSE_HEADER_RE.match(line)]
+    return [line for line in content.splitlines() if not _is_response_header(line)]
 
 
 def _expected_question_count(
@@ -1008,12 +844,13 @@ def _numbered_answers(body_lines: list[str]) -> dict[int, str] | None:
     chunks: dict[int, list[str]] = {}
     current: int | None = None
     for line in body_lines:
-        match = QUESTION_ANSWER_HEADER_RE.match(line)
-        if match:
-            index = int(match.group(1))
+        header, colon, answer = line.partition(":")
+        digits = header[1:]
+        if colon and header.startswith("A") and digits and digits[0] in "123456789" and digits.isdecimal():
+            index = int(digits)
             if index in chunks:
                 return None
-            chunks[index] = [match.group(2) or ""]
+            chunks[index] = [answer.lstrip(" \t")]
             current = index
             continue
         if current is None:
@@ -1385,12 +1222,12 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
-    worker_match = WORKER_RE.match(text)
-    mode_match = MODE_RE.match(text)
+    worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
+    mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
     config = load_config()
     profile = load_profile()
     user_turn = turn_user_identity(steps)
-    recovery_requested = bool(RECOVERY_RE.match(text))
+    recovery_requested = bool(_named_command(text, {"autopilot"}, {"recover"}))
     with state_lock(conversation_id):
         state = load_state(conversation_id)
         if state is None:
@@ -1455,8 +1292,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["candidates"] = []
         state["candidate_turn_id"] = ""
 
-        if worker_match:
-            target = (worker_match.group(1) or "status").lower()
+        if worker_target:
+            target = worker_target
             workers = current_worker_agents(profile)
             if target == "status":
                 message = worker_priority(workers)
@@ -1474,8 +1311,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             message = "\n\n".join(p for p in (worker_reload_msg, message) if p)
             return injection(message + " 请仅用一句话回复，并以 <!-- autopilot: scene=NONE --> 结尾。")
 
-        if mode_match:
-            target = mode_match.group(1).lower()
+        if mode_target:
+            target = mode_target
             if target == "status":
                 scene_count = len(scan_scenes())
                 message = (
@@ -1494,10 +1331,9 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
 
         message = ""
-        candidate_match = CANDIDATE_RE.match(text)
-        if candidate_match:
-            selected = int(candidate_match.group(1))
-            note = (candidate_match.group(2) or "").strip()
+        candidate, note = _command_parts(text, comma=True)
+        if candidate in {"1", "2", "3"}:
+            selected = int(candidate)
             chosen = next(
                 (
                     item
@@ -1522,10 +1358,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                     )
 
         if not message:
-            comma_match = COMMA_RE.match(text)
-            if comma_match:
-                alias = comma_match.group(1).lower()
-                arg = (comma_match.group(2) or "").strip()
+            alias, arg = _shortcut_parts(text, comma=True)
+            if alias:
                 command = find_comma_command(config, alias)
                 if command:
                     expanded = render_template(str(command.get("template") or ""), arg=arg)
@@ -1538,10 +1372,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                         )
 
         if not message:
-            entry_match = ENTRY_RE.match(text)
-            if entry_match:
-                key = entry_match.group(1)
-                arg = (entry_match.group(2) or "").strip()
+            key, arg = _shortcut_parts(text)
+            if key:
                 spec = (config.get("entry_shortcuts") or {}).get(key)
                 if isinstance(spec, dict):
                     requires_arg = bool(spec.get("requires_arg", False))
@@ -1766,8 +1598,8 @@ def command_sync() -> int:
         except OSError as exc:
             print(f"无法读取 GEMINI.md：{exc}", file=sys.stderr)
             return 2
-        starts = [match.start() for match in re.finditer(re.escape(SCENES_BEGIN), text)]
-        ends = [match.start() for match in re.finditer(re.escape(SCENES_END), text)]
+        starts = _find_all_positions(text, SCENES_BEGIN)
+        ends = _find_all_positions(text, SCENES_END)
         if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
             print("GEMINI.md 的场景托管标记缺失、重复或顺序错误。", file=sys.stderr)
             return 2

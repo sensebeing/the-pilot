@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import copy
-import re
 from typing import Any
 
-from .defaults import COMMA_ALIAS_RE, DELIVER_STRATEGIES, ENTRY_KEY_RE, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
+from .defaults import is_comma_alias, DELIVER_STRATEGIES, is_entry_key, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
 from .project import ProfileError, project_specs
 
 
@@ -160,8 +159,8 @@ def _normalize_custom_entries(value: Any, *, project: dict[str, Any] | None = No
     entries: dict[str, dict[str, Any]] = {}
     command_ids: dict[str, str] = {}
     for key, item in mapping.items():
-        if not isinstance(key, str) or not ENTRY_KEY_RE.match(key):
-            raise ProfileError(f"custom_entry 的键 {key!r} 必须匹配 {ENTRY_KEY_RE.pattern}")
+        if not isinstance(key, str) or not is_entry_key(key):
+            raise ProfileError(f"custom_entry 的键 {key!r} 必须匹配 ASCII 小写字母开头，后接小写字母、数字、下划线或连字符")
         if key in specs['entry_order']:
             raise ProfileError(f"custom_entry 不能覆盖内置开局口令 {key!r}；请使用 template_overrides")
         if key in RESERVED_COMMA_ALIASES:
@@ -277,7 +276,7 @@ def normalize_comma_alias(raw: Any) -> str:
     name = text[1:]
     if name in RESERVED_COMMA_ALIASES:
         raise ProfileError(f"口令 {text} 是保留别名（,1 / ,2 / ,3 / ,mode / ,worker / ,agent）")
-    if not COMMA_ALIAS_RE.match(name):
+    if not is_comma_alias(name):
         raise ProfileError(f"口令别名 {raw!r} 只能包含小写字母、数字、下划线和横杠")
     return text
 

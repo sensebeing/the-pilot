@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shlex
 from pathlib import Path
 from dataclasses import dataclass
@@ -183,8 +182,8 @@ def render_autopilot_section(profile: dict[str, Any], scene_count: int) -> str:
 3. **第三步：输出可见建议与唯一隐藏标签**：可见建议行必须打印在正文中（绝不能只藏在 HTML 注释里）；推荐 `**下一步建议：**` 后跟 `- **,1（主推）**：<主推文本>` 与 `- **,2（备选）**：<备选文本>`，对称使用 `,1`/`,2`：
    - 主推行（二选一）：`💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；输 ,2 切备选）**：<主推文本>`；或 `- **,1（主推）**：<主推文本>`。
    - 备选行（可选）：`- **,2（备选）**：<备选文本>`；第三选项用 `- **,3（备选）**：<备选文本>`。
-   - 隐藏标签二选一：JSON `<!-- autopilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（未展示 ,2 时标签省略 "2"），或键值 `<!-- autopilot: scene=<场景名> gate=auto|pause -->`。**可见建议是唯一执行真源**：标签的 `1`/`2`/`3` 只与可见行交叉校验，不得声明未展示的候选；缺可见主推、引用未展示备选或同索引文本不一致时整条建议作废。
-   - 场景名缺失/未知/多标签、gate 缺失或非法时按暂停处理；标签不合法、重复或字段冲突时清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认实施的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。提问未答或结案输出 `<!-- autopilot: scene=NONE -->`。
+   - 正文中的 `,1` / `,2` 仅供人类阅读。回复末尾唯一的结构化 JSON 标签是唯一执行真源，由 `json.loads` 解析：`<!-- autopilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（无备选时省略 "2"）。主推必须非空，候选只从标签读取，不解析或交叉校验 Markdown；使用合法 JSON 转义保留文本。
+   - 场景名缺失/未知/多标签、gate 缺失或非法时按暂停处理；标签不合法、重复或字段冲突时清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认实施的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。提问未答或结案输出 `<!-- autopilot: {{"scene": "NONE"}} -->`（兼容 `<!-- autopilot: scene=NONE -->`）。
    - 暂停/确认回合中，用户可随时输入 `,1 [补充说明]` 触发主推（与 `,2 [补充说明]` 完全对称）。
 
 场景全文由 `scenes/*.md` 唯一持有；改动后运行 `autopilot.py sync` 刷新本段。"""
@@ -225,6 +224,15 @@ def _assert_scenes_markers_managed(
     outside = text if bounds is None else text[: bounds[0]] + text[bounds[1] :]
     if SCENES_BEGIN in outside or SCENES_END in outside:
         raise ValueError(UNMANAGED_SCENES_MARKERS_ERROR)
+
+
+def _find_all_positions(text: str, marker: str) -> list[int]:
+    positions: list[int] = []
+    start = text.find(marker)
+    while start >= 0:
+        positions.append(start)
+        start = text.find(marker, start + len(marker))
+    return positions
 
 
 def merge_gemini_md(existing: str, block: str) -> str:
@@ -366,8 +374,8 @@ def _yaml_string(value: Any) -> str:
 
 
 def _block_bounds(text: str) -> tuple[int, int] | None:
-    begins = [match.start() for match in re.finditer(re.escape(GEMINI_BEGIN), text)]
-    ends = [match.start() for match in re.finditer(re.escape(GEMINI_END), text)]
+    begins = _find_all_positions(text, GEMINI_BEGIN)
+    ends = _find_all_positions(text, GEMINI_END)
     if not begins and not ends:
         return None
     if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:

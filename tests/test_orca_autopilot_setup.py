@@ -197,7 +197,10 @@ def suggestion(
     ]
     if alt:
         lines.append(f"↳ 备选 ,2：{alt}")
-    lines.append(f"<!-- autopilot: scene={scene} gate={gate} -->")
+    tag = {"scene": scene, "gate": gate, "1": prompt}
+    if alt:
+        tag["2"] = alt
+    lines.append(f"<!-- autopilot: {json.dumps(tag, ensure_ascii=False)} -->")
     return "\n".join(lines)
 
 
@@ -532,6 +535,14 @@ class CompilerTest(unittest.TestCase):
                 self.base,
                 overrides={"shortcuts": {"template_overrides": {"missing": "x"}}},
             )
+
+        # Shortcut identities are ASCII tokens, not Unicode lookalikes or lines.
+        for key in ("Ａbc", "a.b", "a\nb", "9entry"):
+            with self.assertRaises(profile_compiler.ProfileError):
+                resolve_profile(self.base, overrides={"shortcuts": {"custom_entry": {key: "x"}}})
+        for alias in (",é", ",a.b", ",a\nb", ",-bad"):
+            with self.assertRaises(profile_compiler.ProfileError):
+                resolve_profile(self.base, overrides={"shortcuts": {"custom_comma": {"ok": {"template": "x", "aliases": [alias]}}}})
 
     def test_command_identity_collisions_and_reserved_entry_are_rejected(self) -> None:
         with self.assertRaises(profile_compiler.ProfileError):
@@ -1627,215 +1638,27 @@ class EngineTest(unittest.TestCase):
         self.stop("c-tag-bad-gate", suggestion("继续推进", gate="maybe"))
         self.assertEqual(send_calls(self.root), [])
 
-    def test_bold_header_never_becomes_prompt_and_numbered_lines_parse(self) -> None:
-        self.stop(
-            "c-bold-header",
-            "方案已就绪。\n\n"
-            "**下一步建议：**\n"
-            "1. **主推**：继续推进实施\n"
-            "2. **备选（,2）**：先暂停确认\n"
-            "原因说明（为什么主推方案更好）：这里先讲背景\n"
-            "主推方案的风险：会删除生产数据\n"
-            "候选1的风险：也会删除生产数据\n"
-            "备选2的风险：同样会删除生产数据\n"
-            "↳ 备选 ,10：越界备选\n"
-            "````\n"
-            "```\n"
-            "1. **主推**：四反引号围栏里的三反引号示例\n"
-            "```\n"
-            "````\n"
-            "> ```\n"
-            "> 1. **主推**：引用块围栏里的示例\n"
-            "> ```\n"
-            "说明 <!-- 隐藏注释开始\n"
-            "主推：隐藏注释里的内容\n"
-            "-->\n"
-            "说明 <!-- 已结束 --> <!--\n"
-            "主推：同一行重开后的隐藏内容\n"
-            "-->\n"
-            "<!-- 跨行开始\n"
-            "--> <!-- 跨行重开\n"
-            "主推：跨行重开后的隐藏内容\n"
-            "-->\n"
-            "```text\n"
-            "> ```\n"
-            "主推：外层代码块里的引用围栏示例\n"
-            "```\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
+    def test_trailing_tag_ignores_markdown_and_earlier_tag_examples(self) -> None:
+        # Failure means human formatting or documentation can override execution.
+        prompt = "检查 `src/**/*.py`，保留 2**3 与内联 `code`"
+        examples = (
+            "正文提及 `<!-- autopilot: scene=NONE -->`。\n",
+            "```html\n<!-- autopilot: scene=NONE -->\n```\n",
+            "**下一步建议：**\n- **,1**：忽略这段展示文本\n- **,2**：展示备选\n",
         )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 1)
-        self.assertNotIn("--enter", sends[0])
-        # Prose, out-of-range indices and fenced examples never become candidates.
-        self.assertEqual(text_argument(sends[0]), "继续推进实施")
-        self.assertNotIn("这里先讲背景", text_argument(sends[0]))
-        self.assertNotIn("会删除生产数据", text_argument(sends[0]))
-        state = read_state(self.state, "c-bold-header")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in state["candidates"]],
-            [(1, "继续推进实施"), (2, "先暂停确认")],
-        )
-        message = self.injection(self.pre("c-bold-header", ",2"))
-        self.assertIn("先暂停确认", message)
+        for index, prose in enumerate(examples):
+            session = f"c-prose-{index}"
+            self.stop(session, prose + suggestion(prompt, alt="暂停确认", gate="pause"))
+            sends = send_calls(self.root)
+            self.assertEqual(len(sends), index + 1)
+            self.assertEqual(text_argument(sends[-1]), prompt)
+            self.assertNotIn("--enter", sends[-1])
+            state = read_state(self.state, session)
+            self.assertEqual([(item["index"], item["prompt"]) for item in state["candidates"]],
+                             [(1, prompt), (2, "暂停确认")])
+            self.assertIn("暂停确认", self.injection(self.pre(session, ",2")))
 
-        # A bare `下一步建议` header opens a suggestion section: contiguous
-        # `1 (Recommended)` / `2` items are candidates there, while the same
-        # bare label in prose before the header or after the block stays prose.
-        self.stop(
-            "c-bare-index",
-            "方案已就绪。\n\n"
-            "- **1**：正文中带冒号的列表项\n\n"
-            "**下一步建议：**\n"
-            "- **1 (Recommended)**：确认关闭上述 16 条 prod Lark 告警，完成全部收尾\n"
-            "- **2**：先只关闭已完成验证的 2 条告警，其余暂不关闭\n\n"
-            "原因说明（为什么主推方案更好）：这里先讲背景\n"
-            "- **1**：正文中带冒号的列表项\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 2)
-        self.assertNotIn("--enter", sends[-1])
-        self.assertEqual(
-            text_argument(sends[-1]),
-            "确认关闭上述 16 条 prod Lark 告警，完成全部收尾",
-        )
-        self.assertNotIn("正文中带冒号的列表项", text_argument(sends[-1]))
-        bare_state = read_state(self.state, "c-bare-index")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in bare_state["candidates"]],
-            [
-                (1, "确认关闭上述 16 条 prod Lark 告警，完成全部收尾"),
-                (2, "先只关闭已完成验证的 2 条告警，其余暂不关闭"),
-            ],
-        )
-        expanded = self.injection(self.pre("c-bare-index", ",2"))
-        self.assertIn("先只关闭已完成验证的 2 条告警，其余暂不关闭", expanded)
-
-        # A numbered list prefix is part of the label grammar, so
-        # `1. (Recommended)` under the header is also candidate 1.
-        self.stop(
-            "c-bare-numbered",
-            "方案已就绪。\n\n"
-            "**下一步建议：**\n"
-            "1. (Recommended)：确认关闭上述 16 条 prod Lark 告警，完成全部收尾\n"
-            "2. (Alternative)：先只关闭已完成验证的 2 条告警，其余暂不关闭\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 3)
-        self.assertNotIn("--enter", sends[-1])
-        self.assertEqual(
-            text_argument(sends[-1]),
-            "确认关闭上述 16 条 prod Lark 告警，完成全部收尾",
-        )
-        numbered_state = read_state(self.state, "c-bare-numbered")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in numbered_state["candidates"]],
-            [
-                (1, "确认关闭上述 16 条 prod Lark 告警，完成全部收尾"),
-                (2, "先只关闭已完成验证的 2 条告警，其余暂不关闭"),
-            ],
-        )
-        expanded = self.injection(self.pre("c-bare-numbered", ",2"))
-        self.assertIn("先只关闭已完成验证的 2 条告警，其余暂不关闭", expanded)
-
-        # Without a `下一步建议` header a primary never opens a section: the
-        # bare `1` list item after it is prose and must not overwrite it.
-        self.stop(
-            "c-headerless-primary",
-            "方案已就绪。\n\n"
-            "- **,1（主推）**：继续推进实施\n"
-            "- **1**：正文中带冒号的列表项\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 4)
-        self.assertNotIn("--enter", sends[-1])
-        self.assertEqual(text_argument(sends[-1]), "继续推进实施")
-        headerless_state = read_state(self.state, "c-headerless-primary")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in headerless_state["candidates"]],
-            [(1, "继续推进实施")],
-        )
-
-        # Hidden lines are section breaks, not invisible glue: a bare `1`/`2`
-        # list item on the far side of a comment or code fence stays prose.
-        self.stop(
-            "c-bare-comment-boundary",
-            "方案已就绪。\n\n"
-            "**下一步建议：**\n"
-            "- **1 (Recommended)**：确认关闭上述 16 条 prod Lark 告警，完成全部收尾\n"
-            "以下为风险示例 <!--说明-->\n"
-            "- **1**：正文中的隐藏行后备选\n"
-            "- **2**：正文中的隐藏行后备选二\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 5)
-        self.assertNotIn("--enter", sends[-1])
-        self.assertEqual(
-            text_argument(sends[-1]),
-            "确认关闭上述 16 条 prod Lark 告警，完成全部收尾",
-        )
-        comment_state = read_state(self.state, "c-bare-comment-boundary")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in comment_state["candidates"]],
-            [(1, "确认关闭上述 16 条 prod Lark 告警，完成全部收尾")],
-        )
-
-        self.stop(
-            "c-bare-fence-boundary",
-            "方案已就绪。\n\n"
-            "**下一步建议：**\n"
-            "- **1 (Recommended)**：确认关闭上述 16 条 prod Lark 告警，完成全部收尾\n"
-            "```text\n"
-            "示例\n"
-            "```\n"
-            "- **1**：正文中的围栏后备选\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 6)
-        self.assertNotIn("--enter", sends[-1])
-        self.assertEqual(
-            text_argument(sends[-1]),
-            "确认关闭上述 16 条 prod Lark 告警，完成全部收尾",
-        )
-        fence_state = read_state(self.state, "c-bare-fence-boundary")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in fence_state["candidates"]],
-            [(1, "确认关闭上述 16 条 prod Lark 告警，完成全部收尾")],
-        )
-
-        # The English `Next Steps` header opens the same section scope, so the
-        # bare `1 (Recommended)` / `2` items below it are candidates too.
-        self.stop(
-            "c-english-next-steps",
-            "Plan is ready.\n\n"
-            "**Next Steps**\n"
-            "- **1 (Recommended)**: ship the change and verify the deployment\n"
-            "- **2**: wait for one more review round\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 7)
-        self.assertNotIn("--enter", sends[-1])
-        self.assertEqual(
-            text_argument(sends[-1]),
-            "ship the change and verify the deployment",
-        )
-        english_state = read_state(self.state, "c-english-next-steps")
-        self.assertEqual(
-            [(item["index"], item["prompt"]) for item in english_state["candidates"]],
-            [
-                (1, "ship the change and verify the deployment"),
-                (2, "wait for one more review round"),
-            ],
-        )
-        expanded = self.injection(self.pre("c-english-next-steps", ",2"))
-        self.assertIn("wait for one more review round", expanded)
-
-    def test_structured_json_tag_merges_with_symmetric_visible_lines(self) -> None:
+    def test_structured_json_tag_selects_candidates(self) -> None:
         tag = json.dumps(
             {
                 "scene": "plan-and-orchestrate",
@@ -1869,12 +1692,11 @@ class EngineTest(unittest.TestCase):
             "复审完成。\n\n"
             "💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；"
             "输 ,2 切备选）**：继续推进实施：先补边界测试\n"
-            "<!-- autopilot: scene=architecture-re-review, gate=auto -->",
+            "<!-- autopilot: scene=architecture-re-review, gate=auto, 1='继续推进实施：先补边界测试' -->",
         )
         sends = send_calls(self.root)
         self.assertEqual(len(sends), 1)
-        # The separator is the first colon after the label; a colon inside the
-        # prompt itself must survive so the prefill stays text-identical.
+        # Legacy key=value fields retain literal colons and candidate expansion.
         self.assertEqual(text_argument(sends[0]), "继续推进实施：先补边界测试")
         state = read_state(self.state, "c-primary-expand")
         self.assertEqual(state["scene"], "architecture-re-review")
@@ -1885,83 +1707,54 @@ class EngineTest(unittest.TestCase):
         self.assertIn("先补边界测试", message)
         self.assertEqual(read_state(self.state, "c-primary-expand")["candidates"], [])
 
-    def test_hidden_tag_cannot_introduce_unseen_candidates(self) -> None:
-        self.stop(
-            "c-tag-only",
-            "方案已就绪。\n\n"
-            '<!-- autopilot: {"scene": "plan-and-orchestrate", "gate": "auto", '
-            '"1": "未展示的主推"} -->',
-        )
-        self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
-        self.assertIn('"cid": "c-tag-only", "reason": "missing_prompt"', log)
-
-        self.stop(
-            "c-tag-unseen-alt",
-            "方案已就绪。\n\n"
-            "💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；"
-            "输 ,2 切备选）**：继续推进实施\n"
-            '<!-- autopilot: {"scene": "plan-and-orchestrate", "gate": "auto", '
-            '"2": "未展示的备选"} -->',
-        )
-        self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
-        self.assertIn(
-            '"cid": "c-tag-unseen-alt", "reason": "missing_alternative"', log
-        )
-
-        # A visible alternative deduplicated into the primary must not be
-        # resurrected by the tag under the same index.
-        self.stop(
-            "c-tag-deduped-alt",
-            "方案已就绪。\n\n"
-            "💡 下一步建议：继续推进实施\n"
-            "↳ 备选 ,2：继续推进实施\n"
-            '<!-- autopilot: {"scene": "plan-and-orchestrate", "gate": "pause", '
-            '"2": "继续推进实施"} -->',
-        )
-        self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
-        self.assertIn(
-            '"cid": "c-tag-deduped-alt", "reason": "missing_alternative"', log
-        )
-
-        # Inline code that merely looks like a comment cannot be told apart
-        # from a real comment, so the affected line is rejected, never rewritten.
-        self.stop(
-            "c-inline-code-comment",
-            "方案已就绪。\n\n"
-            "💡 下一步建议：仅搜索字面量 `<!--secret-->`，不要修改文件\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=auto -->",
-        )
-        self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
-        self.assertIn(
-            '"cid": "c-inline-code-comment", "reason": "missing_prompt"', log
-        )
+    def test_tag_candidates_are_authoritative_and_aliases_fail_closed(self) -> None:
+        # Failure means a conflicting alias or malformed payload becomes executable.
+        valid = {"scene": "plan-and-orchestrate", "gate": "pause", "1": "推进", "2": "推进", "3": "暂停"}
+        self.stop("c-tag-only", "<!-- autopilot: " + json.dumps(valid) + " -->")
+        self.assertEqual(text_argument(send_calls(self.root)[0]), "推进")
+        self.assertEqual([(item["index"], item["prompt"]) for item in read_state(self.state, "c-tag-only")["candidates"]],
+                         [(1, "推进"), (3, "暂停")])
+        cases = [
+            ({**valid, "prompt": "另一个主推"}, "conflicting_prompt"),
+            ({**valid, "alt": "另一个备选"}, "duplicate_alternative"),
+            ({**valid, "1": ""}, "missing_prompt"),
+            ({**valid, "1": 7}, "invalid_json"),
+            ({**valid, "1": ["推进"]}, "invalid_json"),
+            ({**valid, "stage": "other"}, "conflicting_scene"),
+            ({**valid, "action": "auto"}, "conflicting_gate"),
+            ({**valid, "unexpected": "value"}, "unknown_field"),
+        ]
+        for index, (fields, reason) in enumerate(cases):
+            session = f"c-invalid-fields-{index}"
+            self.stop(session, "<!-- autopilot: " + json.dumps(fields) + " -->")
+            self.assertEqual(len(send_calls(self.root)), 1)
+            log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+            self.assertIn(f'"cid": "{session}", "reason": "{reason}"', log)
+        for index, (body, reason) in enumerate((
+            ('{"scene":"NONE","SCENE":"NONE"}', "duplicate_field"),
+            ('{"scene":"NONE",}', "invalid_json"),
+            ('scene=NONE scene=NONE', "duplicate_field"),
+        )):
+            session = f"c-malformed-{index}"
+            self.stop(session, "<!-- autopilot: " + body + " -->")
+            self.assertEqual(len(send_calls(self.root)), 1)
+            self.assertEqual(read_state(self.state, session)["candidates"], [])
+            log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+            self.assertIn(f'"cid": "{session}", "reason": "{reason}"', log)
+        for index, body in enumerate(('{"scene":"NONE"}', 'scene=NONE')):
+            self.stop(f"c-none-{index}", "<!-- autopilot: " + body + " -->")
+            self.assertEqual(len(send_calls(self.root)), 1)
 
     def test_prompt_literals_survive_parsing(self) -> None:
-        prompt = "仅检查 src/**/*.py 与 2**3 的差异"
-        self.stop(
-            "c-literal",
-            "方案已就绪。\n\n"
-            "💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；"
-            f"输 ,2 切备选）**：{prompt}\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 1)
-        self.assertEqual(text_argument(sends[0]), prompt)
-
-        self.stop(
-            "c-literal-wrapper",
-            "方案已就绪。\n\n"
-            "💡 下一步建议：`继续推进`\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->",
-        )
-        sends = send_calls(self.root)
-        self.assertEqual(len(sends), 2)
-        self.assertEqual(text_argument(sends[1]), "继续推进")
+        # Failure means structured text is modified by presentation cleanup.
+        for index, prompt in enumerate(("仅检查 src/**/*.py 与 2**3 的差异", "`继续推进`", "第一行\n第二行：\"原样\"")):
+            self.stop(f"c-literal-{index}", suggestion(prompt, gate="pause") + " \n")
+            sends = send_calls(self.root)
+            self.assertEqual(len(sends), index + 1)
+            self.assertEqual(text_argument(sends[-1]), prompt)
+        self.stop("c-not-trailing", suggestion("不执行") + "\n这是后续正文")
+        self.stop("c-no-tag-prompt", "主推：不执行\n<!-- autopilot: scene=plan-and-orchestrate gate=pause -->")
+        self.assertEqual(len(send_calls(self.root)), 3)
 
     def test_earlier_ask_question_blocks_later_suggestion(self) -> None:
         steps = [
@@ -2360,7 +2153,7 @@ class EngineTest(unittest.TestCase):
 
     def test_single_candidate_tag_may_omit_the_alternative(self) -> None:
         # Failure means the documented single-candidate tag shape is rejected
-        # as an unseen alternative instead of pre-filling the visible primary.
+        # instead of pre-filling the structured primary.
         self.stop(
             "c-single-tag",
             "方案已就绪。\n\n"
@@ -2508,11 +2301,11 @@ class EngineTest(unittest.TestCase):
         self.stop("c-unknown", suggestion("继续推进", gate="auto"))
         self.assertEqual(len(send_calls(self.root)), 2)
 
-    def test_candidate_index_uses_visible_number(self) -> None:
+    def test_candidate_index_uses_structured_number(self) -> None:
         text = (
             "方案已就绪。\n\n💡 下一步建议：主推方案\n"
             "↳ 备选 ,3：第三方案\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=pause -->"
+            '<!-- autopilot: {"scene":"plan-and-orchestrate","gate":"pause","1":"主推方案","3":"第三方案"} -->'
         )
         self.pre("c-cand-missing", "开始")
         self.stop("c-cand-missing", text)

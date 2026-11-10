@@ -1,5 +1,4 @@
 """Universal profile vocabulary and project-neutral scene templates."""
-import re
 
 PROFILE_SCHEMA = "orca-autopilot-profile/v1"
 
@@ -22,9 +21,15 @@ DELIVER_STRATEGIES = ("merge_dev_e2e", "merge_dev_only", "local_verify_only")
 
 RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent"})
 
-COMMA_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+def is_comma_alias(value: str) -> bool:
+    return bool(value) and value[0] in "abcdefghijklmnopqrstuvwxyz0123456789" and all(
+        char in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in value
+    )
 
-ENTRY_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+def is_entry_key(value: str) -> bool:
+    return is_comma_alias(value) and value[0] in "abcdefghijklmnopqrstuvwxyz"
+
 
 GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
 

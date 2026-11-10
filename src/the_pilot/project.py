@@ -6,10 +6,9 @@ and returns independent copies; concurrent compilations cannot change defaults.
 from __future__ import annotations
 
 import copy
-import re
 from typing import Any
 
-from .defaults import DEFAULT_SPECS, RESERVED_COMMA_ALIASES
+from .defaults import DEFAULT_SPECS, RESERVED_COMMA_ALIASES, is_entry_key
 
 PROJECT_SCHEMA = "the-pilot-project/v1"
 
@@ -49,7 +48,7 @@ def normalize_project(raw: Any) -> dict[str, Any]:
         raise ProfileError("entry_order must list every entry spec exactly once")
     identities = set()
     for key, spec in specs["entry_specs"].items():
-        if not re.fullmatch(r"[a-z][a-z0-9_-]*", key) or key in RESERVED_COMMA_ALIASES:
+        if not is_entry_key(key) or key in RESERVED_COMMA_ALIASES:
             raise ProfileError(f"Invalid or reserved entry key: {key}")
         required = {"command_id", "description", "requires_arg", "usage", "template"}
         if not isinstance(spec, dict) or not required <= set(spec) or set(spec) - required - {"workflow_type"}:

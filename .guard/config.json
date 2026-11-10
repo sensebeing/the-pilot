@@ -94,6 +94,16 @@
         ],
         "rule_id": "guard.service-boundaries",
         "message": "Execution layers must not import the CLI entrypoint."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/"
+        ],
+        "imports": [
+          "re"
+        ],
+        "rule_id": "guard.architecture-simplicity",
+        "message": "Use structured JSON and deterministic string operations instead of regular expressions."
       }
     ],
     "forbidden_patterns": [

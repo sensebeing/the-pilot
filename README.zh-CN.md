@@ -36,7 +36,7 @@ Python 3.11+，零外部运行时依赖，支持 macOS / Linux 的 `fcntl` 文�
 
 通用规格 + 项目 `.pilot/project.json` + 用户 `profile.json` → 纯编译器 →
 `config.json`、四场景文件、GEMINI.md 托管块和 Hook 组 → 独立单文件运行时。
-PreInvocation 处理口令与执行器热加载；Stop 读取可见建议并机械投递到 Orca。
+PreInvocation 处理口令与执行器热加载；Stop 只读取回复末尾的结构化 JSON 标签并机械投递到 Orca；可见建议仅供阅读。
 
 主会话负责语义判断、架构设计和复审，子会话在分支内实施并汇报。
 运行时负责提问结算、会话锁、轮数上限和投递状态，不再做第二次模型裁决。
@@ -91,7 +91,7 @@ pilot apply --no-project --json
 | `pilot sync` | 从场景刷新指导段 |
 | `pilot set r 'Review {arg}'` | 保存口令模板 |
 | `pilot log` | 查看投递记录 |
-| `,1` / `,2` / `,3` | 选择可见候选 |
+| `,1` / `,2` / `,3` | 选择结构化标签中的候选 |
 | `,autopilot recover` | 显式恢复不确定投递 |
 
 安装命令接受 `--gemini-dir`，运行时使用 `ORCA_AUTOPILOT_GEMINI_DIR`。
