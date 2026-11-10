@@ -1687,16 +1687,31 @@ class EngineTest(unittest.TestCase):
         )
 
     def test_comma_separated_tag_and_primary_candidate_expansion(self) -> None:
+        # Legacy key=value candidate tags are rejected; only JSON tags execute candidates.
+        self.stop(
+            "c-legacy-kv-rejected",
+            "<!-- autopilot: scene=architecture-re-review, gate=auto, 1='继续推进实施：先补边界测试' -->",
+        )
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(read_state(self.state, "c-legacy-kv-rejected")["candidates"], [])
+
+        tag = json.dumps(
+            {
+                "scene": "architecture-re-review",
+                "gate": "auto",
+                "1": "继续推进实施：先补边界测试",
+            },
+            ensure_ascii=False,
+        )
         self.stop(
             "c-primary-expand",
             "复审完成。\n\n"
             "💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；"
             "输 ,2 切备选）**：继续推进实施：先补边界测试\n"
-            "<!-- autopilot: scene=architecture-re-review, gate=auto, 1='继续推进实施：先补边界测试' -->",
+            f"<!-- autopilot: {tag} -->",
         )
         sends = send_calls(self.root)
         self.assertEqual(len(sends), 1)
-        # Legacy key=value fields retain literal colons and candidate expansion.
         self.assertEqual(text_argument(sends[0]), "继续推进实施：先补边界测试")
         state = read_state(self.state, "c-primary-expand")
         self.assertEqual(state["scene"], "architecture-re-review")
@@ -1733,7 +1748,8 @@ class EngineTest(unittest.TestCase):
         for index, (body, reason) in enumerate((
             ('{"scene":"NONE","SCENE":"NONE"}', "duplicate_field"),
             ('{"scene":"NONE",}', "invalid_json"),
-            ('scene=NONE scene=NONE', "duplicate_field"),
+            ('scene=NONE scene=NONE', "invalid_json"),
+            ('scene=plan-and-orchestrate gate=pause 1="推进"', "invalid_json"),
         )):
             session = f"c-malformed-{index}"
             self.stop(session, "<!-- autopilot: " + body + " -->")
@@ -1746,15 +1762,27 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(len(send_calls(self.root)), 1)
 
     def test_prompt_literals_survive_parsing(self) -> None:
-        # Failure means structured text is modified by presentation cleanup.
-        for index, prompt in enumerate(("仅检查 src/**/*.py 与 2**3 的差异", "`继续推进`", "第一行\n第二行：\"原样\"")):
-            self.stop(f"c-literal-{index}", suggestion(prompt, gate="pause") + " \n")
+        # Failure means structured text is modified by presentation cleanup or comment splitting.
+        prompts = (
+            "仅检查 src/**/*.py 与 2**3 的差异",
+            "`继续推进`",
+            "第一行\n第二行：\"原样\"",
+            "Search for <!--secret--> and keep --> literal",
+            '排查 <!-- autopilot: {"scene": "NONE"} --> 标签解析',
+        )
+        for index, prompt in enumerate(prompts):
+            self.stop(f"c-literal-{index}", suggestion(prompt, alt="备选 <!--alt--> -->", gate="pause") + " \n")
             sends = send_calls(self.root)
             self.assertEqual(len(sends), index + 1)
             self.assertEqual(text_argument(sends[-1]), prompt)
+            state = read_state(self.state, f"c-literal-{index}")
+            self.assertEqual(
+                [(item["index"], item["prompt"]) for item in state["candidates"]],
+                [(1, prompt), (2, "备选 <!--alt--> -->")],
+            )
         self.stop("c-not-trailing", suggestion("不执行") + "\n这是后续正文")
         self.stop("c-no-tag-prompt", "主推：不执行\n<!-- autopilot: scene=plan-and-orchestrate gate=pause -->")
-        self.assertEqual(len(send_calls(self.root)), 3)
+        self.assertEqual(len(send_calls(self.root)), len(prompts))
 
     def test_earlier_ask_question_blocks_later_suggestion(self) -> None:
         steps = [

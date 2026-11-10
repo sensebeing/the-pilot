@@ -566,58 +566,53 @@ def _parse_json_tag(text: str) -> tuple[dict[str, str], str]:
 
 def _parse_tag_body(body: str) -> tuple[dict[str, str], str]:
     text = body.strip()
+    if not text:
+        return {}, "empty_tag"
     if text.startswith("{"):
         return _parse_json_tag(text)
-    values: dict[str, str] = {}
-    separators = " \t\r\n,|;"
-    while text:
-        text = text.lstrip(separators)
-        if not text:
-            break
-        key, equals, rest = text.partition("=")
-        key = key.strip().lower()
-        if not equals or not key or not all(
-            char in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in key
-        ):
-            return {}, "unknown_field"
-        rest = rest.lstrip()
-        if rest.startswith(('"', "'")):
-            quote = rest[0]
-            chars: list[str] = []
-            index = 1
-            while index < len(rest) and rest[index] != quote:
-                if rest[index] == "\\" and index + 1 < len(rest):
-                    index += 1
-                chars.append(rest[index])
-                index += 1
-            if index == len(rest):
-                return {}, "invalid_json"
-            value, text = "".join(chars), rest[index + 1:]
-        else:
-            index = 0
-            while index < len(rest) and rest[index] not in separators:
-                index += 1
-            value, text = rest[:index], rest[index:]
-        if key in values:
-            return {}, "duplicate_field"
-        values[key] = value.strip()
-    return values, ""
+    if text.lower() == "scene=none":
+        return {"scene": "NONE"}, ""
+    return {}, "invalid_json"
+
+
+def _has_unquoted_comment_delimiter(payload: str) -> bool:
+    if not payload.startswith("{"):
+        return "<!--" in payload or "-->" in payload
+    in_string = False
+    escape = False
+    for index, char in enumerate(payload):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif payload.startswith("<!--", index) or payload.startswith("-->", index):
+            return True
+    return False
 
 
 def _trailing_tag(text: str) -> tuple[str, str] | None:
     trimmed = text.rstrip()
     if not trimmed.endswith("-->"):
         return None
-    prefix, opener, body = trimmed[:-3].rpartition("<!--")
-    if not opener or "-->" in body:
-        return None
-    body = body.strip()
-    if not body.lower().startswith("autopilot"):
-        return None
-    payload = body[len("autopilot"):]
-    if payload and not (payload[0].isspace() or payload[0] == ":"):
-        return None
-    return prefix, payload.lstrip().removeprefix(":").strip()
+    content = trimmed[:-3]
+    for position in _find_all_positions(content, "<!--"):
+        body = content[position + 4:].strip()
+        if not body.lower().startswith("autopilot"):
+            continue
+        rest = body[len("autopilot"):]
+        if rest and not (rest[0].isspace() or rest[0] == ":"):
+            continue
+        payload = rest.lstrip().removeprefix(":").strip()
+        if _has_unquoted_comment_delimiter(payload):
+            continue
+        return content[:position], payload
+    return None
 
 
 def _tag_field(values: dict[str, str], names: tuple[str, ...]) -> tuple[str, bool]:
