@@ -1,0 +1,10 @@
+{
+  "schema": "the-pilot-project/v1",
+  "projectId": "example",
+  "description": "A project-specific closeout instruction.",
+  "scene_specs": {
+    "closeout-and-sync": {
+      "fallback_prompt": "Update project documentation and release owned resources."
+    }
+  }
+}

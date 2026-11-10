@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""Install, inspect, upgrade and remove the Orca Autopilot profile.
+
+The whole install is compiled in memory first, then every file is replaced
+atomically in the same directory. There is no install manifest and no pending
+state: a re-run simply recompiles and writes again, while files that belong to
+the teammate (other hooks, other GEMINI.md sections, and custom scene files)
+are never touched.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from contextlib import contextmanager
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+from typing import Any
+
+from . import compiler as profile_compiler
+from .profile import resolve_profile, validate_profile
+from .project import normalize_project
+from .defaults import DEFAULT_SPECS, MODES, DELIVER_STRATEGIES
+
+
+AUTOPILOT_SUBDIR = Path("config") / "autopilot"
+GEMINI_MD_SUBPATH = Path("config") / "GEMINI.md"
+HOOKS_SUBPATH = Path("config") / "hooks.json"
+SCENES_SUBDIR = "scenes"
+ENGINE_NAME = "autopilot.py"
+BUILTIN_SCENE_FILES = tuple(
+    spec["file"] for spec in DEFAULT_SPECS["scene_specs"].values()
+)
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = SCRIPTS_DIR / "assets"
+DEFAULT_PROFILE_PATH = ASSETS_DIR / "profile.default.json"
+ENGINE_SOURCE_PATH = ASSETS_DIR / ENGINE_NAME
+
+
+class SetupError(Exception):
+    """The requested install cannot be completed safely."""
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "probe":
+            result = probe(args)
+        elif args.command == "apply":
+            result = apply(args)
+        elif args.command == "status":
+            result = status(args)
+        else:
+            result = uninstall(args)
+    except (SetupError, profile_compiler.ProfileError, OSError, ValueError) as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False, indent=2))
+    else:
+        print_human(args.command, result)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pilot",
+        description="Install, inspect, upgrade or remove Orca Autopilot in ~/.gemini.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    probe_parser = subparsers.add_parser("probe", help="只读探测本机环境与已有安装")
+    add_common_arguments(probe_parser)
+
+    apply_parser = subparsers.add_parser("apply", help="编译并原子写入配置")
+    add_common_arguments(apply_parser)
+    apply_parser.add_argument("--preset", choices=sorted(DEFAULT_SPECS["presets"]))
+    apply_parser.add_argument("--profile", help="JSON 对象、JSON 文件路径或 @文件路径")
+    apply_parser.add_argument("--upgrade", action="store_true", help="以已安装 profile.json 为基线重编译")
+    apply_parser.add_argument("--mode", choices=MODES)
+    apply_parser.add_argument("--max-turns", type=int)
+    apply_parser.add_argument("--worker-agents")
+    apply_parser.add_argument("--review-agents")
+    apply_parser.add_argument("--scenes")
+    apply_parser.add_argument("--deliver-strategy", choices=DELIVER_STRATEGIES)
+    apply_parser.add_argument(
+        "--feedback-email", action=argparse.BooleanOptionalAction, default=None
+    )
+    apply_parser.add_argument("--entry-shortcuts")
+    apply_parser.add_argument("--guardrail", action="append")
+
+    status_parser = subparsers.add_parser("status", help="只读检查安装与漂移")
+    add_common_arguments(status_parser)
+
+    uninstall_parser = subparsers.add_parser("uninstall", help="移除本工具写入的文件与 Hook 组")
+    add_common_arguments(uninstall_parser)
+    return parser
+
+
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--gemini-dir",
+        default=os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", str(Path.home() / ".gemini")),
+        help="Antigravity 配置目录（默认 ~/.gemini）",
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--project", help="Repository root or project JSON path")
+    selection.add_argument("--no-project", action="store_true", help="Use universal defaults")
+    parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+
+
+def probe(args: argparse.Namespace) -> dict[str, Any]:
+    gemini_dir = gemini_dir_for(args)
+    project = discover_project(args, gemini_dir)
+    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
+    profile_path = autopilot_dir / "profile.json"
+    engine_path = autopilot_dir / ENGINE_NAME
+    scenes_dir = autopilot_dir / SCENES_SUBDIR
+    hooks_path = gemini_dir / HOOKS_SUBPATH
+    gemini_md = gemini_dir / GEMINI_MD_SUBPATH
+    hooks_group = False
+    hooks_error = ""
+    try:
+        hooks_group = has_autopilot_hook_group(hooks_path)
+    except SetupError as exc:
+        hooks_error = str(exc)
+    report: dict[str, Any] = {
+        "gemini_dir": str(gemini_dir),
+        "clis": {
+            name: shutil.which(name) or ""
+            for name in ("orca", "claude", "codex", "agy")
+        },
+        "installed": {
+            "autopilot_dir": autopilot_dir.is_dir(),
+            "profile": profile_path.is_file(),
+            "engine": engine_path.is_file(),
+            "scenes": sorted(path.name for path in scenes_dir.glob("*.md"))
+            if scenes_dir.is_dir()
+            else [],
+            "hooks_group": hooks_group,
+            "gemini_block": profile_compiler.GEMINI_BEGIN in read_text(gemini_md),
+        },
+        "recommended_profile": resolve_profile(
+            load_default_profile(), preset="recommended", project=project
+        ),
+    }
+    if hooks_error:
+        report["hooks_error"] = hooks_error
+    try:
+        installed_profile = read_json_object(profile_path, "profile.json")
+    except SetupError as exc:
+        report["installed_profile_error"] = str(exc)
+        installed_profile = None
+    if installed_profile is not None:
+        try:
+            report["installed_profile"] = validate_profile(installed_profile, project=project)
+        except profile_compiler.ProfileError as exc:
+            report["installed_profile_error"] = str(exc)
+    return report
+
+
+def apply(args: argparse.Namespace) -> dict[str, Any]:
+    with profile_lock(gemini_dir_for(args)):
+        return _apply_unlocked(args)
+
+
+def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
+    gemini_dir = gemini_dir_for(args)
+    project = discover_project(args, gemini_dir)
+    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
+    profile_path = autopilot_dir / "profile.json"
+    config_path = autopilot_dir / "config.json"
+    scenes_dir = autopilot_dir / SCENES_SUBDIR
+    engine_path = autopilot_dir / ENGINE_NAME
+    gemini_md = gemini_dir / GEMINI_MD_SUBPATH
+    hooks_path = gemini_dir / HOOKS_SUBPATH
+
+    if args.upgrade:
+        if args.profile:
+            raise SetupError("--upgrade 不能与 --profile 同用；请先完成定制，再单独升级")
+        base = read_json_object(profile_path, "已安装的 profile.json")
+        if base is None:
+            raise SetupError("--upgrade 需要已安装的 profile.json；未找到安装配置")
+    else:
+        base = load_default_profile()
+    preset = args.preset if args.preset is not None else (None if args.upgrade else "recommended")
+    profile = resolve_profile(
+        base, preset=preset, overrides=overrides_from_args(args), project=project
+    )
+
+    bundle = profile_compiler.compile_bundle(profile, project=project)
+    current_gemini = read_text(gemini_md)
+    hooks = read_json_object(hooks_path, "hooks.json") or {}
+    engine_text = ENGINE_SOURCE_PATH.read_text(encoding="utf-8")
+
+    merged_gemini = profile_compiler.merge_gemini_md(current_gemini, bundle.gemini_block)
+    merged_hooks = profile_compiler.merge_hooks_json(hooks, str(engine_path))
+    stale_scenes = [
+        name
+        for name in BUILTIN_SCENE_FILES
+        if name not in bundle.scenes and (scenes_dir / name).is_file()
+    ]
+
+    project_path = autopilot_dir / "project.json"
+    if project is not None:
+        atomic_write_text(project_path, json_text(project))
+    elif project_path.exists():
+        project_path.unlink()
+    atomic_write_text(profile_path, json_text(bundle.profile_json))
+    atomic_write_text(config_path, json_text(bundle.config_json))
+    for filename, text in bundle.scenes.items():
+        atomic_write_text(scenes_dir / filename, text)
+    atomic_write_text(engine_path, engine_text, mode=0o755)
+    if merged_gemini != current_gemini or not gemini_md.is_file():
+        atomic_write_text(gemini_md, merged_gemini)
+    if merged_hooks != hooks or not hooks_path.is_file():
+        atomic_write_text(hooks_path, json_text(merged_hooks))
+    for name in stale_scenes:
+        (scenes_dir / name).unlink()
+
+    return {
+        "gemini_dir": str(gemini_dir),
+        "preset": preset or "installed-profile",
+        "mode": bundle.profile_json["autopilot"]["mode"],
+        "max_consecutive_auto_turns": bundle.profile_json["autopilot"]["max_consecutive_auto_turns"],
+        "deliver_strategy": bundle.profile_json["scenes"]["deliver_strategy"],
+        "worker_agents": bundle.profile_json["orchestration"]["worker_agents"],
+        "review_agents": bundle.profile_json["orchestration"]["review_agents"],
+        "scenes": sorted(bundle.scenes),
+        "removed_scenes": sorted(stale_scenes),
+        "profile": str(profile_path),
+        "config": str(config_path),
+        "engine": str(engine_path),
+        "gemini_md": str(gemini_md),
+        "hooks": str(hooks_path),
+        "preserved": [],
+        "warnings": missing_cli_warnings(bundle.profile_json),
+    }
+
+
+def status(args: argparse.Namespace) -> dict[str, Any]:
+    gemini_dir = gemini_dir_for(args)
+    project = discover_project(args, gemini_dir)
+    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
+    profile_path = autopilot_dir / "profile.json"
+    config_path = autopilot_dir / "config.json"
+    scenes_dir = autopilot_dir / SCENES_SUBDIR
+    engine_path = autopilot_dir / ENGINE_NAME
+    gemini_md = gemini_dir / GEMINI_MD_SUBPATH
+    hooks_path = gemini_dir / HOOKS_SUBPATH
+
+    profile = read_json_object(profile_path, "profile.json")
+    engine_up_to_date = engine_path.is_file() and (
+        engine_path.read_text(encoding="utf-8") == ENGINE_SOURCE_PATH.read_text(encoding="utf-8")
+    )
+    report: dict[str, Any] = {
+        "gemini_dir": str(gemini_dir),
+        "installed": bool(profile is not None and engine_path.is_file()),
+        "profile": str(profile_path),
+        "engine": {"path": str(engine_path), "up_to_date": engine_up_to_date},
+        "hooks": {
+            "path": str(hooks_path),
+            "group": has_autopilot_hook_group(hooks_path),
+        },
+        "gemini_md": str(gemini_md),
+        "drift": [],
+    }
+    if profile is None:
+        report["drift"].append("profile.json 缺失")
+        return report
+
+    existing_config = read_json_object(config_path, "config.json") or {}
+    bundle = profile_compiler.compile_bundle(profile, project=project)
+    report.update(
+        {
+            "mode": bundle.profile_json["autopilot"]["mode"],
+            "max_consecutive_auto_turns": bundle.profile_json["autopilot"][
+                "max_consecutive_auto_turns"
+            ],
+            "scenes": sorted(bundle.scenes),
+            "deliver_strategy": bundle.profile_json["scenes"]["deliver_strategy"],
+            "preserved": [],
+        }
+    )
+    if existing_config != bundle.config_json:
+        report["drift"].append("config.json 与 profile.json 编译结果不一致")
+
+    expected_scenes = set(bundle.scenes)
+    disk_scenes = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in scenes_dir.glob("*.md")
+    } if scenes_dir.is_dir() else {}
+    for filename, text in bundle.scenes.items():
+        if disk_scenes.get(filename) != text:
+            report["drift"].append(f"场景文件缺失或已漂移：{filename}")
+    for filename in BUILTIN_SCENE_FILES:
+        if filename not in expected_scenes and filename in disk_scenes:
+            report["drift"].append(f"已停用的内置场景仍在：{filename}")
+
+    current_gemini = read_text(gemini_md)
+    # `status` is read-only: a GEMINI.md the installer refuses to merge is a
+    # drift finding, not a reason to fail the whole inspection.
+    try:
+        merged = profile_compiler.merge_gemini_md(current_gemini, bundle.gemini_block)
+    except ValueError as exc:
+        report["drift"].append(f"GEMINI.md 托管块异常：{exc}")
+    else:
+        if merged != current_gemini:
+            report["drift"].append("GEMINI.md 托管块缺失或已漂移")
+
+    hooks = read_json_object(hooks_path, "hooks.json") or {}
+    expected_hooks = profile_compiler.merge_hooks_json(hooks, str(engine_path))
+    report["hooks"]["up_to_date"] = (
+        hooks.get("orca-agy-autopilot") == expected_hooks.get("orca-agy-autopilot")
+    )
+    if not hooks_path.is_file():
+        report["hooks"]["up_to_date"] = False
+    if not report["hooks"]["up_to_date"]:
+        report["drift"].append("hooks.json 的 orca-agy-autopilot 组缺失或已漂移")
+    if not engine_up_to_date:
+        report["drift"].append("autopilot.py 缺失或与当前技能版本不一致")
+    return report
+
+
+def uninstall(args: argparse.Namespace) -> dict[str, Any]:
+    with profile_lock(gemini_dir_for(args)):
+        return _uninstall_unlocked(args)
+
+
+def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
+    gemini_dir = gemini_dir_for(args)
+    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
+    profile_path = autopilot_dir / "profile.json"
+    config_path = autopilot_dir / "config.json"
+    scenes_dir = autopilot_dir / SCENES_SUBDIR
+    engine_path = autopilot_dir / ENGINE_NAME
+    gemini_md = gemini_dir / GEMINI_MD_SUBPATH
+    hooks_path = gemini_dir / HOOKS_SUBPATH
+
+    installed = profile_path.is_file() or engine_path.is_file()
+    removed: list[str] = []
+    hooks = read_json_object(hooks_path, "hooks.json")
+    if hooks is not None and "orca-agy-autopilot" in hooks:
+        atomic_write_text(hooks_path, json_text(profile_compiler.strip_hooks_json(hooks)))
+        removed.append("hooks.json:orca-agy-autopilot")
+
+    current_gemini = read_text(gemini_md)
+    stripped = profile_compiler.strip_gemini_md(current_gemini)
+    if stripped != current_gemini:
+        if stripped:
+            atomic_write_text(gemini_md, stripped)
+        else:
+            gemini_md.unlink()
+        removed.append("GEMINI.md:managed-block")
+
+    for path, label in (
+        (engine_path, "autopilot.py"),
+        (profile_path, "profile.json"),
+        (config_path, "config.json"),
+        (autopilot_dir / "project.json", "project.json"),
+    ):
+        if path.is_file():
+            path.unlink()
+            removed.append(label)
+
+    preserved_scenes = []
+    for path in sorted(scenes_dir.glob("*.md")) if scenes_dir.is_dir() else []:
+        if path.name in BUILTIN_SCENE_FILES:
+            path.unlink()
+            removed.append(f"scenes/{path.name}")
+        else:
+            preserved_scenes.append(path.name)
+
+    prune_empty_dir(scenes_dir)
+    prune_empty_dir(autopilot_dir)
+    preserved = [f"scenes/{name}" for name in preserved_scenes]
+    return {
+        "gemini_dir": str(gemini_dir),
+        "installed": installed,
+        "removed": removed,
+        "preserved": preserved,
+    }
+
+
+def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if args.profile:
+        overrides = read_profile_argument(args.profile)
+    if args.mode:
+        overrides.setdefault("autopilot", {})["mode"] = args.mode
+    if args.max_turns is not None:
+        overrides.setdefault("autopilot", {})["max_consecutive_auto_turns"] = args.max_turns
+    if args.worker_agents is not None:
+        overrides.setdefault("orchestration", {})["worker_agents"] = split_list(args.worker_agents)
+    if args.review_agents is not None:
+        overrides.setdefault("orchestration", {})["review_agents"] = split_list(args.review_agents)
+    if args.scenes is not None:
+        overrides.setdefault("scenes", {})["enabled_scenes"] = split_list(
+            args.scenes, allow_empty=True
+        )
+    if args.deliver_strategy:
+        overrides.setdefault("scenes", {})["deliver_strategy"] = args.deliver_strategy
+    if args.feedback_email is not None:
+        overrides.setdefault("scenes", {})["enable_feedback_email"] = args.feedback_email
+    if args.entry_shortcuts is not None:
+        overrides.setdefault("shortcuts", {})["enabled_entry"] = split_list(
+            args.entry_shortcuts, allow_empty=True
+        )
+    if args.guardrail:
+        overrides.setdefault("scenes", {})["guardrails"] = list(args.guardrail)
+    return overrides
+
+
+def read_profile_argument(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    candidate: Path | None = None
+    if text.startswith("@"):
+        candidate = Path(text[1:]).expanduser()
+    elif "\n" not in text and Path(text).expanduser().is_file():
+        candidate = Path(text).expanduser()
+    if candidate is not None:
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SetupError(f"无法读取 profile 文件 {candidate}: {exc}") from exc
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        raise SetupError(f"--profile 不是合法 JSON：{exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SetupError("--profile 必须是 JSON 对象")
+    return parsed
+
+
+def load_default_profile() -> dict[str, Any]:
+    try:
+        raw = json.loads(DEFAULT_PROFILE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SetupError(f"无法读取默认 profile {DEFAULT_PROFILE_PATH}: {exc}") from exc
+    return validate_profile(raw)
+
+
+def discover_project(args: argparse.Namespace, gemini_dir: Path) -> dict[str, Any] | None:
+    """Explicit choice, installed link, then nearest ancestor project."""
+    if args.no_project:
+        return None
+    if args.project:
+        path = Path(args.project).expanduser().resolve()
+        if path.is_dir():
+            path = path / ".pilot/project.json"
+        if not path.is_file():
+            raise SetupError(f"Project overlay not found: {path}")
+    else:
+        path = gemini_dir / AUTOPILOT_SUBDIR / "project.json"
+        if not path.is_file():
+            path = next(
+                (parent / ".pilot/project.json" for parent in (Path.cwd(), *Path.cwd().parents)
+                 if (parent / ".pilot/project.json").is_file()),
+                None,
+            )
+            if path is None:
+                return None
+    return normalize_project(read_json_object(path, "project.json"))
+
+
+def gemini_dir_for(args: argparse.Namespace) -> Path:
+    return Path(args.gemini_dir).expanduser().resolve()
+
+
+@contextmanager
+def profile_lock(gemini_dir: Path):
+    path = gemini_dir / AUTOPILOT_SUBDIR / ".autopilot.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_text(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def read_json_object(path: Path, label: str) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SetupError(f"{label} 无法解析（{path}）：{exc}") from exc
+    if not isinstance(value, dict):
+        raise SetupError(f"{label} 必须是 JSON 对象（{path}）")
+    return value
+
+
+def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
+    """Write next to the target and replace it, so readers never see a half file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def has_autopilot_hook_group(hooks_path: Path) -> bool:
+    hooks = read_json_object(hooks_path, "hooks.json") or {}
+    return "orca-agy-autopilot" in hooks
+
+
+def missing_cli_warnings(profile: dict[str, Any]) -> list[str]:
+    warnings = []
+    agents = profile["orchestration"]["worker_agents"] + profile["orchestration"]["review_agents"]
+    for name in dict.fromkeys(agents):
+        if not shutil.which(name):
+            warnings.append(f"未在 PATH 上找到 `{name}`；编排/审查命令需要队友自行安装")
+    if not shutil.which("orca"):
+        warnings.append("未在 PATH 上找到 `orca`；自动预填不会发送，请先安装 Orca CLI")
+    return warnings
+
+
+def split_list(raw: str, *, allow_empty: bool = False) -> list[str]:
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items and not allow_empty:
+        raise SetupError("列表参数不能为空")
+    return items
+
+
+def json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def prune_empty_dir(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def print_human(command: str, result: dict[str, Any]) -> None:
+    if command == "probe":
+        print(f"gemini_dir: {result['gemini_dir']}")
+        print("CLIs: " + ", ".join(
+            f"{name}={'yes' if path else 'no'}" for name, path in result["clis"].items()
+        ))
+        installed = result["installed"]
+        print(
+            "已安装: "
+            f"profile={installed['profile']} engine={installed['engine']} "
+            f"hooks={installed['hooks_group']} gemini_block={installed['gemini_block']}"
+        )
+        print("推荐预设: recommended")
+    elif command == "apply":
+        print(f"已应用预设：{result['preset']}（mode={result['mode']}）")
+        print("场景：" + ", ".join(result["scenes"]))
+        if result["removed_scenes"]:
+            print("已移除停用场景：" + ", ".join(result["removed_scenes"]))
+        if result["preserved"]:
+            print("已保留：" + ", ".join(result["preserved"]))
+        for warning in result["warnings"]:
+            print(f"注意：{warning}")
+    elif command == "status":
+        print(f"installed: {result['installed']}")
+        if "mode" in result:
+            print(f"mode: {result['mode']}  max_turns: {result['max_consecutive_auto_turns']}")
+            print("scenes: " + (", ".join(result["scenes"]) or "（无）"))
+        print("drift: " + ("none" if not result["drift"] else "; ".join(result["drift"])))
+    else:
+        print("removed: " + (", ".join(result["removed"]) or "（无）"))
+        if result["preserved"]:
+            print("preserved: " + ", ".join(result["preserved"]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

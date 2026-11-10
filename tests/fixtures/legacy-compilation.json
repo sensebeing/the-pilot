@@ -1,0 +1,943 @@
+{
+  "source_commit": "43c3df897c0",
+  "cases": [
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "d3ebb059889e0647357bc80ceeb3bff32189661d25e2d5a457d6202ad71d5d60",
+        "config_json": "067806c5c9186cbe1668820624839732508c3911ad4234710ef682cb88f4cc9e",
+        "scenes": "d7e6a02c0d9d58cd8883833145c5078559dccffcfe1e83bb1e5a3f5a845f0784",
+        "gemini_block": "b105e4a501626c872a39646b6ef078e45e824defac5c7ae154494233666d7b0a",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "42b8fcd7ed4f2685eebaa681b0920a69e76630022a0ed052f57c648b067be89c",
+        "config_json": "761c64bceb15fdfb439f4f80011e54d2163a9f5bd273637fbfa9c815e599a4f0",
+        "scenes": "851bf3f864a07ab69a87c65642b9b0417fa31ef65081a39b73f09006f667bb4c",
+        "gemini_block": "144b40b3ec51bbbdf25267d66c712be3280cbcf49f11717bec1b65f98943e53b",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "f18eb4489651bc1bd7ebf839626f9ea61c05fc1a567e35a6ce09f76d504d8de5",
+        "config_json": "067806c5c9186cbe1668820624839732508c3911ad4234710ef682cb88f4cc9e",
+        "scenes": "77314f96c8815049ac7b56de308685a5194317d010612a2e4a50012b0929babd",
+        "gemini_block": "fa9e07a8e7b5cc7ade476a574f8215cad987069a8e590856af3546b2de380e6f",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "b41a169bc18475e883a0b9ee02ba671d4547782f29258ced0705e3199f50b256",
+        "config_json": "761c64bceb15fdfb439f4f80011e54d2163a9f5bd273637fbfa9c815e599a4f0",
+        "scenes": "49568945aa9e8221e71f10a113494ab9f5ed9d7eaae914e121e289268551d888",
+        "gemini_block": "e5f45764e4c3295ba5c85866dc4bd3eab2bec229394f1fb1d5237f793106183b",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "b4dab9505e415154fac94fffc997967a7aa8becd21c5b7021b16a48fc77f8d1c",
+        "config_json": "067806c5c9186cbe1668820624839732508c3911ad4234710ef682cb88f4cc9e",
+        "scenes": "d099b051d120ca32ea4db1d271cccf6ff9cb607ae7b1ce95208bb6aa6b99415f",
+        "gemini_block": "850666d244deb94a8933aa1733186431ce45b6aa2b3c5a575700642e7c384bae",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "83723712cf0fafdd8f96b3e0474e641cd0775c1baee78b1cb74a346cf9bf39bb",
+        "config_json": "761c64bceb15fdfb439f4f80011e54d2163a9f5bd273637fbfa9c815e599a4f0",
+        "scenes": "2fdd1764c38ef897a73c2943520303c06c0be6c302946f998cb5270bc565e4a7",
+        "gemini_block": "d59cd0db07f94ed4df74b32d937932b305497dd35c5758f53bf3939780c11206",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "4d5eb2daf81e87d6388a19f3aee47be9d9b87e11098a682ee9d55bb3f6e0b3da",
+        "config_json": "067806c5c9186cbe1668820624839732508c3911ad4234710ef682cb88f4cc9e",
+        "scenes": "b7c9fa9e97208d186fff5eef0e160fed998c72e532071583f86fc7696d3e19f0",
+        "gemini_block": "8aa8ee1db982cbb3d52532c3e9cdd22aab3938724a315e89d3c20ef4614fdf74",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "e767722f6fcecf53a54fbb4ff130bbe91ca055a7056b429aea902837a37fd148",
+        "config_json": "761c64bceb15fdfb439f4f80011e54d2163a9f5bd273637fbfa9c815e599a4f0",
+        "scenes": "c4f5d3cda90cbd1f1a1169cfa32a308fd1a4c6e9c5be39043ca80cf067a43759",
+        "gemini_block": "f5d267eb7b18364458b9bfcc1f9588ee64a87096c6714148e0b5167e965b2de2",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "e6a40dbd42c822d3853092a634e9f123eb971002efbc615dfb7c1d2247b59b73",
+        "config_json": "067806c5c9186cbe1668820624839732508c3911ad4234710ef682cb88f4cc9e",
+        "scenes": "55cbb1c0afa7a4f1dd67d065c069babc1a787b54f784372d88e9331c3fedae3d",
+        "gemini_block": "51093c3ffe6fadd967e9017226975522d9256a50d7b53163cc7fbbb5dcb5ddb2",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "c6283ae568e4943a9425b7e258fae0b82caf4430524fcddb74d56b534ded0264",
+        "config_json": "761c64bceb15fdfb439f4f80011e54d2163a9f5bd273637fbfa9c815e599a4f0",
+        "scenes": "83cb33c9fd41fa05c74f27847c31e1e62e630330617c57e046dcb01521adc18e",
+        "gemini_block": "0a1a3143218a7d1bf357eb6f845f1da7207ece0fda8348683f252c3eee85dc7f",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "c5b412aaee9fe559475b984514c588991f958189d1bec5573c3c7915607749cf",
+        "config_json": "067806c5c9186cbe1668820624839732508c3911ad4234710ef682cb88f4cc9e",
+        "scenes": "7abee279c42cd524c4fa98d62f5af038f66a1357a1331458bd44d3506fe1e004",
+        "gemini_block": "fbca6c4149f1dae8285a6b639f5788c9ff5d7384949a5bf834c5a38d56173176",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "recommended",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "92236ad256aefd20fc6b372b99b8149defd81d7541c841d8dfa516a1db353988",
+        "config_json": "761c64bceb15fdfb439f4f80011e54d2163a9f5bd273637fbfa9c815e599a4f0",
+        "scenes": "dc27d027777bdc4c1feb3ee1e5b4b32226f81a8d17f060535f743b2fc740aaab",
+        "gemini_block": "f03dc4bb1a622cb5ea5ae87bbfd2226de33dad6e6173d015926db6c1bd48d83b",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "47e3fe3e050569080bf4f2168846b4b8fe83283f0f9b54c560b500849ceb71b7",
+        "config_json": "2d72e77d88cc1886ff0aa19665c60f9b64236fb7de2bad98fed8692eefb231de",
+        "scenes": "d7e6a02c0d9d58cd8883833145c5078559dccffcfe1e83bb1e5a3f5a845f0784",
+        "gemini_block": "8233cdb899bf0897b7e3a235ae3a765a43ca0444111826395960a72d859b0aaf",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "510df397a1db6c18c24e2ecb6042937050ef0f17add4419a92fc60deb2d1feed",
+        "config_json": "82eabccbdc1028665e43b8de33cc34b42b986a3ac5ba6e9e2808e9937951736e",
+        "scenes": "851bf3f864a07ab69a87c65642b9b0417fa31ef65081a39b73f09006f667bb4c",
+        "gemini_block": "bf48d04e4f71afef07edbc2adc04388a4cd6b229018598916dbf4f365c73f523",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "e2d9614cb659c19158bdaf9f1af109146bbfb3893ec4540de21b8e971ad7ae0b",
+        "config_json": "2d72e77d88cc1886ff0aa19665c60f9b64236fb7de2bad98fed8692eefb231de",
+        "scenes": "77314f96c8815049ac7b56de308685a5194317d010612a2e4a50012b0929babd",
+        "gemini_block": "5c3b275a285c058636988f9dea18b5f4806d75da8d9c9214b43f746ddfaa74bb",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "e150c253d736611d794d01c54f780d9437ea4e43194cd302f851a93b380269d0",
+        "config_json": "82eabccbdc1028665e43b8de33cc34b42b986a3ac5ba6e9e2808e9937951736e",
+        "scenes": "49568945aa9e8221e71f10a113494ab9f5ed9d7eaae914e121e289268551d888",
+        "gemini_block": "8408424be09d60a8a51d3d523a0d222f0e3d25418759dfdc783ea9e2707450c7",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "f07104f90a372bb97e54e842714c919ae58a72af01328d54fdc0f585ef7f74f2",
+        "config_json": "2d72e77d88cc1886ff0aa19665c60f9b64236fb7de2bad98fed8692eefb231de",
+        "scenes": "d099b051d120ca32ea4db1d271cccf6ff9cb607ae7b1ce95208bb6aa6b99415f",
+        "gemini_block": "2f890043de79906e1a2a944edf34682e973089f6815016a74303272fbc3d4586",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "666b6c73f8ef6c4657297ecd91c9e1b6632a6b4ce916490fae05a69cab95f6e2",
+        "config_json": "82eabccbdc1028665e43b8de33cc34b42b986a3ac5ba6e9e2808e9937951736e",
+        "scenes": "2fdd1764c38ef897a73c2943520303c06c0be6c302946f998cb5270bc565e4a7",
+        "gemini_block": "a18e5c21c7a2d1d17fafc0bdd3f06c2da204a1761d2e06a822893dc49caff09b",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "0e231557ab37065f00479b55e3c610867e492abac2adb5a31b3eb4e77ea58792",
+        "config_json": "2d72e77d88cc1886ff0aa19665c60f9b64236fb7de2bad98fed8692eefb231de",
+        "scenes": "b7c9fa9e97208d186fff5eef0e160fed998c72e532071583f86fc7696d3e19f0",
+        "gemini_block": "9f69a25cc636184d1089fd218690a625682610cda451d89096c235577d6cea80",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "16f034ef6dcbd9c0f937790cc7f67139b235bc4a2545019d8bf99ce4bccd43a3",
+        "config_json": "82eabccbdc1028665e43b8de33cc34b42b986a3ac5ba6e9e2808e9937951736e",
+        "scenes": "c4f5d3cda90cbd1f1a1169cfa32a308fd1a4c6e9c5be39043ca80cf067a43759",
+        "gemini_block": "2dfdab8da25a629551e2706208140646e80b6dd1218a74fb47b245f4b1caf881",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "04397133b9d81cf9fa377031eae54a4d3807f23fabca490885e5d5836a61cdc1",
+        "config_json": "2d72e77d88cc1886ff0aa19665c60f9b64236fb7de2bad98fed8692eefb231de",
+        "scenes": "55cbb1c0afa7a4f1dd67d065c069babc1a787b54f784372d88e9331c3fedae3d",
+        "gemini_block": "b25931c0e81f5a33b07f248b6a3eef41dd700adf79d815eb2b6c9642b6eb62db",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "15439d90bdd350a63622ea14c95d6bd8d8abbc1af2c37800e950f10740f016c7",
+        "config_json": "82eabccbdc1028665e43b8de33cc34b42b986a3ac5ba6e9e2808e9937951736e",
+        "scenes": "83cb33c9fd41fa05c74f27847c31e1e62e630330617c57e046dcb01521adc18e",
+        "gemini_block": "fcc351d11f8077194112523c4e07ba0c1d95b6ac608922b2df6c9c7c30e414c9",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "a151ae76d18b8ee14aeeeed4ab54ef3f1da8f4a179a413bbab66d016ea45d202",
+        "config_json": "2d72e77d88cc1886ff0aa19665c60f9b64236fb7de2bad98fed8692eefb231de",
+        "scenes": "7abee279c42cd524c4fa98d62f5af038f66a1357a1331458bd44d3506fe1e004",
+        "gemini_block": "6d7146f39387017c8aa06dad9dbbcebf15e58c3360757393564d1c2b56353381",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "conservative",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "0d4c1a71d1c7e6231f3decfe059fdd403c806ee71b4608095c25509dec997ae5",
+        "config_json": "82eabccbdc1028665e43b8de33cc34b42b986a3ac5ba6e9e2808e9937951736e",
+        "scenes": "dc27d027777bdc4c1feb3ee1e5b4b32226f81a8d17f060535f743b2fc740aaab",
+        "gemini_block": "387cff30bfcfa8a2175fc61f417385194c388c54c1baf6248c6b1a5c5a1357b9",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "adaa9bad7baa4fe8116e379a4691eeafe686be7972f726207568caf791f07a37",
+        "config_json": "bac1f7f722fb3de4a0a4076fdc45a81a3c598e029928c5610120a9e89b6cfc87",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "786963604da78f761628ef0419357885e614f95c2ee3d2634e2d88c8309ccfbe",
+        "config_json": "5f57ae7ae1cd4b9880372c4672c5d9ec91f6c05df8a27940461aafa0b74cbd00",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "df20edf080ffc36ceb3741496693bd2f6ad1347f51ba29a4a4671f554f57ef19",
+        "config_json": "bac1f7f722fb3de4a0a4076fdc45a81a3c598e029928c5610120a9e89b6cfc87",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_e2e",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "2f4e9ef7cbe4e385a94993c5849504ab4917fb3914ff17a515ed9ba4e1f144fd",
+        "config_json": "5f57ae7ae1cd4b9880372c4672c5d9ec91f6c05df8a27940461aafa0b74cbd00",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "10fde766b6a38d98011a9ab6f21199c45a5958e4f8bea4a2e6c973ff2953e1f8",
+        "config_json": "bac1f7f722fb3de4a0a4076fdc45a81a3c598e029928c5610120a9e89b6cfc87",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "b2c070c49eb53b7d8828fa27711731d05e634c721d63a17b1615e08541e6b4fa",
+        "config_json": "5f57ae7ae1cd4b9880372c4672c5d9ec91f6c05df8a27940461aafa0b74cbd00",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "6ab52a22cdcdbce0774b469f558e54c98710409265d9547199d7f65a9c59ca59",
+        "config_json": "bac1f7f722fb3de4a0a4076fdc45a81a3c598e029928c5610120a9e89b6cfc87",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "merge_dev_only",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "f8a4d8507486f94241562eb4ec9232053cc2dd797c2b178365e3163b678f89f7",
+        "config_json": "5f57ae7ae1cd4b9880372c4672c5d9ec91f6c05df8a27940461aafa0b74cbd00",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": false
+        }
+      },
+      "sha256": {
+        "profile_json": "c4213a032c1211f8a35e4cca0d3aaae8b47ea3eb6db45fc72a8cc593ba2bfe3e",
+        "config_json": "bac1f7f722fb3de4a0a4076fdc45a81a3c598e029928c5610120a9e89b6cfc87",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": false,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "985ff7129d373be0e1056358403e1f880883061f0ccd585932cf4f5dce774125",
+        "config_json": "5f57ae7ae1cd4b9880372c4672c5d9ec91f6c05df8a27940461aafa0b74cbd00",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": true
+        }
+      },
+      "sha256": {
+        "profile_json": "174d20299b492636e0dcd0196c286ab86102eece67b0e7b3a5b6698ae9d0c90b",
+        "config_json": "bac1f7f722fb3de4a0a4076fdc45a81a3c598e029928c5610120a9e89b6cfc87",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    },
+    {
+      "preset": "orchestration-only",
+      "overrides": {
+        "scenes": {
+          "deliver_strategy": "local_verify_only",
+          "enable_feedback_email": true,
+          "guardrails": [
+            "Keep ownership explicit.",
+            "核验真实结果"
+          ]
+        },
+        "shortcuts": {
+          "custom_entry": {
+            "go": "Implement {arg}"
+          },
+          "custom_comma": {
+            "ts": {
+              "template": "Run focused tests",
+              "aliases": [
+                ",test-now"
+              ]
+            }
+          },
+          "template_overrides": {
+            "go": "Review {arg}"
+          }
+        }
+      },
+      "sha256": {
+        "profile_json": "4262bd0400b7fe99965c75e636a5e403eba0eb2b95f41bfb11d904a59654418f",
+        "config_json": "5f57ae7ae1cd4b9880372c4672c5d9ec91f6c05df8a27940461aafa0b74cbd00",
+        "scenes": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+        "gemini_block": "f767d58dbf0bb09ca08957864e6efcb236719d2309c781638946f73fdbbf2f6e",
+        "hooks": "0787017b8fde54e09c845e0b073499d9e6fd68d737e5cb295630e67b6c0d9e55"
+      }
+    }
+  ],
+  "runtime_sha256": "8d1b27cb3c1b59ab3122aa0b2751b2897d4d003de0d023a4c3eb440c86e39631",
+  "compiler_sha256": "46708ddb86d3958decdd959a2475a47537128e8d6cfa23eb921c95b1ab2b6f2d"
+}

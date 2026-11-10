@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "the-pilot"
+version = "0.1.0"
+description = "Scene-based turn automation and Orca orchestration governance"
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+readme = "README.md"
+
+[project.scripts]
+pilot = "the_pilot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+the_pilot = ["assets/*.py", "assets/*.json"]

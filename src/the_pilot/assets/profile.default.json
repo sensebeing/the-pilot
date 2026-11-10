@@ -1,0 +1,40 @@
+{
+  "schema": "orca-autopilot-profile/v1",
+  "orchestration": {
+    "worker_agents": [
+      "claude",
+      "codex"
+    ],
+    "review_agents": [
+      "codex",
+      "claude",
+      "agy"
+    ]
+  },
+  "autopilot": {
+    "mode": "gate",
+    "max_consecutive_auto_turns": 8
+  },
+  "scenes": {
+    "enabled_scenes": [
+      "plan-and-orchestrate",
+      "architecture-re-review",
+      "deliver-and-verify",
+      "closeout-and-sync"
+    ],
+    "deliver_strategy": "merge_dev_only",
+    "enable_feedback_email": false,
+    "guardrails": []
+  },
+  "shortcuts": {
+    "enabled_entry": [
+      "r",
+      "rt",
+      "d",
+      "pull"
+    ],
+    "custom_entry": {},
+    "custom_comma": {},
+    "template_overrides": {}
+  }
+}
