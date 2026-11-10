@@ -1,0 +1,120 @@
+{
+  "manifest_file": "AGENTS.md",
+  "manifest_tag": "the-guard-policy",
+  "detail_manifest_ref": "AGENTS.md#engineering-quality-policy",
+  "detail_dir": "docs/standards/rules",
+  "topology": {
+    "python_prod_prefixes": [
+      "src/"
+    ],
+    "modules": [
+      {
+        "path": "src/the_pilot",
+        "languages": [
+          "Python"
+        ],
+        "boundary_docs": [
+          "src/the_pilot/README.md"
+        ],
+        "dependencies": []
+      }
+    ],
+    "forbidden_imports": [
+      {
+        "scope_prefixes": [
+          "src/the_pilot/assets/"
+        ],
+        "imports": [
+          "the_pilot"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Installed autopilot.py must remain a standalone standard-library script without importing the_pilot."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/defaults.py"
+        ],
+        "imports": [
+          "the_pilot.project",
+          "the_pilot.profile",
+          "the_pilot.compiler",
+          "the_pilot.installer",
+          "the_pilot.runtime",
+          "the_pilot.cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "defaults.py owns static universal catalogs and must not import higher layers."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/project.py"
+        ],
+        "imports": [
+          "the_pilot.profile",
+          "the_pilot.compiler",
+          "the_pilot.installer",
+          "the_pilot.runtime",
+          "the_pilot.cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "project.py may only depend on defaults.py."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/profile.py"
+        ],
+        "imports": [
+          "the_pilot.compiler",
+          "the_pilot.installer",
+          "the_pilot.runtime",
+          "the_pilot.cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "profile.py may only depend on defaults.py and project.py."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/compiler.py"
+        ],
+        "imports": [
+          "the_pilot.installer",
+          "the_pilot.runtime",
+          "the_pilot.cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "compiler.py is pure in-memory compilation and must not import installer, runtime or cli."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/installer.py",
+          "src/the_pilot/runtime.py"
+        ],
+        "imports": [
+          "the_pilot.cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Execution layers must not import the CLI entrypoint."
+      }
+    ],
+    "forbidden_patterns": [
+      {
+        "scope_prefixes": [
+          "src/the_pilot/",
+          "skills/"
+        ],
+        "literal_or_regex": "\\b(alter-service|alter-alert|alter-feedback|pending-prod-publish)\\b",
+        "literal": false,
+        "rule_id": "guard.architecture-simplicity",
+        "message": "Keep project-specific policy in .pilot/project.json overlays, not in the universal package or skills."
+      }
+    ]
+  },
+  "review": {
+    "project_title": "the-pilot",
+    "extra_reviewable_paths": [
+      "docs/standards/rules/**",
+      "skills/**",
+      "examples/**"
+    ]
+  }
+}

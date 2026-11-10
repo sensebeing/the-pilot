@@ -124,7 +124,9 @@ runtime inputs, while an upgrade recompiles them from the durable preferences.
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
-/path/to/the-guard/bin/guard check --repo-root . --policy-only
+guard check --repo-root . --policy-only
+guard check --repo-root . --base origin/main
+guard review --repo-root .
 ```
 
 Tests use temporary roots, fake Orca and explicit isolation. The imported

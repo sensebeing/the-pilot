@@ -5,10 +5,12 @@ before changing code. Keep project-specific policy in overlays, not the universa
 compiler or runtime. Installed `autopilot.py` must remain a standalone standard
 library script. Do not add a second runtime implementation.
 
-Run `PYTHONPATH=src python3 -m unittest discover -s tests -v` with Python 3.11+.
-Every test must use a temporary directory and explicit Gemini-root isolation;
-never read or write real user configuration as test data. New resident tests
-must explain the stable behavioral fact they protect.
+Run `PYTHONPATH=src python3 -m unittest discover -s tests -v` and
+`guard check --repo-root . --base origin/main` with Python 3.11+, then run
+`guard review` before pushing to `main`. Every test must use a temporary
+directory and explicit Gemini-root isolation; never read or write real user
+configuration as test data. New resident tests must explain the stable
+behavioral fact they protect.
 
 ## Engineering Quality Policy
 
@@ -39,6 +41,24 @@ rules:
     scope: [backend, frontend, api, schema, shared, tool, skill, prompt, test]
     summary: Modules, files, classes and methods have clear cohesive responsibilities and names.
     details: docs/standards/rules/code-organization.md
+    checker: static-plus-review
+  - id: guard.no-silent-fallback
+    severity: block
+    scope: [backend, frontend, api, schema, shared, tool, skill, prompt, test]
+    summary: Never fabricate business facts or hide failures behind defaults, bypasses or recovery paths.
+    details: docs/standards/rules/no-silent-fallback.md
+    checker: static-plus-review
+  - id: guard.agent-skill-prompt
+    severity: block
+    scope: [backend, frontend, api, schema, shared, tool, skill, prompt, test]
+    summary: Skills, prompts and agent configuration reference authoritative services and structured results; they do not copy state machines, business vocabularies or classification logic.
+    details: docs/standards/rules/agent-skill-prompt.md
+    checker: static-plus-review
+  - id: guard.test-case-quality
+    severity: block
+    scope: [backend, frontend, api, schema, shared, tool, skill, prompt, test]
+    summary: Resident tests protect current core business facts and declare what their failure means.
+    details: docs/standards/rules/test-case-quality.md
     checker: static-plus-review
 ```
 <!-- the-guard-policy:end -->

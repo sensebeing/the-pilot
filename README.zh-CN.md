@@ -103,7 +103,9 @@ pilot apply --no-project --json
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
-/path/to/the-guard/bin/guard check --repo-root . --policy-only
+guard check --repo-root . --policy-only
+guard check --repo-root . --base origin/main
+guard review --repo-root .
 ```
 
 所有测试用临时目录、显式隔离和 fake Orca，不触碰真实个人配置。
