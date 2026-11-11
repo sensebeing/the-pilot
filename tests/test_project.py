@@ -265,7 +265,7 @@ class ProjectTest(unittest.TestCase):
             }),
             json.dumps({
                 "type": "user",
-                "timestamp": int(now * 1000),
+                "timestamp": int((now - 86400) * 1000),
                 "message": {"content": "继续"},
             }),
             json.dumps({
@@ -293,6 +293,11 @@ class ProjectTest(unittest.TestCase):
         os.utime(claude_c2, (now - 30, now - 30))
         claude_hist = home / ".claude/history.jsonl"
         claude_hist.write_text("\n".join([
+            json.dumps({
+                "sessionId": "c1",
+                "timestamp": int((now - 1800) * 1000),
+                "display": "继续",
+            }),
             json.dumps({
                 "sessionId": "c1",
                 "timestamp": int(now * 1000),
@@ -334,7 +339,7 @@ class ProjectTest(unittest.TestCase):
         codex_hist = home / ".codex/history.jsonl"
         codex_hist.write_text(json.dumps({
             "session_id": codex_uuid,
-            "ts": int(now),
+            "ts": int(now - 60),
             "text": "合并当前分支到 main 并完成实跑验证",
         }) + "\n")
 
@@ -351,8 +356,8 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(report["schema"], "the-pilot-distillation/v1")
         self.assertEqual(report["config_status"]["status"], "absent")
         self.assertEqual(report["sources"]["antigravity"]["sampled_files"], 2)
-        # Claude c1 has 4 human turns (opener + 2x "继续" + 1x deliver); history mirror of opener + 1x "继续" is not double-counted; c_extra adds 1
-        self.assertEqual(report["sources"]["claude"]["human_messages"], 5)
+        # Claude c1 has 4 distinct in-window turns (1x "继续" from 24h ago in file, 1x "继续" from 30m ago in history, 1x "继续" at now mirrored in both, 1x deliver); c2 has 1; c_extra has 1
+        self.assertEqual(report["sources"]["claude"]["human_messages"], 6)
         self.assertEqual(report["sources"]["claude"]["filtered_machine_messages"], 1)
         # Codex rollout event_msg + response_item + history.jsonl mirror of same UUID session counts once
         self.assertEqual(report["sources"]["codex"]["human_messages"], 1)
@@ -372,7 +377,7 @@ class ProjectTest(unittest.TestCase):
 
         by_sig = {item["signature"]: item for item in report["recurring_patterns"]}
         self.assertIn("继续", by_sig)
-        self.assertEqual(by_sig["继续"]["count"], 3)
+        self.assertEqual(by_sig["继续"]["count"], 4)
         self.assertEqual(by_sig["继续"]["category"], "continue_nudge")
         self.assertEqual(by_sig["继续"]["agents"], ["claude", "cursor"])
 
@@ -417,14 +422,26 @@ class ProjectTest(unittest.TestCase):
             }
         }), encoding="utf-8")
         claude_c3 = home / ".claude/projects/demo/c3.jsonl"
-        claude_c3.write_text(json.dumps({
-            "type": "user",
-            "timestamp": int(now * 1000),
-            "message": {"content": "ti auth-service"},
-        }) + "\n")
+        claude_c3.write_text("\n".join([
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": "ti auth-service"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": "ti billing-service"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": "ti"},
+            }),
+        ]) + "\n")
         with_shortcuts = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
         self.assertEqual(with_shortcuts["config_status"]["status"], "ok")
-        self.assertEqual(with_shortcuts["autopilot_activity"].get("entry:ti"), 1)
+        self.assertEqual(with_shortcuts["autopilot_activity"].get("entry:ti"), 2)
         # Template-similar free-form prompts remain in manual_messages and surface in uncertain_template_matches
         self.assertEqual(with_shortcuts["uncertain_template_matches"].get("entry:ti"), 2)
         cfg_path.unlink()

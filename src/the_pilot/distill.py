@@ -27,6 +27,7 @@ MAX_EXAMPLES_PER_PATTERN = 3
 MAX_PATTERNS = 25
 MAX_SAMPLED_PROMPTS = 30
 MAX_ERRORS_PER_SOURCE = 5
+HISTORY_MIRROR_MAX_DELTA_SECONDS = 60.0
 
 AUTOPILOT_COMMENT_OPEN = "<!--"
 AUTOPILOT_COMMENT_CLOSE = "-->"
@@ -138,7 +139,7 @@ def distill_chat_history(
             unknown_role_count += 1
 
         matched_autopilot = item.get("tag_provenance") or _match_installed_autopilot(
-            item["text"], installed_shortcuts, role
+            item["text"], installed_shortcuts
         )
         if matched_autopilot is not None:
             autopilot_counts[matched_autopilot] += 1
@@ -777,7 +778,9 @@ def _reconcile_history_records(
             if file_text != text:
                 continue
             delta = abs(file_ts - ts)
-            if best_delta is None or delta < best_delta:
+            if delta <= HISTORY_MIRROR_MAX_DELTA_SECONDS and (
+                best_delta is None or delta < best_delta
+            ):
                 best_delta = delta
                 matched_idx = idx
         if matched_idx >= 0:
@@ -1027,7 +1030,7 @@ def _load_installed_shortcuts(gemini_dir: Path) -> tuple[dict[str, Any], list[di
                 aliases.append(f",{canonical.lower()}")
             shortcuts.append({
                 "label": f"{label_prefix}{canonical}",
-                "canonical_key": canonical.lower(),
+                "canonical_key": canonical,
                 "is_entry": is_entry,
                 "requires_arg": raw_requires_arg,
                 "aliases": sorted(set(aliases)),
@@ -1036,33 +1039,63 @@ def _load_installed_shortcuts(gemini_dir: Path) -> tuple[dict[str, Any], list[di
     return {"status": "ok", "path": str(config_path), "shortcuts_loaded": len(shortcuts)}, shortcuts
 
 
-def _match_installed_autopilot(
-    text: str, shortcuts: list[dict[str, Any]], turn_role: str
-) -> str | None:
+def _command_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
+    if comma:
+        if not text.startswith(","):
+            return "", ""
+        text = text[1:].lstrip()
+    parts = text.split(maxsplit=1)
+    return (parts[0], parts[1].strip() if len(parts) == 2 else "") if parts else ("", "")
+
+
+def _named_command(text: str, names: set[str], targets: set[str], default: str = "") -> str:
+    name, arg = _command_parts(text, comma=True)
+    if name.lower() not in names:
+        return ""
+    target = arg.lower() or default
+    return target if target in targets else ""
+
+
+def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
+    raw = text[1:] if comma and text.startswith(",") else text
+    if comma and (not text.startswith(",") or not raw or raw[0].isspace()):
+        return "", ""
+    key, arg = _command_parts(raw)
+    checked = key.lower() if comma else key
+    if not checked or not all(ch in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in checked):
+        return "", ""
+    if not comma and checked[0] not in "abcdefghijklmnopqrstuvwxyz":
+        return "", ""
+    return ("," + checked if comma else checked), arg
+
+
+def _match_installed_autopilot(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
     stripped = text.strip()
-    lower = stripped.lower()
-    if lower in (",1", ",2", ",3") or lower.startswith((",1 ", ",2 ", ",3 ")):
-        return f"candidate:{lower.split()[0]}"
-    if lower.startswith(",mode"):
-        return "command:,mode"
-    if lower.startswith((",worker", ",agent")):
+    if _named_command(
+        stripped, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status"
+    ):
         return "command:,worker"
-    if lower.startswith(",autopilot"):
+    if _named_command(stripped, {"mode"}, {"gate", "confirm", "off", "status"}):
+        return "command:,mode"
+    if _named_command(stripped, {"autopilot"}, {"recover"}):
         return "command:,autopilot"
-    tokens = lower.split(maxsplit=1)
-    if not tokens:
-        return None
-    first_token = tokens[0]
-    has_arg = len(tokens) > 1 and bool(tokens[1].strip())
-    for item in shortcuts:
-        if first_token.startswith(",") and first_token in item["aliases"]:
-            if item["requires_arg"] and not has_arg:
-                continue
-            return item["label"]
-        if item["is_entry"] and turn_role == "entry" and first_token == item["canonical_key"]:
-            if item["requires_arg"] and not has_arg:
-                continue
-            return item["label"]
+    candidate, _ = _command_parts(stripped, comma=True)
+    if candidate in {"1", "2", "3"}:
+        return f"candidate:,{candidate}"
+    alias, comma_arg = _shortcut_parts(stripped, comma=True)
+    if alias:
+        for item in shortcuts:
+            if alias in item["aliases"]:
+                if item["requires_arg"] and not comma_arg:
+                    continue
+                return item["label"]
+    key, bare_arg = _shortcut_parts(stripped, comma=False)
+    if key:
+        for item in shortcuts:
+            if item["is_entry"] and key == item["canonical_key"]:
+                if item["requires_arg"] and not bare_arg:
+                    continue
+                return item["label"]
     return None
 
 
