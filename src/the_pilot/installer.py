@@ -640,6 +640,11 @@ def print_human(command: str, result: dict[str, Any]) -> None:
             f"{agent}(sampled={info['sampled_files']}/{info['discovered_files']}, msgs={info['human_messages']})"
             for agent, info in result["sources"].items()
         ))
+        findings = result.get("pipeline_assessment", {}).get("findings", [])
+        if findings:
+            print("pipeline findings: " + ", ".join(
+                f"{item['code']}({item['stage']})" for item in findings
+            ))
         for item in result["recurring_patterns"][:10]:
             print(f"[{item['count']}x][{item['category']}] {item['signature']}")
     else:

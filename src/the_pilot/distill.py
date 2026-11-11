@@ -9,11 +9,17 @@ recommendations for agent-assisted setup or tuning.
 from __future__ import annotations
 
 from collections import Counter, deque
+import copy
 from datetime import datetime
 import json
 from pathlib import Path
 import time
 from typing import Any
+
+from .compiler import split_frontmatter
+from .defaults import DEFAULT_SPECS, PIPELINE_STAGE_CONTRACTS, SCENE_ORDER
+from .profile import validate_profile
+from .project import ProfileError, project_specs
 
 DISTILL_SCHEMA = "the-pilot-distillation/v1"
 DEFAULT_DAYS = 7
@@ -93,6 +99,7 @@ def distill_chat_history(
     current_ts = float(time.time() if now_ts is None else now_ts)
     cutoff_ts = current_ts - days * 86400.0
     config_status, installed_shortcuts = _load_installed_shortcuts(gemini_dir)
+    installed_pipeline = _inspect_installed_pipeline(gemini_dir)
 
     sources: dict[str, dict[str, Any]] = {}
     all_records: list[dict[str, Any]] = []
@@ -211,6 +218,8 @@ def distill_chat_history(
 
     evidence_complete = (
         config_status.get("status") != "error"
+        and installed_pipeline["profile_status"] != "error"
+        and installed_pipeline["scenes_status"] != "error"
         and all(
             src["status"] != "degraded"
             and src["truncated_files"] == 0
@@ -218,8 +227,10 @@ def distill_chat_history(
             for src in sources.values()
         )
     )
+    pipeline_assessment = _analyze_pipeline_flow(all_records, manual_records, installed_pipeline)
     recommendations = _build_recommendations(
-        recurring_patterns, autopilot_counts, manual_records, config_status, evidence_complete
+        recurring_patterns, autopilot_counts, manual_records, config_status, evidence_complete,
+        pipeline_assessment,
     )
     sampled_prompts = _sample_diverse_prompts(manual_records, limit=MAX_SAMPLED_PROMPTS)
 
@@ -242,6 +253,7 @@ def distill_chat_history(
         "autopilot_activity": dict(autopilot_counts.most_common(15)),
         "uncertain_template_matches": dict(uncertain_template_counts.most_common(15)),
         "recurring_patterns": recurring_patterns,
+        "pipeline_assessment": pipeline_assessment,
         "recommendations": recommendations,
         "sampled_prompts": sampled_prompts,
         "next_step": (
@@ -976,6 +988,206 @@ def _is_machine_message(text: str) -> bool:
     return False
 
 
+def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
+    """Inspect the installed profile and scene contracts without guessing."""
+    profile_path = gemini_dir / "config/autopilot/profile.json"
+    project_path = gemini_dir / "config/autopilot/project.json"
+    scenes_dir = gemini_dir / "config/autopilot/scenes"
+    result: dict[str, Any] = {
+        "profile_status": "absent" if not profile_path.is_file() else "ok",
+        "scenes_status": "absent" if not scenes_dir.is_dir() else "ok",
+        "mode": None,
+        "max_consecutive_auto_turns": None,
+        "deliver_strategy": None,
+        "enabled_scenes": [],
+        "missing_stages": list(SCENE_ORDER),
+        "custom_scene_files": [],
+        "incomplete_scene_contracts": [],
+        "guardrail_count": 0,
+        "redundant_guardrails": [],
+    }
+    specs = DEFAULT_SPECS
+    if profile_path.is_file():
+        try:
+            raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            project_raw = (
+                json.loads(project_path.read_text(encoding="utf-8"))
+                if project_path.is_file()
+                else None
+            )
+            profile = validate_profile(raw_profile, project=project_raw)
+        except (OSError, ProfileError, json.JSONDecodeError) as exc:
+            result["profile_status"] = "error"
+            result["error"] = str(exc)
+        else:
+            specs = project_specs(project_raw)
+            autopilot = profile["autopilot"]
+            scenes = profile["scenes"]
+            enabled_scenes = scenes["enabled_scenes"]
+            result.update({
+                "mode": autopilot["mode"],
+                "max_consecutive_auto_turns": autopilot["max_consecutive_auto_turns"],
+                "deliver_strategy": scenes["deliver_strategy"],
+                "enabled_scenes": list(enabled_scenes),
+                "missing_stages": [stage for stage in SCENE_ORDER if stage not in enabled_scenes],
+                "guardrail_count": len(scenes["guardrails"]),
+            })
+            required_guardrails = [
+                spec["required_guardrail"]
+                for spec in specs["scene_specs"].values()
+                if spec["required_guardrail"]
+            ]
+            result["redundant_guardrails"] = sorted({
+                guardrail for guardrail in scenes["guardrails"]
+                if any(
+                    guardrail in required_guardrail or required_guardrail in guardrail
+                    for required_guardrail in required_guardrails
+                )
+            })
+
+    stage_by_file = {
+        spec["file"]: stage for stage, spec in specs["scene_specs"].items()
+    }
+    if scenes_dir.is_dir():
+        try:
+            scene_files = sorted(path for path in scenes_dir.glob("*.md") if path.is_file())
+            present_files = {path.name for path in scene_files}
+            result["custom_scene_files"] = sorted(
+                name for name in present_files if name not in stage_by_file
+            )
+            incomplete: set[str] = set()
+            for path in scene_files:
+                meta, body = split_frontmatter(path.read_text(encoding="utf-8"))
+                stage = stage_by_file.get(path.name)
+                missing_guardrail = (
+                    stage is not None
+                    and specs["scene_specs"][stage]["required_guardrail"]
+                    and not str(meta.get("required_guardrail") or "").strip()
+                )
+                if (
+                    not str(meta.get("description") or "").strip()
+                    or not str(meta.get("fallback_prompt") or "").strip()
+                    or not body.strip()
+                    or missing_guardrail
+                ):
+                    incomplete.add(path.name)
+            if result["profile_status"] == "ok":
+                for stage in result["enabled_scenes"]:
+                    scene_file = specs["scene_specs"][stage]["file"]
+                    if scene_file not in present_files:
+                        incomplete.add(scene_file)
+            result["incomplete_scene_contracts"] = sorted(incomplete)
+        except (OSError, ValueError) as exc:
+            result["scenes_status"] = "error"
+            result.setdefault("error", str(exc))
+    return result
+
+
+def _analyze_pipeline_flow(
+    all_records: list[dict[str, Any]],
+    manual_records: list[dict[str, Any]],
+    installed_pipeline: dict[str, Any],
+) -> dict[str, Any]:
+    stage_activity = {
+        stage: {"autopilot_turns": 0, "manual_turns": 0, "total_turns": 0}
+        for stage in SCENE_ORDER
+    }
+    session_turns: dict[tuple[str, str], list[tuple[float, str, bool]]] = {}
+    for item in all_records:
+        tagged = item.get("tag_provenance") or ""
+        stage = tagged[6:] if tagged.startswith("scene:") and tagged[6:] in SCENE_ORDER else ""
+        is_auto = bool(stage)
+        if not stage:
+            category, _ = _classify_pattern(
+                _normalize_signature(item.get("text", "")), item.get("turn_role", "unknown"), 1
+            )
+            stage = {
+                "plan_and_dispatch": "plan-and-orchestrate",
+                "architecture_review": "architecture-re-review",
+                "deliver_and_verify": "deliver-and-verify",
+                "closeout_and_sync": "closeout-and-sync",
+                "continue_nudge": "continue_nudge",
+            }.get(category, "")
+        if stage in stage_activity:
+            key = "autopilot_turns" if is_auto else "manual_turns"
+            stage_activity[stage][key] += 1
+            stage_activity[stage]["total_turns"] += 1
+        session_key = (str(item.get("agent") or ""), str(item.get("session_id") or ""))
+        session_turns.setdefault(session_key, []).append((float(item.get("timestamp") or 0), stage, item.get("turn_role") == "unknown"))
+
+    multi_turn_sessions = sum(len(turns) >= 2 for turns in session_turns.values())
+    sessions_with_delivery = 0
+    sessions_with_delivery_without_review = 0
+    sessions_with_delivery_without_closeout = 0
+    sessions_with_manual_nudges = 0
+    for turns in session_turns.values():
+        ordered = sorted(turns)
+        truncated = any(turn[2] for turn in ordered)
+        stages = [turn[1] for turn in ordered]
+        if "continue_nudge" in stages:
+            sessions_with_manual_nudges += 1
+        if truncated or "deliver-and-verify" not in stages:
+            continue
+        sessions_with_delivery += 1
+        delivery_index = stages.index("deliver-and-verify")
+        if delivery_index > 0 and "architecture-re-review" not in stages[: delivery_index + 1]:
+            sessions_with_delivery_without_review += 1
+        if len(stages) >= 2 and "closeout-and-sync" not in stages[delivery_index:]:
+            sessions_with_delivery_without_closeout += 1
+    e2e_manual_turns = sum(
+        "e2e" in str(item.get("text") or "").lower() or "端到端" in str(item.get("text") or "").lower()
+        for item in manual_records
+    )
+    flow_metrics = {
+        "multi_turn_sessions": multi_turn_sessions,
+        "sessions_with_delivery": sessions_with_delivery,
+        "sessions_with_delivery_without_review": sessions_with_delivery_without_review,
+        "sessions_with_delivery_without_closeout": sessions_with_delivery_without_closeout,
+        "sessions_with_manual_nudges": sessions_with_manual_nudges,
+        "e2e_manual_turns": e2e_manual_turns,
+    }
+    findings: list[dict[str, Any]] = []
+    def add(code: str, stage: str, target: str, evidence_count: int, action: str) -> None:
+        contract = PIPELINE_STAGE_CONTRACTS[stage]
+        findings.append({"code": code, "stage": stage, "target": target, "evidence_count": evidence_count,
+                         "deliverable": contract["deliverable"], "quality_bar": contract["quality_bar"], "action": action})
+    if (installed_pipeline.get("profile_status") == "ok" and installed_pipeline.get("mode") != "off"
+            and installed_pipeline.get("enabled_scenes") and installed_pipeline.get("missing_stages")):
+        add("missing_pipeline_stages", installed_pipeline["missing_stages"][0], "scenes.enabled_scenes",
+            len(installed_pipeline["missing_stages"]), "Enable every canonical pipeline stage so transitions remain observable and complete.")
+    over_count = len(installed_pipeline.get("custom_scene_files", [])) + len(installed_pipeline.get("redundant_guardrails", []))
+    if over_count or installed_pipeline.get("guardrail_count", 0) > 4:
+        add("over_engineered_pipeline", "plan-and-orchestrate", "scenes", max(over_count, installed_pipeline.get("guardrail_count", 0)),
+            "Remove custom duplication and retain only guardrails with an independent safety or quality purpose.")
+    if installed_pipeline.get("incomplete_scene_contracts"):
+        incomplete_stage = next(
+            (
+                stage
+                for stage in SCENE_ORDER
+                if DEFAULT_SPECS["scene_specs"][stage]["file"]
+                in installed_pipeline["incomplete_scene_contracts"]
+            ),
+            "plan-and-orchestrate",
+        )
+        add("incomplete_stage_contract", incomplete_stage, "scenes", len(installed_pipeline["incomplete_scene_contracts"]),
+            "Complete each enabled scene description, fallback prompt, and required guardrail before relying on it.")
+    if sessions_with_delivery_without_review:
+        add("review_gate_bypassed", "architecture-re-review", "scenes.architecture-re-review", sessions_with_delivery_without_review,
+            "Route delivery only after the full task receives an architecture re-review.")
+    if sessions_with_delivery_without_closeout:
+        add("closeout_stage_dropped", "closeout-and-sync", "scenes.closeout-and-sync", sessions_with_delivery_without_closeout,
+            "Keep closeout and synchronization after delivery until all obligations and resources are settled.")
+    if installed_pipeline.get("deliver_strategy") in ("merge_dev_only", "local_verify_only") and e2e_manual_turns >= 2:
+        add("deliver_strategy_mismatch", "deliver-and-verify", "scenes.deliver_strategy", e2e_manual_turns,
+            "Align the delivery strategy with repeated end-to-end verification demand.")
+    if sessions_with_manual_nudges >= 2 or (installed_pipeline.get("profile_status") == "ok" and installed_pipeline.get("mode") == "gate"
+            and (installed_pipeline.get("max_consecutive_auto_turns") or 0) < 10 and multi_turn_sessions >= 2 and sessions_with_manual_nudges >= 1):
+        add("manual_pipeline_handoff", "plan-and-orchestrate", "autopilot.max_consecutive_auto_turns", sessions_with_manual_nudges,
+            "Raise the automatic turn budget only after confirming the four stage contracts can advance without manual handoffs.")
+    return {"stage_contracts": copy.deepcopy(PIPELINE_STAGE_CONTRACTS), "installed_pipeline": installed_pipeline,
+            "stage_activity": stage_activity, "flow_metrics": flow_metrics, "findings": findings}
+
+
 def _load_installed_shortcuts(gemini_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     config_path = gemini_dir / "config/autopilot/config.json"
     if not config_path.is_file():
@@ -1257,6 +1469,7 @@ def _build_recommendations(
     manual_records: list[dict[str, Any]],
     config_status: dict[str, Any],
     evidence_complete: bool,
+    pipeline_assessment: dict[str, Any],
 ) -> list[dict[str, Any]]:
     recommendations: list[dict[str, Any]] = []
     seen_targets: set[str] = set()
@@ -1276,9 +1489,20 @@ def _build_recommendations(
             "action": suggestion["action"],
         })
 
+    for finding in pipeline_assessment.get("findings", []):
+        recommendations.append({
+            "category": "pipeline_optimization",
+            "target": finding["target"],
+            "evidence_count": finding["evidence_count"],
+            "pattern_signature": finding["code"],
+            "action": finding["action"],
+        })
+
     if (
         evidence_complete
         and config_status.get("status") == "absent"
+        and pipeline_assessment.get("installed_pipeline", {}).get("profile_status") != "error"
+        and pipeline_assessment.get("installed_pipeline", {}).get("scenes_status") != "error"
         and not autopilot_counts
         and manual_records
     ):

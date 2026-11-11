@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from the_pilot import __version__
 from the_pilot.compiler import compile_bundle, merge_hooks_json
+from the_pilot.defaults import DEFAULT_SPECS, PIPELINE_STAGE_CONTRACTS, SCENE_ORDER
 from the_pilot.distill import distill_chat_history
 from the_pilot.profile import resolve_profile
 from the_pilot.project import ProfileError, normalize_project
@@ -461,5 +462,109 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(cli_out["schema"], "the-pilot-distillation/v1")
         self.assertTrue(cli_out["recommendations"])
         self.cli("distill", "--home-dir", str(home), "--days", "0", ok=False)
+
+    def test_distill_pipeline_assessment_reports_stage_contract_gaps(self):
+        home = self.root / "home"
+        now = time.time()
+        claude_dir = home / ".claude/projects/demo"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "p1.jsonl").write_text("\n".join([
+            json.dumps({
+                "type": "user",
+                "timestamp": int((now - 180) * 1000),
+                "message": {"content": "继续"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int((now - 60) * 1000),
+                "message": {"content": "合并当前分支到 main 并完成实跑验证"},
+            }),
+        ]) + "\n")
+        for index in range(2):
+            (claude_dir / f"e2e{index}.jsonl").write_text(json.dumps({
+                "type": "user",
+                "timestamp": int((now - 30 - index) * 1000),
+                "message": {"content": "再跑一遍 e2e 验证"},
+            }) + "\n")
+
+        autopilot_dir = self.gemini / "config/autopilot"
+        scenes_dir = autopilot_dir / "scenes"
+        scenes_dir.mkdir(parents=True)
+        profile = copy.deepcopy(self.base)
+        profile["scenes"]["enabled_scenes"] = ["plan-and-orchestrate", "deliver-and-verify"]
+        profile["scenes"]["deliver_strategy"] = "merge_dev_only"
+        (autopilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
+        (scenes_dir / "01-plan-and-orchestrate.md").write_text(
+            "---\n"
+            "description: Plan the task\n"
+            f"required_guardrail: {DEFAULT_SPECS['scene_specs']['plan-and-orchestrate']['required_guardrail']}\n"
+            "fallback_prompt: Draft the plan\n"
+            "---\n"
+            "Plan body.\n",
+            encoding="utf-8",
+        )
+        (scenes_dir / "custom-extra.md").write_text(
+            "---\n"
+            "description: Extra scene\n"
+            "fallback_prompt: Do the extra step\n"
+            "---\n"
+            "Extra body.\n",
+            encoding="utf-8",
+        )
+
+        report = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
+        )
+        assessment = report["pipeline_assessment"]
+        self.assertEqual(assessment["stage_contracts"], PIPELINE_STAGE_CONTRACTS)
+        self.assertEqual(list(assessment["stage_contracts"]), list(SCENE_ORDER))
+        for stage, contract in assessment["stage_contracts"].items():
+            self.assertTrue(contract["deliverable"], stage)
+            self.assertTrue(contract["quality_bar"], stage)
+        installed = assessment["installed_pipeline"]
+        self.assertEqual(installed["profile_status"], "ok")
+        self.assertEqual(installed["deliver_strategy"], "merge_dev_only")
+        self.assertEqual(installed["missing_stages"], ["architecture-re-review", "closeout-and-sync"])
+        self.assertEqual(installed["custom_scene_files"], ["custom-extra.md"])
+        self.assertEqual(installed["incomplete_scene_contracts"], ["03-deliver-and-verify.md"])
+        findings = {finding["code"]: finding for finding in assessment["findings"]}
+        self.assertEqual(
+            set(findings),
+            {
+                "missing_pipeline_stages",
+                "over_engineered_pipeline",
+                "incomplete_stage_contract",
+                "review_gate_bypassed",
+                "closeout_stage_dropped",
+                "deliver_strategy_mismatch",
+            },
+        )
+        self.assertEqual(findings["missing_pipeline_stages"]["stage"], "architecture-re-review")
+        self.assertEqual(findings["incomplete_stage_contract"]["stage"], "deliver-and-verify")
+        self.assertEqual(findings["review_gate_bypassed"]["evidence_count"], 1)
+        self.assertEqual(findings["closeout_stage_dropped"]["evidence_count"], 1)
+        self.assertEqual(findings["deliver_strategy_mismatch"]["evidence_count"], 2)
+        self.assertTrue(report["evidence_complete"])
+
+        (autopilot_dir / "project.json").write_text('{"schema": "wrong"}', encoding="utf-8")
+        bad_project = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
+        )
+        self.assertEqual(
+            bad_project["pipeline_assessment"]["installed_pipeline"]["profile_status"], "error"
+        )
+        (autopilot_dir / "project.json").unlink()
+        (autopilot_dir / "profile.json").write_text("{corrupt", encoding="utf-8")
+        corrupt = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
+        )
+        corrupt_installed = corrupt["pipeline_assessment"]["installed_pipeline"]
+        self.assertEqual(corrupt_installed["profile_status"], "error")
+        self.assertTrue(corrupt_installed["error"])
+        self.assertFalse(corrupt["evidence_complete"])
+        self.assertNotIn(
+            "missing_pipeline_stages",
+            {finding["code"] for finding in corrupt["pipeline_assessment"]["findings"]},
+        )
 
 

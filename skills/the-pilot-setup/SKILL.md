@@ -18,15 +18,21 @@ To register the skills globally across coding agents, run
    `pilot distill --days 7 --json`. Inspect installed preferences, available CLIs,
    and the user's last 7 days of chat history across Antigravity, Claude Code,
    Codex, and Cursor without writing files.
-2. Summarize recurring user prompt patterns (`recurring_patterns` and semantic
-   patterns in `sampled_prompts`) and propose concrete scene, guardrail, and
-   shortcut automations (`custom_entry`, `custom_comma`, `deliver_strategy`, or
-   `.pilot/project.json` overlay updates). Ask about the four dimensions, keeping
-   an existing profile as the starting point: orchestration worker/review priorities;
-   autopilot mode/turn limit; enabled scenes/delivery policy/notification
-   preference/guardrails; entry shortcuts/custom commands/template overrides.
-   Present a recommended option first. Do not assume permission to send mail or
-   deploy production.
+2. Review the distillation report on two levels before proposing changes.
+   Summarize recurring user prompt patterns (`recurring_patterns` and semantic
+   patterns in `sampled_prompts`). Then assess the installed scene pipeline that
+   the report describes: whether every stage of the flow from planning to
+   closeout is enabled with a complete contract, whether each stage states an
+   explicit deliverable and exit quality bar, whether stages connect without
+   manual handoffs, and whether custom scenes or guardrails each protect a
+   distinct invariant that the built-in contracts do not already cover. Propose concrete scene,
+   guardrail, and shortcut automations (`custom_entry`, `custom_comma`,
+   `deliver_strategy`, or `.pilot/project.json` overlay updates) from that
+   evidence. Ask about the four dimensions, keeping an existing profile as the
+   starting point: orchestration worker/review priorities; autopilot mode/turn
+   limit; enabled scenes/delivery policy/notification preference/guardrails;
+   entry shortcuts/custom commands/template overrides. Present a recommended
+   option first. Do not assume permission to send mail or deploy production.
 3. Apply the confirmed preferences with `pilot apply --preset recommended
    --project <repo> --profile <json-or-file> --json`. Omit the project flag for
    discovery, or use `--no-project` to explicitly choose universal defaults.

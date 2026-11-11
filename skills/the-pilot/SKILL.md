@@ -17,6 +17,9 @@ skill. Inspect `pilot --help` and subcommand help for current argument syntax.
 - `pilot distill [--days 7] [--max-sessions 80] --json` scans the last 7 days of
   local agent chat logs (Antigravity, Claude Code, Codex, Cursor) to identify
   recurring user input patterns and recommend scenes, guardrails or shortcuts.
+  It also assesses the installed scene pipeline, including stage completeness,
+  per-stage deliverables and exit quality bars, transition continuity, and
+  whether custom scenes or guardrails add machinery without independent value.
 - `pilot log` inspects recent runtime events.
 - `,autopilot recover` explicitly recovers an ambiguous delivery only after
   checking what the previous send actually did. Never blindly replay a send.

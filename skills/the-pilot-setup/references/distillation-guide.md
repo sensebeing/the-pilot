@@ -13,4 +13,15 @@ Run `pilot distill --days 7 --json` (optional `--max-sessions 80`). The command 
 4. **Separate personal preferences from project overlays**:
    Personal mode preferences, turn limits, and personal aliases belong in `profile.json` via `pilot apply`. Team-shared entry commands, delivery wording, and repository closeout rules belong in `.pilot/project.json`.
 
+## Pipeline assessment
+
+`pilot distill` also inspects the installed profile and scene files without writing anything, and reports how the current scene pipeline is configured. Read that assessment together with the prompt patterns.
+
+1. **Stage completeness**: every stage of the flow from planning to closeout is enabled and backed by a complete scene contract.
+2. **Stage exit**: each stage names the deliverable it must produce and the quality bar that decides when the stage is done.
+3. **Transition continuity**: one stage ends where the next begins. Reaching delivery without a full-task architecture review, or ending after delivery without closeout, shows a broken handoff.
+4. **Simplicity**: custom scenes and guardrails are worth keeping only when they protect an invariant that the built-in contracts do not already cover.
+
+Use the assessment as evidence about the workflow. Confirm every proposed change with the user before running `pilot apply`.
+
 Present the observed frequency, representative examples, and proposed profile or project overlay changes to the user and wait for confirmation before running `pilot apply`. For tests and isolated demonstrations, always pass explicit temporary `--home-dir` and `--gemini-dir` paths.

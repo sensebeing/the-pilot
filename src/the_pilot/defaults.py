@@ -17,6 +17,37 @@ SCENE_ORDER = (
     "closeout-and-sync",
 )
 
+PIPELINE_STAGE_CONTRACTS = {
+    "plan-and-orchestrate": {
+        "order": 10,
+        "title": "方案收敛与 Orca 编排实施",
+        "deliverable": "形成已确认的整体方案、唯一 owner、边界与可执行的编排任务。",
+        "quality_bar": "方案覆盖真实根因、直接调用拓扑和验证路径，并满足工程质量约束。",
+        "simplicity_rule": "拒绝表象补丁、重复状态机和没有独立保护作用的额外分支。",
+    },
+    "architecture-re-review": {
+        "order": 20,
+        "title": "实施后全任务最简架构复审循环",
+        "deliverable": "完成对本任务全部实施结果的整体架构复审并记录未解决问题。",
+        "quality_bar": "确认唯一 owner、职责边界、契约和未覆盖风险均已闭合。",
+        "simplicity_rule": "复审必须回到根因和最简设计，不能用局部黑名单或重试掩盖结构问题。",
+    },
+    "deliver-and-verify": {
+        "order": 30,
+        "title": "按实际进度合入、发 dev 与端到端验证",
+        "deliverable": "按授权完成合入、环境验证和所需的定向实跑证据。",
+        "quality_bar": "每个交付动作都有与当前改动匹配的验证结果、剩余风险和可追溯证据。",
+        "simplicity_rule": "只执行尚未完成且有证据价值的交付步骤，不重复部署或扩大测试范围。",
+    },
+    "closeout-and-sync": {
+        "order": 40,
+        "title": "文档同步与工作区收尾",
+        "deliverable": "同步必要文档、结清授权义务并释放可回收的协作资源。",
+        "quality_bar": "收尾记录与实际状态一致，未完成义务有 owner，全部结清后才宣布完成。",
+        "simplicity_rule": "收尾只保留真实义务和资源清理，不新增流程证明或重复记录。",
+    },
+}
+
 DELIVER_STRATEGIES = ("merge_dev_e2e", "merge_dev_only", "local_verify_only")
 
 RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent"})
