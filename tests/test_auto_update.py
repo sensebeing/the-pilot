@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import subprocess
+import sys
 import time
 
 from the_pilot import installer
@@ -23,20 +24,27 @@ class AutoUpdateTest(unittest.TestCase):
             old = root / "project.json"
             old.write_text(json.dumps({"projectId": "p", "shortcuts": {"x": "old"}}))
             with mock.patch.object(autopilot, "AUTOPILOT_DIR", root), mock.patch.object(autopilot, "GEMINI_DIR", root), \
+                 mock.patch.object(autopilot, "STATE_DIR", root / "state"), mock.patch.object(autopilot, "LOG_PATH", root / "state/log"), \
                  mock.patch.object(autopilot, "maybe_trigger_auto_update"), mock.patch.object(autopilot, "subprocess") as proc:
-                proc.run.return_value = mock.Mock(returncode=0)
+                proc.run.return_value = mock.Mock(returncode=0, stdout='{"project_status":"updated"}')
                 autopilot.maybe_sync_project_overlay({"workspacePaths": [str(root)]})
                 proc.run.assert_called_once()
+                self.assertIn("project_auto_synced", (root / "state/log").read_text())
 
     def test_corrupt_overlay_is_logged_without_writing(self):
-        """Corrupt workspace JSON logs failure and leaves installed state untouched."""
+        """Corrupt workspace JSON fails closed in the installer and logs failure in the runtime."""
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
+            gemini = root / "gemini"
+            autopilot_dir = gemini / "config/autopilot"
+            autopilot_dir.mkdir(parents=True)
+            source = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
+            (autopilot_dir / "project.json").write_text(json.dumps(source))
             (root / ".pilot").mkdir()
             (root / ".pilot/project.json").write_text("{")
-            (root / "project.json").write_text('{"projectId":"p"}')
-            with mock.patch.object(autopilot, "AUTOPILOT_DIR", root), mock.patch.object(autopilot, "STATE_DIR", root / "state"), mock.patch.object(autopilot, "LOG_PATH", root / "state/log"):
+            with mock.patch.object(autopilot, "GEMINI_DIR", gemini), mock.patch.object(autopilot, "AUTOPILOT_DIR", autopilot_dir), mock.patch.object(autopilot, "STATE_DIR", root / "state"), mock.patch.object(autopilot, "LOG_PATH", root / "state/log"), mock.patch.dict(os.environ, {"ORCA_AUTOPILOT_PILOT_BIN": str(Path(__file__).parents[1] / "bin/pilot")}):
                 autopilot.maybe_sync_project_overlay({"workspacePaths": [str(root)]})
+                self.assertEqual(json.loads((autopilot_dir / "project.json").read_text())["projectId"], source["projectId"])
                 self.assertIn("project_auto_sync_failed", (root / "state/log").read_text())
 
     def test_cooldown_suppresses_background_spawn(self):
@@ -55,6 +63,7 @@ class AutoUpdateTest(unittest.TestCase):
         args = installer.build_parser().parse_args(["self-update", "--checkout-dir", "/tmp/x", "--home-dir", "/tmp/h", "--json"])
         self.assertEqual(args.checkout_dir, "/tmp/x")
         self.assertEqual(args.home_dir, "/tmp/h")
+        self.assertFalse(args.project_only)
 
     def test_status_surfaces_persisted_update(self):
         """Status reports persisted auto-update metadata without mutating it."""
@@ -69,6 +78,7 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(report["auto_update"]["status"], "up_to_date")
 
     def test_self_update_status_distinguishes_same_head(self):
+        """A clean main checkout with no incoming commit is up to date."""
         with tempfile.TemporaryDirectory() as root:
             checkout = Path(root) / "checkout"
             subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
@@ -92,6 +102,7 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertIsInstance(json.loads(log_record)["ts"], str)
 
     def test_self_update_skips_dirty_and_non_main_checkouts(self):
+        """Dirty and non-main checkouts are reported as skipped without pulling."""
         with tempfile.TemporaryDirectory() as root:
             checkout = Path(root) / "checkout"
             subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
@@ -112,6 +123,7 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(installer.self_update(args)["source_status"], "skipped_non_main_branch")
 
     def test_self_update_human_output(self):
+        """Human self-update output succeeds when the checkout has a bare origin."""
         with tempfile.TemporaryDirectory() as root:
             checkout = Path(root) / "checkout"
             subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
@@ -120,13 +132,52 @@ class AutoUpdateTest(unittest.TestCase):
             (checkout / "README").write_text("x")
             subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
             subprocess.run(["git", "-C", str(checkout), "commit", "-m", "init"], check=True, capture_output=True)
+            upstream = Path(root) / "upstream.git"
+            subprocess.run(["git", "init", "--bare", str(upstream)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(upstream)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "push", "-u", "origin", "main"], check=True, capture_output=True)
             result = installer.main([
                 "self-update", "--checkout-dir", str(checkout), "--gemini-dir", str(Path(root) / "gemini"),
                 "--no-project",
             ])
             self.assertEqual(result, 0)
 
+    def test_invalid_explicit_checkout_fails_closed(self):
+        """An explicit non-Git checkout is failed and persisted as failed metadata."""
+        with tempfile.TemporaryDirectory() as root:
+            gemini = Path(root) / "gemini"
+            args = installer.build_parser().parse_args(["self-update", "--checkout-dir", str(Path(root) / "missing"), "--gemini-dir", str(gemini), "--no-project", "--json"])
+            with self.assertRaises(installer.SetupError):
+                installer.self_update(args)
+            self.assertEqual(json.loads((gemini / "config/autopilot/state/auto_update.json").read_text())["status"], "failed")
+
+    def test_no_source_is_reported_explicitly(self):
+        """Without checkout or uv, source and overall status remain skipped_no_source."""
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(installer, "_discover_checkout", return_value=(None, False)), mock.patch.object(installer.shutil, "which", return_value=None):
+            args = installer.build_parser().parse_args(["self-update", "--gemini-dir", str(Path(root) / "gemini"), "--no-project", "--json"])
+            report = installer.self_update(args)
+            self.assertEqual(report["source_status"], "skipped_no_source")
+            self.assertEqual(report["status"], "skipped_no_source")
+
+    def test_spawn_failure_does_not_advance_cooldown(self):
+        """A failed Popen records failure and leaves last_checked_at available for retry."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            state = root / "state"
+            old = time.time() - autopilot.AUTO_UPDATE_INTERVAL_SECONDS - 1
+            state.mkdir()
+            (state / "auto_update.json").write_text(json.dumps({"last_checked_at": old}))
+            with mock.patch.object(autopilot, "STATE_DIR", state), mock.patch.object(autopilot, "LOG_PATH", state / "autopilot.log"), mock.patch.dict(os.environ, {"ORCA_AUTOPILOT_PILOT_BIN": sys.executable, "ORCA_AUTOPILOT_GEMINI_DIR": "", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE": "1", "ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE": ""}), mock.patch.object(autopilot.subprocess, "Popen", side_effect=OSError("spawn")):
+                autopilot.maybe_trigger_auto_update()
+                record = json.loads((state / "auto_update.json").read_text())
+                self.assertEqual(record["last_checked_at"], old)
+                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["error"], "spawn")
+                autopilot.maybe_trigger_auto_update()
+            self.assertIn("auto_update_spawn_failed", (state / "autopilot.log").read_text())
+
     def test_overlay_sync_uses_real_installer_and_v2_template(self):
+        """Workspace overlay changes are compiled through the installer runtime."""
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
             gemini = root_path / "gemini"
@@ -158,4 +209,62 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertIn("V2 hello", json.dumps(result, ensure_ascii=False))
             self.assertEqual(json.loads((gemini / "config/autopilot/profile.json").read_text())["autopilot"]["max_consecutive_auto_turns"], 9)
             self.assertEqual(json.loads((gemini / "config/autopilot/project.json").read_text())["entry_specs"]["cq"]["template"], "V2 {arg}")
+
+    def test_self_update_pulls_new_commit_syncs_skills_and_preserves_profile(self):
+        """A clean main checkout pulls upstream commits, syncs skill symlinks, and preserves profile.json."""
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            upstream = root_path / "upstream.git"
+            subprocess.run(["git", "init", "--bare", "-b", "main", str(upstream)], check=True, capture_output=True)
+            producer = root_path / "producer"
+            subprocess.run(["git", "init", "-b", "main", str(producer)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(producer), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(producer), "config", "user.name", "Test"], check=True)
+            for name in ("the-pilot", "the-pilot-setup"):
+                skill_dir = producer / "skills" / name
+                skill_dir.mkdir(parents=True)
+                (skill_dir / "SKILL.md").write_text(f"# {name}\n")
+            subprocess.run(["git", "-C", str(producer), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(producer), "commit", "-m", "v1"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(producer), "remote", "add", "origin", str(upstream)], check=True)
+            subprocess.run(["git", "-C", str(producer), "push", "-u", "origin", "main"], check=True, capture_output=True)
+
+            checkout = root_path / "checkout"
+            subprocess.run(["git", "clone", str(upstream), str(checkout)], check=True, capture_output=True)
+            (producer / "skills/the-pilot/SKILL.md").write_text("# the-pilot v2\n")
+            subprocess.run(["git", "-C", str(producer), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(producer), "commit", "-m", "v2"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(producer), "push", "origin", "main"], check=True, capture_output=True)
+            expected_sha = subprocess.run(
+                ["git", "-C", str(producer), "rev-parse", "--short", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+            gemini = root_path / "gemini"
+            home = root_path / "home"
+            (home / ".agents/skills").mkdir(parents=True)
+            unmanaged = home / ".claude/skills/the-pilot"
+            unmanaged.mkdir(parents=True)
+            (unmanaged / "custom.txt").write_text("keep")
+
+            apply_args = installer.build_parser().parse_args([
+                "apply", "--gemini-dir", str(gemini), "--no-project", "--max-turns", "11", "--json",
+            ])
+            installer.apply(apply_args)
+
+            update_args = installer.build_parser().parse_args([
+                "self-update", "--checkout-dir", str(checkout), "--home-dir", str(home),
+                "--gemini-dir", str(gemini), "--no-project", "--json",
+            ])
+            report = installer.self_update(update_args)
+            self.assertEqual(report["status"], "updated")
+            self.assertEqual(report["source_status"], "updated")
+            self.assertEqual(report["head_sha"], expected_sha)
+            self.assertTrue((home / ".agents/skills/the-pilot").is_symlink())
+            self.assertFalse(unmanaged.is_symlink())
+            self.assertEqual((unmanaged / "custom.txt").read_text(), "keep")
+            self.assertEqual(
+                json.loads((gemini / "config/autopilot/profile.json").read_text())["autopilot"]["max_consecutive_auto_turns"],
+                11,
+            )
 

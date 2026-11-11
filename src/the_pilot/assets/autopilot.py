@@ -185,37 +185,59 @@ def save_json(path: Path, value: dict[str, Any]) -> bool:
     return save_text(path, text)
 
 
+def _pilot_binary() -> str:
+    candidate = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN") or shutil.which("pilot") or str(Path.home() / "the-pilot/bin/pilot")
+    return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else ""
+
+
 def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
     workspace_paths = payload.get("workspacePaths")
     if not isinstance(workspace_paths, list) or not workspace_paths:
         return
-    workspace = Path(str(workspace_paths[0])).expanduser()
-    overlay = next((parent / ".pilot/project.json" for parent in (workspace, *workspace.parents) if (parent / ".pilot/project.json").is_file()), None)
-    installed_path = AUTOPILOT_DIR / "project.json"
-    if overlay is None or not installed_path.is_file():
+    if not (AUTOPILOT_DIR / "project.json").is_file():
+        return
+    if (os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
+            and os.environ.get("ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE", "").strip() != "1"
+            and not os.environ.get("ORCA_AUTOPILOT_PILOT_BIN", "").strip()):
+        return
+    pilot_bin = _pilot_binary()
+    if not pilot_bin:
+        return
+    workspace = str(workspace_paths[0])
+    try:
+        result = subprocess.run(
+            [
+                pilot_bin,
+                "self-update",
+                "--project-only",
+                "--workspace",
+                workspace,
+                "--gemini-dir",
+                str(GEMINI_DIR),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
+        return
+    if result.returncode != 0:
+        log_event(
+            "project_auto_sync_failed",
+            workspace=workspace,
+            returncode=result.returncode,
+            error=(result.stderr or result.stdout).strip()[-300:],
+        )
         return
     try:
-        workspace_project = json.loads(overlay.read_text(encoding="utf-8"))
-        installed_project = json.loads(installed_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        log_event("project_auto_sync_failed", path=str(overlay), error=str(exc))
+        receipt = json.loads(result.stdout)
+    except ValueError as exc:
+        log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
         return
-    if not isinstance(workspace_project, dict) or not isinstance(installed_project, dict):
-        log_event("project_auto_sync_failed", path=str(overlay), error="project.json must be an object")
-        return
-    project_id = workspace_project.get("projectId")
-    if not project_id or project_id != installed_project.get("projectId") or workspace_project == installed_project:
-        return
-    pilot_bin = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN") or shutil.which("pilot") or str(Path.home() / "the-pilot/bin/pilot")
-    try:
-        result = subprocess.run([pilot_bin, "apply", "--upgrade", "--project", str(overlay), "--gemini-dir", str(GEMINI_DIR), "--json"], capture_output=True, text=True, timeout=3)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log_event("project_auto_sync_failed", projectId=project_id, path=str(overlay), error=str(exc))
-        return
-    if result.returncode == 0:
-        log_event("project_auto_synced", projectId=project_id, path=str(overlay))
-    else:
-        log_event("project_auto_sync_failed", projectId=project_id, path=str(overlay), returncode=result.returncode)
+    if isinstance(receipt, dict) and receipt.get("project_status") == "updated":
+        log_event("project_auto_synced", workspace=workspace)
 
 
 def maybe_trigger_auto_update() -> None:
@@ -231,19 +253,28 @@ def maybe_trigger_auto_update() -> None:
             return
     except (TypeError, ValueError):
         metadata = {}
-    pilot_bin = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN") or shutil.which("pilot") or str(Path.home() / "the-pilot/bin/pilot")
-    if not os.path.isfile(pilot_bin) or not os.access(pilot_bin, os.X_OK):
+    pilot_bin = _pilot_binary()
+    if not pilot_bin:
         return
     with _file_lock(STATE_DIR / "auto_update.lock"):
         metadata = load_json(metadata_path)
-        if time.time() - float(metadata.get("last_checked_at") or 0) < AUTO_UPDATE_INTERVAL_SECONDS:
-            return
-        metadata["last_checked_at"] = time.time()
-        if not save_json(metadata_path, metadata):
+        try:
+            cooldown = time.time() - float(metadata.get("last_checked_at") or 0)
+        except (TypeError, ValueError):
+            cooldown = AUTO_UPDATE_INTERVAL_SECONDS
+        if cooldown < AUTO_UPDATE_INTERVAL_SECONDS:
             return
         try:
             subprocess.Popen([pilot_bin, "self-update", "--gemini-dir", str(GEMINI_DIR), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        except OSError:
+        except OSError as exc:
+            metadata["status"] = "failed"
+            metadata["error"] = str(exc)
+            metadata["last_failed_at"] = time.time()
+            save_json(metadata_path, metadata)
+            log_event("auto_update_spawn_failed", path=pilot_bin, error=str(exc))
+            return
+        metadata["last_checked_at"] = time.time()
+        if not save_json(metadata_path, metadata):
             return
         log_event("auto_update_spawned", path=pilot_bin)
 

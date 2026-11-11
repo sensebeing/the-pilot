@@ -132,6 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(update_parser)
     update_parser.add_argument("--checkout-dir", help="本地 the-pilot checkout（测试或开发覆盖）")
     update_parser.add_argument("--home-dir", default=str(Path.home()), help="技能链接根目录")
+    update_parser.add_argument("--workspace", help="workspace directory for project overlay synchronization")
+    update_parser.add_argument("--project-only", action="store_true", help="仅同步 workspace project overlay")
 
     uninstall_parser = subparsers.add_parser("uninstall", help="移除本工具写入的文件与 Hook 组")
     add_common_arguments(uninstall_parser)
@@ -317,7 +319,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         "gemini_md": str(gemini_md),
         "drift": [],
     }
-    state_dir = Path(os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip() or str(autopilot_dir / "state"))
+    state_dir = _state_dir_for(autopilot_dir)
     auto_update_path = state_dir / "auto_update.json"
     if auto_update_path.is_file():
         try:
@@ -384,7 +386,9 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
 def _discover_checkout(explicit: str | None) -> tuple[Path | None, bool]:
     if explicit:
         path = Path(explicit).expanduser().resolve()
-        return (path if (path / ".git").exists() else None), True
+        if not (path / ".git").exists():
+            raise SetupError(f"Checkout directory is not a Git repository: {path}")
+        return path, True
     candidates = [SCRIPTS_DIR.parents[1], Path.home() / "the-pilot"]
     for path in candidates:
         if (path / ".git").exists():
@@ -392,19 +396,76 @@ def _discover_checkout(explicit: str | None) -> tuple[Path | None, bool]:
     return None, False
 
 
+def _state_dir_for(autopilot_dir: Path) -> Path:
+    return Path(
+        os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip()
+        or str(autopilot_dir / "state")
+    ).expanduser()
+
+
+def _find_ancestor_overlay(start: Path) -> Path | None:
+    return next(
+        (
+            parent / ".pilot/project.json"
+            for parent in (start, *start.parents)
+            if (parent / ".pilot/project.json").is_file()
+        ),
+        None,
+    )
+
+
+def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, autopilot_dir: Path) -> str:
+    if not workspace_arg:
+        return "none"
+    installed_path = autopilot_dir / "project.json"
+    overlay = _find_ancestor_overlay(Path(workspace_arg).expanduser().resolve())
+    if overlay is None:
+        return "none"
+    with profile_lock(gemini_dir):
+        if not installed_path.is_file():
+            return "none"
+        installed_project = normalize_project(read_json_object(installed_path, "project.json"))
+        workspace_project = normalize_project(read_json_object(overlay, "project.json"))
+        if workspace_project["projectId"] != installed_project["projectId"]:
+            return "skipped_unmatched_project"
+        if workspace_project == installed_project:
+            return "up_to_date"
+        apply_args = argparse.Namespace(
+            command="apply", gemini_dir=str(gemini_dir), project=str(overlay), no_project=False,
+            json=False, preset=None, profile=None, upgrade=True, mode=None, max_turns=None,
+            worker_agents=None, review_agents=None, scenes=None, deliver_strategy=None,
+            feedback_email=None, entry_shortcuts=None, guardrail=None,
+        )
+        _apply_unlocked(apply_args)
+    return "updated"
+
+
 def self_update(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
     autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
-    state_dir = Path(os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip() or str(autopilot_dir / "state"))
+    state_dir = _state_dir_for(autopilot_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "project_only", False):
+        project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, autopilot_dir)
+        return {
+            "status": project_status,
+            "source_status": "skipped_project_only",
+            "project_status": project_status,
+            "head_sha": None,
+            "synced_skills": [],
+            "error": None,
+        }
     report: dict[str, Any] = {
         "last_checked_at": time.time(), "last_updated_at": None,
-        "status": "failed", "source_status": "failed", "head_sha": None,
-        "synced_skills": [], "error": None,
+        "status": "failed", "source_status": "failed", "project_status": "none",
+        "head_sha": None, "synced_skills": [], "error": None,
     }
     with _file_lock(state_dir / "auto_update.lock"):
-        checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None))
         try:
+            report["project_status"] = _sync_workspace_overlay(
+                getattr(args, "workspace", None), gemini_dir, autopilot_dir
+            )
+            checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None))
             if checkout is not None:
                 status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 20)
                 branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 20).strip()
@@ -429,10 +490,12 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                         report["source_status"] = "up_to_date"
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
             elif not explicit and shutil.which("uv"):
-                subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
-                report["source_status"] = "updated"
+                uv_out = subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
+                report["source_status"] = (
+                    "up_to_date" if "nothing to upgrade" in uv_out.lower() else "updated"
+                )
             else:
-                report["source_status"] = "up_to_date"
+                report["source_status"] = "skipped_no_source"
 
             if checkout is not None:
                 home_dir = Path(args.home_dir).expanduser()
@@ -486,7 +549,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     apply(apply_args)
             report["last_updated_at"] = time.time()
-            report["status"] = "updated" if report["source_status"] == "updated" else ("skipped_dirty_checkout" if report["source_status"] == "skipped_dirty_checkout" else ("skipped_non_main_branch" if report["source_status"] == "skipped_non_main_branch" else "up_to_date"))
+            if report["source_status"] in {"updated", "up_to_date", "skipped_dirty_checkout", "skipped_non_main_branch", "skipped_no_source"}:
+                report["status"] = report["source_status"]
         except Exception as exc:
             report["error"] = str(exc)
             report["status"] = "failed"
@@ -494,12 +558,14 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         log_path = state_dir / "autopilot.log"
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": "auto_update_failed" if report["status"] == "failed" else "auto_update_completed", **report}, ensure_ascii=False) + "\n")
+        if report["status"] == "failed":
+            raise SetupError(str(report["error"]))
     return report
 
 
 def subprocess_run(command: list[str], timeout: int) -> str:
     result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
-    return result.stdout
+    return result.stdout or result.stderr
 
 
 @contextmanager
@@ -644,11 +710,7 @@ def discover_project(args: argparse.Namespace, gemini_dir: Path) -> dict[str, An
     else:
         path = gemini_dir / AUTOPILOT_SUBDIR / "project.json"
         if not path.is_file():
-            path = next(
-                (parent / ".pilot/project.json" for parent in (Path.cwd(), *Path.cwd().parents)
-                 if (parent / ".pilot/project.json").is_file()),
-                None,
-            )
+            path = _find_ancestor_overlay(Path.cwd())
             if path is None:
                 return None
     return normalize_project(read_json_object(path, "project.json"))
@@ -660,14 +722,8 @@ def gemini_dir_for(args: argparse.Namespace) -> Path:
 
 @contextmanager
 def profile_lock(gemini_dir: Path):
-    path = gemini_dir / AUTOPILOT_SUBDIR / ".autopilot.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with _file_lock(gemini_dir / AUTOPILOT_SUBDIR / ".autopilot.lock"):
+        yield
 
 
 def read_text(path: Path) -> str:

@@ -938,7 +938,7 @@
       }
     }
   ],
-  "runtime_sha256": "5967b591559b0a9e78777b236161ba16ef0704204f951a10364e130e4fb71bcc",
+  "runtime_sha256": "22bdf47a354ae83d4c7f5d2856419f0133337c5b584bb3e258a4b08bd97ab735",
   "compiler_sha256": "46708ddb86d3958decdd959a2475a47537128e8d6cfa23eb921c95b1ab2b6f2d",
   "contract_update": "Trailing structured JSON tag is the sole suggestion execution source; regex-free runtime.",
   "policy_revision": "default-post-deploy-targeted-dev-e2e"

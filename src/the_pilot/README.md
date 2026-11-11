@@ -5,8 +5,8 @@
 - `profile.py`: durable user preference normalization and preset resolution.
 - `compiler.py`: pure rendering and managed-document merges; no IO.
 - `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs, plus scene pipeline assessment of the installed profile and scene contracts.
-- `installer.py`: project discovery, installation lock and atomic file writes.
-- `assets/autopilot.py`: the single runtime owner, copied unchanged on install.
+- `installer.py`: the sole owner of project discovery, workspace overlay synchronization, `self-update`, installation locking and atomic file writes.
+- `assets/autopilot.py`: the single runtime owner, copied unchanged on install; it only forwards `--workspace` to the installer CLI.
 - `runtime.py`: subprocess adapter to the installed runtime (no second engine).
 - `cli.py`: installer versus runtime command routing only.
 
@@ -22,4 +22,4 @@ Only installer operations perform discovery. Inputs are copied, never mutated.
 
 ### Automatic updates
 
-`pilot self-update` serializes source updates, global skill symlink synchronization, and runtime recompilation while preserving `profile.json` and `project.json`. The runtime invokes it in the background after a six hour cooldown; `pilot status --json` exposes the persisted result.
+`pilot self-update` serializes source updates, global skill symlink synchronization, and runtime recompilation while preserving `profile.json` and `project.json`. The runtime invokes it in the background after a six hour cooldown and forwards the workspace path for project overlay synchronization; `pilot status --json` exposes the persisted result.
