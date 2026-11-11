@@ -247,3 +247,7 @@ guard review --repo-root .
 ## 许可证
 
 [MIT](LICENSE)
+
+## 自动更新
+
+已安装运行时最多每六小时检查一次更新。冷却时间到期后会在后台启动 `pilot self-update`，优先使用本地干净的 `main` checkout，否则使用 `uv` 升级。脏 checkout 或非 main 分支不会执行拉取。可用 `pilot status --json` 查看结果，并使用 `ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE=1` 关闭后台检查。

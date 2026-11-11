@@ -39,3 +39,7 @@ For tests use a temporary root. Never use real user directories as fixtures.
 Project overlays and long-term preferences are managed by `pilot apply`; use
 `pilot apply --upgrade` to recompile an installation without resetting preferences.
 The Pilot does not dispatch network work or run background Dealer daemons.
+
+## Automatic updates
+
+The runtime may start `pilot self-update` once per six hour cooldown. It preserves user profile and project preferences and records the result for `pilot status --json`. Set `ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE=1` to disable it.

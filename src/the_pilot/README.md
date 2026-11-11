@@ -19,3 +19,7 @@ configuration or initialize a runtime.
 `project=None` means universal defaults. Library callers pass an overlay to both
 `resolve_profile(base, project=overlay)` and `compile_bundle(profile, project=overlay)`.
 Only installer operations perform discovery. Inputs are copied, never mutated.
+
+### Automatic updates
+
+`pilot self-update` serializes source updates, global skill symlink synchronization, and runtime recompilation while preserving `profile.json` and `project.json`. The runtime invokes it in the background after a six hour cooldown; `pilot status --json` exposes the persisted result.

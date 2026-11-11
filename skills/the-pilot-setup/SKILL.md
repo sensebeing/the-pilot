@@ -45,3 +45,7 @@ To register the skills globally across coding agents, run
 `pilot uninstall` removes owned files, including the installed project link.
 Tests and demonstrations must pass explicit temporary `--gemini-dir` and
 `--home-dir` paths and set `ORCA_AUTOPILOT_GEMINI_DIR` for runtime operations.
+
+## Automatic updates
+
+After setup, `pilot self-update` can refresh a clean main checkout, synchronize skill links, and recompile the installed runtime while preserving user preferences. Use `pilot status --json` to inspect its last result.

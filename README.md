@@ -247,3 +247,7 @@ If `the-pilot` helps your team build with AI, a star on GitHub helps other teams
 ## License
 
 [MIT](LICENSE)
+
+## Automatic updates
+
+The installed runtime checks for updates at most once every six hours. When the cooldown expires it starts `pilot self-update` in the background, using a local clean `main` checkout when available or the `uv` tool upgrade path. A dirty checkout or non-main branch is left untouched. Inspect the last result with `pilot status --json`; use `ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE=1` to disable background checks.

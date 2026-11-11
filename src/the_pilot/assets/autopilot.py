@@ -47,6 +47,7 @@ STATE_DIR = Path(
     or str(AUTOPILOT_DIR / "state")
 ).expanduser()
 LOG_PATH = STATE_DIR / "autopilot.log"
+AUTO_UPDATE_INTERVAL_SECONDS = 6 * 3600
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 MODES = ("gate", "confirm", "off")
@@ -182,6 +183,69 @@ def save_text(path: Path, text: str) -> bool:
 def save_json(path: Path, value: dict[str, Any]) -> bool:
     text = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
     return save_text(path, text)
+
+
+def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
+    workspace_paths = payload.get("workspacePaths")
+    if not isinstance(workspace_paths, list) or not workspace_paths:
+        return
+    workspace = Path(str(workspace_paths[0])).expanduser()
+    overlay = next((parent / ".pilot/project.json" for parent in (workspace, *workspace.parents) if (parent / ".pilot/project.json").is_file()), None)
+    installed_path = AUTOPILOT_DIR / "project.json"
+    if overlay is None or not installed_path.is_file():
+        return
+    try:
+        workspace_project = json.loads(overlay.read_text(encoding="utf-8"))
+        installed_project = json.loads(installed_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log_event("project_auto_sync_failed", path=str(overlay), error=str(exc))
+        return
+    if not isinstance(workspace_project, dict) or not isinstance(installed_project, dict):
+        log_event("project_auto_sync_failed", path=str(overlay), error="project.json must be an object")
+        return
+    project_id = workspace_project.get("projectId")
+    if not project_id or project_id != installed_project.get("projectId") or workspace_project == installed_project:
+        return
+    pilot_bin = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN") or shutil.which("pilot") or str(Path.home() / "the-pilot/bin/pilot")
+    try:
+        result = subprocess.run([pilot_bin, "apply", "--upgrade", "--project", str(overlay), "--gemini-dir", str(GEMINI_DIR), "--json"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_event("project_auto_sync_failed", projectId=project_id, path=str(overlay), error=str(exc))
+        return
+    if result.returncode == 0:
+        log_event("project_auto_synced", projectId=project_id, path=str(overlay))
+    else:
+        log_event("project_auto_sync_failed", projectId=project_id, path=str(overlay), returncode=result.returncode)
+
+
+def maybe_trigger_auto_update() -> None:
+    if os.environ.get("ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE", "").strip() == "1":
+        return
+    if (os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
+            and os.environ.get("ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE", "").strip() != "1"):
+        return
+    metadata_path = STATE_DIR / "auto_update.json"
+    try:
+        metadata = load_json(metadata_path)
+        if time.time() - float(metadata.get("last_checked_at") or 0) < AUTO_UPDATE_INTERVAL_SECONDS:
+            return
+    except (TypeError, ValueError):
+        metadata = {}
+    pilot_bin = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN") or shutil.which("pilot") or str(Path.home() / "the-pilot/bin/pilot")
+    if not os.path.isfile(pilot_bin) or not os.access(pilot_bin, os.X_OK):
+        return
+    with _file_lock(STATE_DIR / "auto_update.lock"):
+        metadata = load_json(metadata_path)
+        if time.time() - float(metadata.get("last_checked_at") or 0) < AUTO_UPDATE_INTERVAL_SECONDS:
+            return
+        metadata["last_checked_at"] = time.time()
+        if not save_json(metadata_path, metadata):
+            return
+        try:
+            subprocess.Popen([pilot_bin, "self-update", "--gemini-dir", str(GEMINI_DIR), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return
+        log_event("auto_update_spawned", path=pilot_bin)
 
 
 def load_profile() -> dict[str, Any]:
@@ -1217,6 +1281,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
+    maybe_sync_project_overlay(payload)
+    maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
     config = load_config()

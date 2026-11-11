@@ -16,8 +16,10 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 from . import compiler as profile_compiler
@@ -57,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
             result = apply(args)
         elif args.command == "status":
             result = status(args)
+        elif args.command == "self-update":
+            result = self_update(args)
         else:
             result = uninstall(args)
     except (SetupError, profile_compiler.ProfileError, OSError, ValueError) as exc:
@@ -123,6 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="只读检查安装与漂移")
     add_common_arguments(status_parser)
+
+    update_parser = subparsers.add_parser("self-update", help="更新 CLI、技能链接与已安装运行时")
+    add_common_arguments(update_parser)
+    update_parser.add_argument("--checkout-dir", help="本地 the-pilot checkout（测试或开发覆盖）")
+    update_parser.add_argument("--home-dir", default=str(Path.home()), help="技能链接根目录")
 
     uninstall_parser = subparsers.add_parser("uninstall", help="移除本工具写入的文件与 Hook 组")
     add_common_arguments(uninstall_parser)
@@ -308,6 +317,13 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         "gemini_md": str(gemini_md),
         "drift": [],
     }
+    state_dir = Path(os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip() or str(autopilot_dir / "state"))
+    auto_update_path = state_dir / "auto_update.json"
+    if auto_update_path.is_file():
+        try:
+            report["auto_update"] = json.loads(auto_update_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            report["auto_update"] = {"error": str(exc)}
     if profile is None:
         report["drift"].append("profile.json 缺失")
         return report
@@ -363,6 +379,109 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
     if not engine_up_to_date:
         report["drift"].append("autopilot.py 缺失或与当前技能版本不一致")
     return report
+
+
+def _discover_checkout(explicit: str | None) -> tuple[Path | None, bool]:
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        return (path if (path / ".git").exists() else None), True
+    candidates = [SCRIPTS_DIR.parents[1], Path.home() / "the-pilot"]
+    for path in candidates:
+        if (path / ".git").exists():
+            return path, False
+    return None, False
+
+
+def self_update(args: argparse.Namespace) -> dict[str, Any]:
+    gemini_dir = gemini_dir_for(args)
+    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
+    state_dir = Path(os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip() or str(autopilot_dir / "state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "last_checked_at": time.time(), "last_updated_at": None,
+        "status": "failed", "source_status": "failed", "head_sha": None,
+        "synced_skills": [], "error": None,
+    }
+    with _file_lock(state_dir / "auto_update.lock"):
+        checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None))
+        try:
+            if checkout is not None:
+                status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 20)
+                branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 20).strip()
+                if status.strip():
+                    report["source_status"] = "skipped_dirty_checkout"
+                elif branch != "main":
+                    report["source_status"] = "skipped_non_main_branch"
+                else:
+                    subprocess_run(["git", "-C", str(checkout), "pull", "--ff-only"], 20)
+                    report["source_status"] = "updated"
+                    pilot_bin = Path.home() / ".local/bin/pilot"
+                    if not explicit and shutil.which("uv") and (pilot_bin.exists() or shutil.which("pilot")):
+                        subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
+                report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
+            elif not explicit and shutil.which("uv"):
+                subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
+                report["source_status"] = "updated"
+            else:
+                report["source_status"] = "up_to_date"
+
+            if checkout is not None:
+                home_dir = Path(args.home_dir).expanduser()
+                for skill_name in ("the-pilot", "the-pilot-setup"):
+                    source = checkout / "skills" / skill_name
+                    if not source.exists():
+                        continue
+                    parents = (home_dir / ".agents/skills", home_dir / ".claude/skills", Path(args.gemini_dir).expanduser() / "config/skills")
+                    for parent in parents:
+                        target = parent / skill_name
+                        if not parent.is_dir() or (target.exists() and not target.is_symlink()):
+                            continue
+                        if target.is_symlink() or not target.exists():
+                            target.unlink(missing_ok=True)
+                            target.symlink_to(source)
+                            report["synced_skills"].append(str(target))
+
+            profile_path = autopilot_dir / "profile.json"
+            if profile_path.is_file():
+                project_path = autopilot_dir / "project.json"
+                apply_args = argparse.Namespace(**vars(args))
+                apply_args.command = "apply"
+                apply_args.upgrade = True
+                apply_args.profile = None
+                apply_args.preset = apply_args.mode = apply_args.max_turns = None
+                apply_args.worker_agents = apply_args.review_agents = apply_args.scenes = None
+                apply_args.deliver_strategy = apply_args.entry_shortcuts = None
+                apply_args.feedback_email = None
+                apply_args.guardrail = None
+                apply_args.project = str(project_path) if project_path.is_file() else None
+                apply_args.no_project = False
+                _apply_unlocked(apply_args)
+            report["last_updated_at"] = time.time()
+            report["status"] = "updated" if report["source_status"] == "updated" else ("skipped_dirty_checkout" if report["source_status"] == "skipped_dirty_checkout" else ("skipped_non_main_branch" if report["source_status"] == "skipped_non_main_branch" else "up_to_date"))
+        except Exception as exc:
+            report["error"] = str(exc)
+            report["status"] = "failed"
+        atomic_write_text(state_dir / "auto_update.json", json_text(report))
+        log_path = state_dir / "autopilot.log"
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"ts": time.time(), "event": "auto_update_failed" if report["status"] == "failed" else "auto_update_completed", **report}, ensure_ascii=False) + "\n")
+    return report
+
+
+def subprocess_run(command: list[str], timeout: int) -> str:
+    result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+    return result.stdout
+
+
+@contextmanager
+def _file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def uninstall(args: argparse.Namespace) -> dict[str, Any]:
