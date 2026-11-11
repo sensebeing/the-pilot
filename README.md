@@ -115,7 +115,7 @@ Inside an active chat session or from the terminal:
 | --- | --- | --- | --- |
 | 1. Orchestration | `worker_agents`<br>`review_agents` | Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Coordinator and Dispatched Worker separation, child-worktree isolation, branch-first review loop, and hot-reloadable executor priority. |
 | 2. Autopilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..50` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
-| 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | Strategies: `merge_dev_only` \| `merge_dev_e2e` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
+| 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | Strategies: `merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
 | 4. Shortcuts | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | Universal entries: `r`, `rt`, `d`, `pull`<br>Plus project entries and custom aliases | Short prompt templates expanded deterministically on `PreInvocation` (for example, `r auth` expands into a full architectural review prompt). |
 
 ## Four-scene state machine
@@ -130,9 +130,11 @@ At the end of each Coordinator turn, the model classifies the task (`Class A` de
 | --- | --- | --- | --- |
 | `plan-and-orchestrate` | Initial architecture review, new feature design, root-cause diagnosis, or review remediation list is ready for code changes. | `auto` (`Class A`)<br>`pause` (`Class B`) | Converge on root-cause architecture and dispatch or supervise Orca child workers against explicit module contracts. |
 | `architecture-re-review` | Any code in the task scope was implemented or modified during the turn (even if already merged). | `auto` | Audit the entire task scope against original design docs and simplest-architecture standards before delivery. |
-| `deliver-and-verify` | Whole-task architecture and engineering quality issues are zero, and authorized delivery or verification steps remain. | `auto` (pauses before `/ship` prod) | Merge to `main` and complete the configured delivery strategy (`merge_dev_only`, `merge_dev_e2e`, or `local_verify_only`). |
+| `deliver-and-verify` | Whole-task architecture and engineering quality issues are zero, and authorized delivery or verification steps remain. | `auto` (pauses before `/ship` prod) | Merge to `main` and complete the configured delivery strategy (`merge_dev_e2e`, `merge_dev_only`, or `local_verify_only`). |
 | `closeout-and-sync` | Code review and delivery verification are complete, with docs, ledgers, feedback, alerts, or worktrees left to close out. | `auto` | Sync docs and ledgers, release Orca workers (`worker-release`), clean up session worktrees, and land closeout commits. |
 | `NONE` | Waiting on `ask_question` user input, or every code, delivery, and closeout obligation is complete. | No prefill | Emit `<!-- autopilot: {"scene": "NONE"} -->` and stop cleanly. |
+
+The default `merge_dev_e2e` strategy runs targeted dev E2E after deployment. If unnecessary or prerequisites are unavailable, report the concrete reason and remaining risk, then close out. Prod and full/batch suites still require explicit current-turn authorization. Select `merge_dev_only` explicitly for deployment verification only.
 
 ## Workflow
 
@@ -230,5 +232,3 @@ If `the-pilot` helps your team build with AI, a star on GitHub helps other teams
 ## License
 
 [MIT](LICENSE)
-
-The default `merge_dev_e2e` strategy runs targeted dev E2E after deployment. If unnecessary or prerequisites are unavailable, report the concrete reason and remaining risk, then close out. Prod and full/batch suites still require explicit current-turn authorization. Select `merge_dev_only` explicitly for deployment verification only.

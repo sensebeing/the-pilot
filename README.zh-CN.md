@@ -115,7 +115,7 @@ pilot apply --project /path/to/repo --preset recommended --json
 | --- | --- | --- | --- |
 | 1. 主从编排（Orchestration） | `worker_agents`<br>`review_agents` | 子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | 主会话（设计/Review）与子会话（分支编码）职责分离、父子工作区层级、执行器优先级持久化与下一轮热加载。 |
 | 2. 自动推进（Autopilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..50`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
-| 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | 交付策略：`merge_dev_only` \| `merge_dev_e2e` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线要求。 |
+| 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | 交付策略：`merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线要求。 |
 | 4. 快捷口令（Shortcuts） | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | 通用口令：`r`、`rt`、`d`、`pull`<br>外加项目扩展口令与自定义 `,` 别名 | 在 `PreInvocation` 阶段将简短口令（例如 `r auth`）展开为完整的架构审查或编排提示词。 |
 
 ## 四场景状态机
@@ -130,9 +130,11 @@ pilot apply --project /path/to/repo --preset recommended --json
 | --- | --- | --- | --- |
 | `plan-and-orchestrate` | 刚完成初版架构审查报告、新需求设计方案、问题根因定位（需改代码）或复审待改清单。 | `auto`（A 类）<br>`pause`（B 类） | 从架构源头收敛方案，明确唯一 Owner 与模块契约，通过 Orca 编排子工作区推进实施并严格 Review。 |
 | `architecture-re-review` | 本会话整个任务涉及的代码在本轮发生了实施或整改（哪怕已合入 `main`）。 | `auto` | 对照最初的设计和审查文档，对本会话整个任务涉及的代码做最简架构复审，清理表象补丁与工程质量问题。 |
-| `deliver-and-verify` | 按实际代码行为核查后，最简架构与工程质量问题已清零，尚有未完成的合入或环境核验步骤。 | `auto`（进 prod 前强制 `pause`） | 按配置的交付策略（`merge_dev_only`、`merge_dev_e2e` 或 `local_verify_only`）完成剩余交付与验证步骤。 |
+| `deliver-and-verify` | 按实际代码行为核查后，最简架构与工程质量问题已清零，尚有未完成的合入或环境核验步骤。 | `auto`（进 prod 前强制 `pause`） | 按配置的交付策略（`merge_dev_e2e`、`merge_dev_only` 或 `local_verify_only`）完成剩余交付与验证步骤。 |
 | `closeout-and-sync` | 代码复审与交付验证均已完成，尚有文档、台账同步、告警/反馈结案或 Orca 工作区回收未完成。 | `auto` | 同步设计文档与 `WORKING.md`、释放 Orca 受控子会话（`worker-release`）、回收工作区并将收尾改动落回 `origin/main`。 |
 | `NONE` | 正在等待用户回答 `ask_question`，或代码、交付、文档与工作区收尾已全部结清。 | 不预填 | 输出 `<!-- autopilot: {"scene": "NONE"} -->`，清空候选并结束。 |
+
+默认交付策略为 `merge_dev_e2e`：部署后执行受影响链路的定向 dev E2E；无需验证或缺少执行条件时说明具体原因与剩余风险后收尾。prod 与全量/批量套件仍需当轮明确授权。`merge_dev_only` 可显式选择仅部署核验。
 
 ## 工作流
 
@@ -230,5 +232,3 @@ guard review --repo-root .
 ## 许可证
 
 [MIT](LICENSE)
-
-默认交付策略为 `merge_dev_e2e`：部署后执行受影响链路的定向 dev E2E；无需验证或缺少执行条件时说明具体原因与剩余风险后收尾。prod 与全量/批量套件仍需当轮明确授权。`merge_dev_only` 可显式选择仅部署核验。
