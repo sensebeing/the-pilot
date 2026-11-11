@@ -413,11 +413,20 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 elif branch != "main":
                     report["source_status"] = "skipped_non_main_branch"
                 else:
+                    before_sha = subprocess_run(
+                        ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
+                    ).strip()
                     subprocess_run(["git", "-C", str(checkout), "pull", "--ff-only"], 20)
-                    report["source_status"] = "updated"
-                    pilot_bin = Path.home() / ".local/bin/pilot"
-                    if not explicit and shutil.which("uv") and (pilot_bin.exists() or shutil.which("pilot")):
-                        subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
+                    after_sha = subprocess_run(
+                        ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
+                    ).strip()
+                    if after_sha != before_sha:
+                        report["source_status"] = "updated"
+                        pilot_bin = Path.home() / ".local/bin/pilot"
+                        if not explicit and shutil.which("uv") and (pilot_bin.exists() or shutil.which("pilot")):
+                            subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
+                    else:
+                        report["source_status"] = "up_to_date"
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
             elif not explicit and shutil.which("uv"):
                 subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
@@ -455,7 +464,27 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 apply_args.guardrail = None
                 apply_args.project = str(project_path) if project_path.is_file() else None
                 apply_args.no_project = False
-                _apply_unlocked(apply_args)
+                if checkout is not None and (checkout / "bin" / "pilot").is_file():
+                    project_args = (
+                        ["--project", str(project_path)]
+                        if project_path.is_file()
+                        else ["--no-project"]
+                    )
+                    subprocess_run(
+                        [
+                            sys.executable,
+                            str(checkout / "bin" / "pilot"),
+                            "apply",
+                            "--upgrade",
+                            "--gemini-dir",
+                            str(gemini_dir),
+                            *project_args,
+                            "--json",
+                        ],
+                        30,
+                    )
+                else:
+                    apply(apply_args)
             report["last_updated_at"] = time.time()
             report["status"] = "updated" if report["source_status"] == "updated" else ("skipped_dirty_checkout" if report["source_status"] == "skipped_dirty_checkout" else ("skipped_non_main_branch" if report["source_status"] == "skipped_non_main_branch" else "up_to_date"))
         except Exception as exc:
@@ -464,7 +493,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         atomic_write_text(state_dir / "auto_update.json", json_text(report))
         log_path = state_dir / "autopilot.log"
         with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"ts": time.time(), "event": "auto_update_failed" if report["status"] == "failed" else "auto_update_completed", **report}, ensure_ascii=False) + "\n")
+            handle.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": "auto_update_failed" if report["status"] == "failed" else "auto_update_completed", **report}, ensure_ascii=False) + "\n")
     return report
 
 
@@ -744,10 +773,18 @@ def print_human(command: str, result: dict[str, Any]) -> None:
             print(f"注意：{warning}")
     elif command == "status":
         print(f"installed: {result['installed']}")
+        auto_update = result.get("auto_update")
+        if isinstance(auto_update, dict) and "status" in auto_update:
+            print(f"auto_update: {auto_update['status']}")
         if "mode" in result:
             print(f"mode: {result['mode']}  max_turns: {result['max_consecutive_auto_turns']}")
             print("scenes: " + (", ".join(result['scenes']) or "（无）"))
         print("drift: " + ("none" if not result["drift"] else "; ".join(result["drift"])))
+    elif command == "self-update":
+        print(
+            f"status: {result['status']}  source: {result['source_status']}  "
+            f"head: {result.get('head_sha') or 'none'}"
+        )
     elif command == "distill":
         totals = result["totals"]
         print(
