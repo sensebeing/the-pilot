@@ -99,7 +99,7 @@ def distill_chat_history(
     current_ts = float(time.time() if now_ts is None else now_ts)
     cutoff_ts = current_ts - days * 86400.0
     config_status, installed_shortcuts = _load_installed_shortcuts(gemini_dir)
-    installed_pipeline = _inspect_installed_pipeline(gemini_dir)
+    installed_pipeline, stage_contracts = _inspect_installed_pipeline(gemini_dir)
 
     sources: dict[str, dict[str, Any]] = {}
     all_records: list[dict[str, Any]] = []
@@ -219,6 +219,7 @@ def distill_chat_history(
     evidence_complete = (
         config_status.get("status") != "error"
         and installed_pipeline["profile_status"] != "error"
+        and installed_pipeline["project_status"] != "error"
         and installed_pipeline["scenes_status"] != "error"
         and all(
             src["status"] != "degraded"
@@ -227,7 +228,9 @@ def distill_chat_history(
             for src in sources.values()
         )
     )
-    pipeline_assessment = _analyze_pipeline_flow(all_records, manual_records, installed_pipeline)
+    pipeline_assessment = _analyze_pipeline_flow(
+        all_records, manual_records, installed_pipeline, stage_contracts
+    )
     recommendations = _build_recommendations(
         recurring_patterns, autopilot_counts, manual_records, config_status, evidence_complete,
         pipeline_assessment,
@@ -988,13 +991,30 @@ def _is_machine_message(text: str) -> bool:
     return False
 
 
-def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
-    """Inspect the installed profile and scene contracts without guessing."""
+def _effective_stage_contracts(
+    specs: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Pair universal stage obligations with the effective project scene specs."""
+    contracts: dict[str, dict[str, Any]] = {}
+    for stage, contract in PIPELINE_STAGE_CONTRACTS.items():
+        scene_spec = specs["scene_specs"][stage]
+        merged = copy.deepcopy(contract)
+        merged["order"] = scene_spec["order"]
+        merged["title"] = scene_spec["title"]
+        contracts[stage] = merged
+    return contracts
+
+
+def _inspect_installed_pipeline(
+    gemini_dir: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Inspect the installed project overlay, profile, and scenes without guessing."""
     profile_path = gemini_dir / "config/autopilot/profile.json"
     project_path = gemini_dir / "config/autopilot/project.json"
     scenes_dir = gemini_dir / "config/autopilot/scenes"
     result: dict[str, Any] = {
         "profile_status": "absent" if not profile_path.is_file() else "ok",
+        "project_status": "absent" if not project_path.is_file() else "ok",
         "scenes_status": "absent" if not scenes_dir.is_dir() else "ok",
         "mode": None,
         "max_consecutive_auto_turns": None,
@@ -1002,25 +1022,33 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
         "enabled_scenes": [],
         "missing_stages": list(SCENE_ORDER),
         "custom_scene_files": [],
+        "duplicate_scene_names": [],
         "incomplete_scene_contracts": [],
         "guardrail_count": 0,
         "redundant_guardrails": [],
     }
     specs = DEFAULT_SPECS
+    project_raw = None
+    if project_path.is_file():
+        try:
+            project_raw = json.loads(project_path.read_text(encoding="utf-8"))
+            specs = project_specs(project_raw)
+        except (OSError, ProfileError, json.JSONDecodeError) as exc:
+            result["project_status"] = "error"
+            result["error"] = str(exc)
+            if profile_path.is_file():
+                result["profile_status"] = "error"
+            # The project overlay owns the effective scene specs. Without it the
+            # profile and scene contracts must not be validated against defaults.
+            return result, {}
     if profile_path.is_file():
         try:
             raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
-            project_raw = (
-                json.loads(project_path.read_text(encoding="utf-8"))
-                if project_path.is_file()
-                else None
-            )
             profile = validate_profile(raw_profile, project=project_raw)
         except (OSError, ProfileError, json.JSONDecodeError) as exc:
             result["profile_status"] = "error"
             result["error"] = str(exc)
         else:
-            specs = project_specs(project_raw)
             autopilot = profile["autopilot"]
             scenes = profile["scenes"]
             enabled_scenes = scenes["enabled_scenes"]
@@ -1032,18 +1060,19 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
                 "missing_stages": [stage for stage in SCENE_ORDER if stage not in enabled_scenes],
                 "guardrail_count": len(scenes["guardrails"]),
             })
-            required_guardrails = [
-                spec["required_guardrail"]
-                for spec in specs["scene_specs"].values()
-                if spec["required_guardrail"]
-            ]
-            result["redundant_guardrails"] = sorted({
-                guardrail for guardrail in scenes["guardrails"]
-                if any(
-                    guardrail in required_guardrail or required_guardrail in guardrail
-                    for required_guardrail in required_guardrails
-                )
-            })
+            required_guardrails = {
+                specs["scene_specs"][stage]["required_guardrail"].strip()
+                for stage in enabled_scenes
+                if specs["scene_specs"][stage]["required_guardrail"]
+            }
+            guardrail_counts = Counter(
+                guardrail.strip() for guardrail in scenes["guardrails"]
+            )
+            result["redundant_guardrails"] = sorted(
+                guardrail
+                for guardrail in guardrail_counts
+                if guardrail_counts[guardrail] > 1 or guardrail in required_guardrails
+            )
 
     stage_by_file = {
         spec["file"]: stage for stage, spec in specs["scene_specs"].items()
@@ -1057,10 +1086,16 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
             result["custom_scene_files"] = sorted(
                 name for name in present_files if name not in stage_by_file
             )
+            name_owners: dict[str, set[str]] = {}
+            custom_stage_names: set[str] = set()
             for path in scene_files:
                 meta, body = split_frontmatter(path.read_text(encoding="utf-8"))
                 stage = stage_by_file.get(path.name)
                 meta_name = str(meta.get("name") or "").strip()
+                if meta_name:
+                    name_owners.setdefault(meta_name, set()).add(path.name)
+                    if stage is None and meta_name in SCENE_ORDER:
+                        custom_stage_names.add(meta_name)
                 if stage is None:
                     broken_contract = not meta_name
                 else:
@@ -1076,6 +1111,10 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
                     or broken_contract
                 ):
                     incomplete.add(path.name)
+            result["duplicate_scene_names"] = sorted(
+                {name for name, owners in name_owners.items() if len(owners) > 1}
+                | custom_stage_names
+            )
         except (OSError, ValueError) as exc:
             result["scenes_status"] = "error"
             result.setdefault("error", str(exc))
@@ -1085,13 +1124,14 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
             if scene_file not in present_files:
                 incomplete.add(scene_file)
     result["incomplete_scene_contracts"] = sorted(incomplete)
-    return result
+    return result, _effective_stage_contracts(specs)
 
 
 def _analyze_pipeline_flow(
     all_records: list[dict[str, Any]],
     manual_records: list[dict[str, Any]],
     installed_pipeline: dict[str, Any],
+    stage_contracts: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     stage_activity = {
         stage: {"autopilot_turns": 0, "manual_turns": 0, "total_turns": 0}
@@ -1169,10 +1209,12 @@ def _analyze_pipeline_flow(
             and installed_pipeline.get("enabled_scenes") and installed_pipeline.get("missing_stages")):
         add("missing_pipeline_stages", installed_pipeline["missing_stages"][0], "scenes.enabled_scenes",
             len(installed_pipeline["missing_stages"]), "Enable every canonical pipeline stage so transitions remain observable and complete.")
-    over_count = len(installed_pipeline.get("custom_scene_files", [])) + len(installed_pipeline.get("redundant_guardrails", []))
-    if over_count or installed_pipeline.get("guardrail_count", 0) > 4:
-        add("over_engineered_pipeline", "plan-and-orchestrate", "scenes", max(over_count, installed_pipeline.get("guardrail_count", 0)),
-            "Remove custom duplication and retain only guardrails with an independent safety or quality purpose.")
+    duplication_count = len(installed_pipeline.get("redundant_guardrails", [])) + len(
+        installed_pipeline.get("duplicate_scene_names", [])
+    )
+    if duplication_count:
+        add("over_engineered_pipeline", "plan-and-orchestrate", "scenes", duplication_count,
+            "Remove duplicated scene names and guardrails that repeat an enabled stage's required guardrail.")
     if installed_pipeline.get("incomplete_scene_contracts"):
         incomplete_stage = next(
             (
@@ -1198,7 +1240,7 @@ def _analyze_pipeline_flow(
             and (installed_pipeline.get("max_consecutive_auto_turns") or 0) < 10 and multi_turn_sessions >= 2 and sessions_with_manual_nudges >= 1):
         add("manual_pipeline_handoff", "plan-and-orchestrate", "autopilot.max_consecutive_auto_turns", sessions_with_manual_nudges,
             "Raise the automatic turn budget only after confirming the four stage contracts can advance without manual handoffs.")
-    return {"stage_contracts": copy.deepcopy(PIPELINE_STAGE_CONTRACTS), "installed_pipeline": installed_pipeline,
+    return {"stage_contracts": stage_contracts, "installed_pipeline": installed_pipeline,
             "stage_activity": stage_activity, "flow_metrics": flow_metrics, "findings": findings}
 
 
@@ -1516,6 +1558,7 @@ def _build_recommendations(
         evidence_complete
         and config_status.get("status") == "absent"
         and pipeline_assessment.get("installed_pipeline", {}).get("profile_status") != "error"
+        and pipeline_assessment.get("installed_pipeline", {}).get("project_status") != "error"
         and pipeline_assessment.get("installed_pipeline", {}).get("scenes_status") != "error"
         and not autopilot_counts
         and manual_records

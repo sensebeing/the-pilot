@@ -490,6 +490,14 @@ class ProjectTest(unittest.TestCase):
         autopilot_dir = self.gemini / "config/autopilot"
         scenes_dir = autopilot_dir / "scenes"
         scenes_dir.mkdir(parents=True)
+        project = {
+            "schema": "the-pilot-project/v1",
+            "projectId": "demo",
+            "scene_specs": {
+                "plan-and-orchestrate": {"order": 7, "title": "自定义方案阶段"},
+            },
+        }
+        (autopilot_dir / "project.json").write_text(json.dumps(project), encoding="utf-8")
         profile = copy.deepcopy(self.base)
         profile["scenes"]["enabled_scenes"] = ["plan-and-orchestrate", "deliver-and-verify"]
         profile["scenes"]["deliver_strategy"] = "merge_dev_only"
@@ -518,23 +526,36 @@ class ProjectTest(unittest.TestCase):
             home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
         )
         assessment = report["pipeline_assessment"]
-        self.assertEqual(assessment["stage_contracts"], PIPELINE_STAGE_CONTRACTS)
-        self.assertEqual(list(assessment["stage_contracts"]), list(SCENE_ORDER))
-        for stage, contract in assessment["stage_contracts"].items():
-            self.assertTrue(contract["deliverable"], stage)
-            self.assertTrue(contract["quality_bar"], stage)
+        contracts = assessment["stage_contracts"]
+        self.assertEqual(list(contracts), list(SCENE_ORDER))
+        for stage, contract in contracts.items():
+            self.assertEqual(
+                set(contract),
+                {"order", "title", "deliverable", "quality_bar", "simplicity_rule"},
+                stage,
+            )
+            for field in ("deliverable", "quality_bar", "simplicity_rule"):
+                self.assertEqual(contract[field], PIPELINE_STAGE_CONTRACTS[stage][field], stage)
+        self.assertEqual(contracts["plan-and-orchestrate"]["order"], 7)
+        self.assertEqual(contracts["plan-and-orchestrate"]["title"], "自定义方案阶段")
+        self.assertEqual(
+            contracts["closeout-and-sync"]["title"],
+            DEFAULT_SPECS["scene_specs"]["closeout-and-sync"]["title"],
+        )
         installed = assessment["installed_pipeline"]
         self.assertEqual(installed["profile_status"], "ok")
+        self.assertEqual(installed["project_status"], "ok")
         self.assertEqual(installed["deliver_strategy"], "merge_dev_only")
         self.assertEqual(installed["missing_stages"], ["architecture-re-review", "closeout-and-sync"])
         self.assertEqual(installed["custom_scene_files"], ["custom-extra.md"])
+        self.assertEqual(installed["duplicate_scene_names"], [])
+        self.assertEqual(installed["redundant_guardrails"], [])
         self.assertEqual(installed["incomplete_scene_contracts"], ["03-deliver-and-verify.md"])
         findings = {finding["code"]: finding for finding in assessment["findings"]}
         self.assertEqual(
             set(findings),
             {
                 "missing_pipeline_stages",
-                "over_engineered_pipeline",
                 "incomplete_stage_contract",
                 "review_gate_bypassed",
                 "closeout_stage_dropped",
@@ -547,6 +568,48 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(findings["closeout_stage_dropped"]["evidence_count"], 1)
         self.assertEqual(findings["deliver_strategy_mismatch"]["evidence_count"], 2)
         self.assertTrue(report["evidence_complete"])
+
+        duplicate_guardrail_profile = copy.deepcopy(profile)
+        duplicate_guardrail_profile["scenes"]["guardrails"] = [
+            DEFAULT_SPECS["scene_specs"]["plan-and-orchestrate"]["required_guardrail"],
+        ]
+        (autopilot_dir / "profile.json").write_text(
+            json.dumps(duplicate_guardrail_profile), encoding="utf-8"
+        )
+        guardrail_assessment = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
+        )["pipeline_assessment"]
+        self.assertEqual(
+            guardrail_assessment["installed_pipeline"]["redundant_guardrails"],
+            [DEFAULT_SPECS["scene_specs"]["plan-and-orchestrate"]["required_guardrail"]],
+        )
+        self.assertIn(
+            "over_engineered_pipeline",
+            {finding["code"] for finding in guardrail_assessment["findings"]},
+        )
+
+        (scenes_dir / "custom-plan.md").write_text(
+            "---\n"
+            "name: plan-and-orchestrate\n"
+            "description: Duplicate of the built-in planning stage\n"
+            "fallback_prompt: Plan the task again\n"
+            "---\n"
+            "Duplicate body.\n",
+            encoding="utf-8",
+        )
+        duplicate_name_assessment = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
+        )["pipeline_assessment"]
+        self.assertEqual(
+            duplicate_name_assessment["installed_pipeline"]["duplicate_scene_names"],
+            ["plan-and-orchestrate"],
+        )
+        self.assertIn(
+            "over_engineered_pipeline",
+            {finding["code"] for finding in duplicate_name_assessment["findings"]},
+        )
+        (scenes_dir / "custom-plan.md").unlink()
+        (autopilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
 
         for path in claude_dir.glob("*.jsonl"):
             path.unlink()
@@ -585,9 +648,23 @@ class ProjectTest(unittest.TestCase):
         bad_project = distill_chat_history(
             home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
         )
-        self.assertEqual(
-            bad_project["pipeline_assessment"]["installed_pipeline"]["profile_status"], "error"
+        bad_installed = bad_project["pipeline_assessment"]["installed_pipeline"]
+        self.assertEqual(bad_installed["project_status"], "error")
+        self.assertEqual(bad_installed["profile_status"], "error")
+        self.assertEqual(bad_installed["custom_scene_files"], [])
+        self.assertEqual(bad_installed["incomplete_scene_contracts"], [])
+        self.assertFalse(bad_project["evidence_complete"])
+
+        (autopilot_dir / "profile.json").unlink()
+        missing_profile = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
         )
+        missing_installed = missing_profile["pipeline_assessment"]["installed_pipeline"]
+        self.assertEqual(missing_installed["project_status"], "error")
+        self.assertEqual(missing_installed["profile_status"], "absent")
+        self.assertTrue(missing_installed["error"])
+        self.assertFalse(missing_profile["evidence_complete"])
+
         (autopilot_dir / "project.json").unlink()
         (autopilot_dir / "profile.json").write_text("{corrupt", encoding="utf-8")
         corrupt = distill_chat_history(
