@@ -1048,6 +1048,8 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
     stage_by_file = {
         spec["file"]: stage for stage, spec in specs["scene_specs"].items()
     }
+    incomplete: set[str] = set()
+    present_files: set[str] = set()
     if scenes_dir.is_dir():
         try:
             scene_files = sorted(path for path in scenes_dir.glob("*.md") if path.is_file())
@@ -1055,31 +1057,34 @@ def _inspect_installed_pipeline(gemini_dir: Path) -> dict[str, Any]:
             result["custom_scene_files"] = sorted(
                 name for name in present_files if name not in stage_by_file
             )
-            incomplete: set[str] = set()
             for path in scene_files:
                 meta, body = split_frontmatter(path.read_text(encoding="utf-8"))
                 stage = stage_by_file.get(path.name)
-                missing_guardrail = (
-                    stage is not None
-                    and specs["scene_specs"][stage]["required_guardrail"]
-                    and not str(meta.get("required_guardrail") or "").strip()
-                )
+                meta_name = str(meta.get("name") or "").strip()
+                if stage is None:
+                    broken_contract = not meta_name
+                else:
+                    broken_contract = (
+                        meta_name != stage
+                        or str(meta.get("required_guardrail") or "").strip()
+                        != specs["scene_specs"][stage]["required_guardrail"]
+                    )
                 if (
                     not str(meta.get("description") or "").strip()
                     or not str(meta.get("fallback_prompt") or "").strip()
                     or not body.strip()
-                    or missing_guardrail
+                    or broken_contract
                 ):
                     incomplete.add(path.name)
-            if result["profile_status"] == "ok":
-                for stage in result["enabled_scenes"]:
-                    scene_file = specs["scene_specs"][stage]["file"]
-                    if scene_file not in present_files:
-                        incomplete.add(scene_file)
-            result["incomplete_scene_contracts"] = sorted(incomplete)
         except (OSError, ValueError) as exc:
             result["scenes_status"] = "error"
             result.setdefault("error", str(exc))
+    if result["profile_status"] == "ok" and result["scenes_status"] != "error":
+        for stage in result["enabled_scenes"]:
+            scene_file = specs["scene_specs"][stage]["file"]
+            if scene_file not in present_files:
+                incomplete.add(scene_file)
+    result["incomplete_scene_contracts"] = sorted(incomplete)
     return result
 
 
@@ -1130,8 +1135,17 @@ def _analyze_pipeline_flow(
             continue
         sessions_with_delivery += 1
         delivery_index = stages.index("deliver-and-verify")
-        if delivery_index > 0 and "architecture-re-review" not in stages[: delivery_index + 1]:
-            sessions_with_delivery_without_review += 1
+        if delivery_index > 0:
+            last_plan = next(
+                (
+                    index
+                    for index in range(delivery_index - 1, -1, -1)
+                    if stages[index] == "plan-and-orchestrate"
+                ),
+                -1,
+            )
+            if "architecture-re-review" not in stages[last_plan + 1 : delivery_index]:
+                sessions_with_delivery_without_review += 1
         if len(stages) >= 2 and "closeout-and-sync" not in stages[delivery_index:]:
             sessions_with_delivery_without_closeout += 1
     e2e_manual_turns = sum(

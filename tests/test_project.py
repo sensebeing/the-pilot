@@ -496,6 +496,7 @@ class ProjectTest(unittest.TestCase):
         (autopilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
         (scenes_dir / "01-plan-and-orchestrate.md").write_text(
             "---\n"
+            "name: plan-and-orchestrate\n"
             "description: Plan the task\n"
             f"required_guardrail: {DEFAULT_SPECS['scene_specs']['plan-and-orchestrate']['required_guardrail']}\n"
             "fallback_prompt: Draft the plan\n"
@@ -505,6 +506,7 @@ class ProjectTest(unittest.TestCase):
         )
         (scenes_dir / "custom-extra.md").write_text(
             "---\n"
+            "name: custom-extra\n"
             "description: Extra scene\n"
             "fallback_prompt: Do the extra step\n"
             "---\n"
@@ -545,6 +547,39 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(findings["closeout_stage_dropped"]["evidence_count"], 1)
         self.assertEqual(findings["deliver_strategy_mismatch"]["evidence_count"], 2)
         self.assertTrue(report["evidence_complete"])
+
+        for path in claude_dir.glob("*.jsonl"):
+            path.unlink()
+        (claude_dir / "rework.jsonl").write_text("\n".join([
+            json.dumps({
+                "type": "user",
+                "timestamp": int((now - 240) * 1000),
+                "message": {"content": "先产出方案并用 Orca 编排实施"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int((now - 180) * 1000),
+                "message": {"content": "整体 review 一遍代码"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int((now - 120) * 1000),
+                "message": {"content": "先产出方案并用 Orca 编排实施"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int((now - 60) * 1000),
+                "message": {"content": "合并当前分支到 main 并完成实跑验证"},
+            }),
+        ]) + "\n")
+        rework = distill_chat_history(
+            home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
+        )
+        rework_findings = {
+            finding["code"]: finding
+            for finding in rework["pipeline_assessment"]["findings"]
+        }
+        self.assertEqual(rework_findings["review_gate_bypassed"]["evidence_count"], 1)
 
         (autopilot_dir / "project.json").write_text('{"schema": "wrong"}', encoding="utf-8")
         bad_project = distill_chat_history(
