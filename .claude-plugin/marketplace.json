@@ -10,7 +10,7 @@
     {
       "name": "the-pilot",
       "source": "./",
-      "description": "Scene-based Turn Autopilot and Orca Coordinator/Worker governance for AI coding sessions.",
+      "description": "Stop being a human relay for coding agents. Distill 7-day chat history and run a 4-stage Turn Autopilot so you focus on product and architecture.",
       "version": "0.1.0",
       "license": "MIT",
       "keywords": [

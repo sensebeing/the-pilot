@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "the-pilot"
 version = "0.1.0"
-description = "Scene-based Turn Autopilot and Orca Coordinator/Worker governance for AI coding sessions"
+description = "Stop being a human relay for coding agents. Distill 7-day chat history and run a 4-stage Turn Autopilot so you focus on product and architecture."
 requires-python = ">=3.11"
 license = "MIT"
 readme = "README.md"

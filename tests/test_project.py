@@ -155,6 +155,7 @@ class ProjectTest(unittest.TestCase):
         for manifest in (claude_plugin, cursor_plugin, marketplace["plugins"][0]):
             self.assertEqual(manifest["name"], "the-pilot")
             self.assertEqual(manifest["version"], __version__)
+            self.assertEqual(manifest["description"], pyproject["project"]["description"])
             self.assertEqual(manifest["license"], pyproject["project"]["license"])
             self.assertEqual(manifest["keywords"], pyproject["project"]["keywords"])
         self.assertEqual(claude_plugin["skills"], expected_skills)

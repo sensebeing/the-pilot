@@ -6,17 +6,17 @@
 [![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--pilot-black)](https://skills.sh/sensebeing/the-pilot)
 [![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-pilot?style=social)](https://github.com/sensebeing/the-pilot/stargazers)
 
-**Keep your AI coding sessions moving safely from design to delivery.**
+**Stop working as a human relay for your coding agents.**
 
-Scene-based Turn Autopilot and Orca Coordinator/Worker governance for teams building software with AI.
+Distill seven days of multi-agent chat history into a four-stage Turn Autopilot, so your attention goes to product and architecture instead of prompt handoffs.
 
-Multi-step engineering tasks rarely finish in one prompt. A feature or root-cause fix moves through architecture design, isolated worker implementation, code review, branch integration, verification, and workspace cleanup. Without turn automation, sessions pause after every turn waiting for someone to type *"review the branch"*, *"merge and verify"*, or *"clean up the worktree"*. Simple auto-continue scripts fail in the other direction by pressing Enter while a clarifying question is still open, or by scraping Markdown prose with fragile regular expressions.
+Coding agents stop after every turn. A feature or a root-cause fix moves through architecture design, isolated implementation, code review, branch integration, verification, and workspace cleanup, and each of those transitions normally ends with a person reading the summary and typing the next instruction: *"review the branch"*, *"merge to main and deploy dev"*, *"run E2E"*, *"clean up the worktree and update the docs"*, *"continue"*. The developer becomes a relay between stages of an assembly line, retyping the same handful of prompts every day. Auto-continue scripts do not fix this: they press Enter while a clarifying question is still open, or they scrape Markdown prose with regexes that break on the first backtick.
 
-`the-pilot` turns each completed agent turn into a deterministic next step. The Coordinator session owns architecture and review, Orca workers implement changes on isolated branches, and the runtime reads a single trailing JSON tag (`json.loads`, zero regex) to prefill or submit the next prompt once questions are settled and the terminal is idle.
+`the-pilot` takes over the routine handoffs. It distills seven days of multi-agent chat history to find the prompts you keep typing, compiles a minimal four-stage pipeline, and gives every stage an explicit deliverable and exit quality bar. Routine stages advance automatically in `gate` mode once questions are settled and the terminal is idle. Design trade-offs and production releases pause for a human (`gate=pause`), or stop while an `ask_question` tool call waits for an answer (`scene=NONE`). The runtime reads one trailing JSON tag with `json.loads` and no regex, so visible prose, backticks, and code blocks never affect the decision.
 
 | Without `the-pilot` | With `the-pilot` |
 | --- | --- |
-| A multi-step task pauses after every turn waiting for someone to type *"review the branch"*, *"merge and verify"*, or *"clean up the worktree"*, while naive auto-continue scripts press Enter over open clarifying questions or break when Markdown prose contains backticks. | Coordinator sessions design and review while Orca child workers implement changes on isolated branches. At the end of each turn, the runtime reads a single trailing JSON tag (`json.loads`, zero regex) to auto-advance routine stages in `gate` mode, prefill design decisions (`gate=pause`), and stop whenever an `ask_question` tool call is open. |
+| You act as the relay. After every turn you read the agent summary and retype the same transition prompts (*"review the branch"*, *"merge and verify"*, *"clean up the worktree"*), while naive auto-continue scripts press Enter over open clarifying questions or break on a backtick. | The four-stage pipeline owns routine transitions. Coordinator sessions design and review, Orca child workers implement on isolated branches, and a stage advances only after its deliverable and exit quality bar are met. Design decisions and production gates wait for your judgment. |
 
 [中文文档](README.zh-CN.md) · [Quick start](#quick-start) · [Presets & 4 dimensions](#presets-and-four-dimension-customization) · [Four-scene state machine](#four-scene-state-machine) · [Workflow](#workflow) · [Project overlay](#project-extension-tier-pilotprojectjson) · [Setup skill](skills/the-pilot-setup/SKILL.md) · [Daily skill](skills/the-pilot/SKILL.md)
 
@@ -33,11 +33,22 @@ then follow skills/the-pilot-setup/SKILL.md to run `pilot distill --days 7 --jso
 
 ## Why we built it
 
-When our team works in Orca, a single task typically pairs one Coordinator session that designs the architecture and reviews diffs with one or more Codex or Claude Code workers implementing changes in child worktrees.
+We built `the-pilot` because our own sessions had turned into a relay loop. A task moved from design to implementation to review to delivery, and after every turn someone typed the transition prompt. The prompts were always the same: *"review the branch"*, *"merge to main and deploy dev"*, *"run the targeted E2E"*, *"clean up the worktree and update the docs"*, *"continue"*. The human was doing procedural assembly-line work between stages that a pipeline could determine on its own.
 
-We wanted sessions to move through routine engineering stages on their own while stopping whenever human judgment is needed. Routine transitions (`Class A`), such as moving from worker implementation to whole-task architecture review or from a clean review to authorized branch integration, advance automatically in `gate` mode. Design trade-offs and unconfirmed contract boundaries (`Class B`) pause (`gate=pause`) with the recommended prompt prefilled in the terminal input box, or stop (`scene=NONE`) while an `ask_question` tool call waits for an answer.
+The judgments that need a person are product decisions, architecture boundaries, and whether a design is simple enough to ship. Routine handoffs should not consume that attention.
 
-Humans read the visible `,1` and `,2` Markdown lines (which can contain inline backticks, code blocks, or symbols), while the runtime parses only the trailing JSON comment (`<!-- autopilot: {...} -->`) via `json.loads`.
+So `the-pilot` distills seven days of chat history, turns recurring prompts into four stages with explicit deliverables and quality bars, and advances routine transitions automatically. Class A transitions, such as worker implementation to whole-task architecture review or a clean review to authorized branch integration, run in `gate` mode. Class B design and contract decisions pause (`gate=pause`) with the recommended prompt prefilled in the terminal input box, or stop (`scene=NONE`) while an `ask_question` tool call waits for an answer.
+
+Humans read the visible `,1` and `,2` Markdown lines, which can contain inline backticks, code blocks, or symbols. The runtime parses only the trailing JSON comment (`<!-- autopilot: {...} -->`) via `json.loads`.
+
+## How it compares to other approaches
+
+| Approach | What it provides | Where the human still carries the load |
+| --- | --- | --- |
+| Static prompt and spec libraries (superpowers, spec-kit, claude-code-workflows) | Slash commands, checklists, and spec templates for common engineering steps. | You decide when each step starts and trigger every stage transition by hand. |
+| Blind auto-loop wrappers (ralph-claude-code, queue auto-clickers) | A loop that keeps sending prompts until the agent exits. | Routine handoffs and architecture or production gates receive the same treatment, with no per-stage deliverable or quality bar to stop on. |
+| Multi-terminal session managers (claude-squad, Prowl, sno-station) | Several agent terminals tiled in one window. | More agents in view means more windows to babysit, and the handoff prompts stay manual. |
+| `the-pilot` | Seven days of multi-agent chat history distilled into a minimal four-stage pipeline, with an explicit deliverable and exit quality bar for every stage. | Routine stages advance automatically (`gate=auto`); design decisions and production releases pause for confirmation (`gate=pause`). |
 
 ## Quick start
 
@@ -126,13 +137,17 @@ At the end of each Coordinator turn, the model classifies the task (`Class A` de
 <!-- autopilot: {"scene": "plan-and-orchestrate", "gate": "auto", "1": "Primary prompt", "2": "Alternative prompt"} -->
 ```
 
-| Scene | When it triggers | Default gate | Next-step responsibility |
-| --- | --- | --- | --- |
-| `plan-and-orchestrate` | Initial architecture review, new feature design, root-cause diagnosis, or review remediation list is ready for code changes. | `auto` (`Class A`)<br>`pause` (`Class B`) | Converge on root-cause architecture and dispatch or supervise Orca child workers against explicit module contracts. |
-| `architecture-re-review` | Any code in the task scope was implemented or modified during the turn (even if already merged). | `auto` | Audit the entire task scope against original design docs and simplest-architecture standards before delivery. |
-| `deliver-and-verify` | Whole-task architecture and engineering quality issues are zero, and authorized delivery or verification steps remain. | `auto` (pauses before `/ship` prod) | Merge to `main` and complete the configured delivery strategy (`merge_dev_e2e`, `merge_dev_only`, or `local_verify_only`). |
-| `closeout-and-sync` | Code review and delivery verification are complete, with docs, ledgers, feedback, alerts, or worktrees left to close out. | `auto` | Sync docs and ledgers, release Orca workers (`worker-release`), clean up session worktrees, and land closeout commits. |
-| `NONE` | Waiting on `ask_question` user input, or every code, delivery, and closeout obligation is complete. | No prefill | Emit `<!-- autopilot: {"scene": "NONE"} -->` and stop cleanly. |
+Every stage carries a deliverable and an exit quality bar, and the runtime advances only when that obligation is met. A turn cannot jump from implementation to delivery without the whole-task architecture re-review, and a task cannot be declared done before closeout is settled.
+
+| Scene | When it triggers | Default gate | Deliverable | Exit quality bar | Next-step responsibility |
+| --- | --- | --- | --- | --- | --- |
+| `plan-and-orchestrate` | Initial architecture review, new feature design, root-cause diagnosis, or a review remediation list is ready for code changes. | `auto` (`Class A`)<br>`pause` (`Class B`) | An agreed whole-task plan: unique owner, boundaries, contracts, and executable orchestration tasks. | The plan covers the real root cause, the direct call topology, and the verification path, and satisfies the engineering quality rules. | Converge on root-cause architecture and dispatch or supervise Orca child workers against explicit module contracts. |
+| `architecture-re-review` | Any code in the task scope was implemented or modified during the turn, even if already merged. | `auto` | A whole-task architecture review of all implementation in the task, with unresolved issues recorded. | Unique owner, responsibility boundaries, contracts, and uncovered risks are closed. | Audit the entire task scope against original design docs and simplest-architecture standards before delivery. |
+| `deliver-and-verify` | Whole-task architecture and engineering quality issues are zero, and authorized delivery or verification steps remain. | `auto` (pauses before `/ship` prod) | Authorized integration, environment verification, and the targeted real-run evidence this change needs. | Every delivery action has verification results matched to the change, remaining risks, and traceable evidence. | Merge to `main` and complete the configured delivery strategy (`merge_dev_e2e`, `merge_dev_only`, or `local_verify_only`). |
+| `closeout-and-sync` | Code review and delivery verification are complete, with docs, ledgers, feedback, alerts, or worktrees left to close out. | `auto` | Required docs synced, authorized obligations settled, and reclaimable collaboration resources released. | The closeout record matches actual state, unfinished obligations have an owner, and the task is declared done only after everything is settled. | Sync docs and ledgers, release Orca workers (`worker-release`), clean up session worktrees, and land closeout commits. |
+| `NONE` | Waiting on `ask_question` user input, or every code, delivery, and closeout obligation is complete. | No prefill | Nothing left to do. | Every obligation is settled. | Emit `<!-- autopilot: {"scene": "NONE"} -->` and stop cleanly. |
+
+`pilot distill --days 7 --json` audits both the recurring prompt patterns and the end-to-end health of the installed pipeline. It reports stage completeness, per-stage deliverables and quality bars, whether review and closeout handoffs happen before and after delivery, and whether custom scenes or guardrails add machinery without independent value.
 
 The default `merge_dev_e2e` strategy runs targeted dev E2E after deployment. If unnecessary or prerequisites are unavailable, report the concrete reason and remaining risk, then close out. Prod and full/batch suites still require explicit current-turn authorization. Select `merge_dev_only` explicitly for deployment verification only.
 
