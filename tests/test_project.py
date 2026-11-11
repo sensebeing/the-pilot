@@ -201,6 +201,22 @@ class ProjectTest(unittest.TestCase):
                 "content": "<USER_REQUEST>\nAudit whole task architecture\n</USER_REQUEST>",
             }),
             json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "created_at": recent_iso,
+                "content": 'Stale suggestion.\n<!-- autopilot: {"scene": "closeout-and-sync", "gate": "auto", "1": "Stale closeout prompt"} -->',
+            }),
+            json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "created_at": recent_iso,
+                "content": "Superseded by final response.\n<!-- autopilot: scene=NONE -->",
+            }),
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": recent_iso,
+                "content": "<USER_REQUEST>\nStale closeout prompt\n</USER_REQUEST>",
+            }),
+            json.dumps({
                 "type": "USER_INPUT",
                 "source": "USER_EXPLICIT",
                 "created_at": recent_iso,
@@ -233,14 +249,19 @@ class ProjectTest(unittest.TestCase):
         }) + "\n")
         os.utime(agy_old, (old_ts, old_ts))
 
-        # 2. Claude Code: repeated turns in same session + history mirror reconciliation
+        # 2. Claude Code: repeated turns in same session + pre-window turn + history mirror reconciliation
         claude_proj = home / ".claude/projects/demo/c1.jsonl"
         claude_proj.parent.mkdir(parents=True)
         claude_proj.write_text("\n".join([
             json.dumps({
                 "type": "user",
-                "timestamp": int(now * 1000),
+                "timestamp": int(old_ts * 1000),
                 "message": {"content": "triage issue e2931f0c-03bf-45fe-ac1b-d6b7edddd83e in services/auth/login.py"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int(old_ts * 1000),
+                "message": {"content": "继续"},
             }),
             json.dumps({
                 "type": "user",
@@ -263,17 +284,24 @@ class ProjectTest(unittest.TestCase):
                 "message": {"content": "You are an independent Adversarial Architecture & Engineering Quality Reviewer."},
             }),
         ]) + "\n")
+        claude_c2 = home / ".claude/projects/demo/c2.jsonl"
+        claude_c2.write_text(json.dumps({
+            "type": "user",
+            "timestamp": int(now * 1000),
+            "message": {"content": "triage issue e2931f0c-03bf-45fe-ac1b-d6b7edddd83e in services/auth/login.py"},
+        }) + "\n")
+        os.utime(claude_c2, (now - 30, now - 30))
         claude_hist = home / ".claude/history.jsonl"
         claude_hist.write_text("\n".join([
             json.dumps({
                 "sessionId": "c1",
                 "timestamp": int(now * 1000),
-                "display": "triage issue e2931f0c-03bf-45fe-ac1b-d6b7edddd83e in services/auth/login.py",
+                "display": "继续",
             }),
             json.dumps({
-                "sessionId": "c1",
+                "sessionId": "c2",
                 "timestamp": int(now * 1000),
-                "display": "继续",
+                "display": "triage issue e2931f0c-03bf-45fe-ac1b-d6b7edddd83e in services/auth/login.py",
             }),
             json.dumps({
                 "sessionId": "c_extra",
@@ -282,7 +310,7 @@ class ProjectTest(unittest.TestCase):
             }),
         ]) + "\n")
 
-        # 3. Codex: canonical UUID reconciliation between rollout file and history.jsonl + same-turn mirror
+        # 3. Codex: canonical UUID reconciliation + both mirror orders (event->response and response->event)
         codex_uuid = "01a1c8bb-6f9f-7162-a8f4-7fd61cb6ac69"
         codex_sess = home / f".codex/sessions/2026/11/11/rollout-2026-11-11T11-51-29-{codex_uuid}.jsonl"
         codex_sess.parent.mkdir(parents=True)
@@ -293,14 +321,14 @@ class ProjectTest(unittest.TestCase):
                 "payload": {"type": "user_message", "message": "You are working inside Orca, a multi-agent IDE. You are a dispatched worker."},
             }),
             json.dumps({
-                "type": "event_msg",
-                "timestamp": recent_iso,
-                "payload": {"type": "user_message", "message": "合并当前分支到 main 并完成实跑验证"},
-            }),
-            json.dumps({
                 "type": "response_item",
                 "timestamp": recent_iso,
                 "payload": {"role": "user", "content": [{"type": "input_text", "text": "合并当前分支到 main 并完成实跑验证"}]},
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": recent_iso,
+                "payload": {"type": "user_message", "message": "合并当前分支到 main 并完成实跑验证"},
             }),
         ]) + "\n")
         codex_hist = home / ".codex/history.jsonl"
@@ -336,6 +364,7 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(report["sources"]["cursor"]["human_messages"], 1)
         self.assertEqual(report["autopilot_activity"].get("candidate:,1"), 1)
         self.assertEqual(report["autopilot_activity"].get("scene:architecture-re-review"), 1)
+        self.assertIsNone(report["autopilot_activity"].get("scene:closeout-and-sync"))
 
         # Pre-window opener in s1 means the first in-window message of s1 is classified as followup, not entry
         s1_sample = next(item for item in report["sampled_prompts"] if "mid-session followup" in item["preview"])
@@ -366,13 +395,38 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(capped["sources"]["claude"]["truncated_files"], 1)
         self.assertFalse(capped["evidence_complete"])
 
-        # Corrupt config.json surfaces error status and suppresses false onboarding recommendation
+        # 6. Malformed or corrupt config.json surfaces error status and suppresses false onboarding recommendation
         cfg_path = self.gemini / "config/autopilot/config.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text("{corrupt", encoding="utf-8")
-        degraded_cfg = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
-        self.assertEqual(degraded_cfg["config_status"]["status"], "error")
-        self.assertFalse(any(r["category"] == "onboarding" for r in degraded_cfg["recommendations"]))
+        for bad_payload in ("{corrupt", json.dumps({"entry_shortcuts": {"r": {"aliases": 123}}})):
+            cfg_path.write_text(bad_payload, encoding="utf-8")
+            degraded_cfg = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
+            self.assertEqual(degraded_cfg["config_status"]["status"], "error")
+            self.assertFalse(any(r["category"] == "onboarding" for r in degraded_cfg["recommendations"]))
+
+        # 7. Installed shortcut matching: confirmed entry shortcut vs uncertain template match
+        cfg_path.write_text(json.dumps({
+            "entry_shortcuts": {
+                "ti": {
+                    "canonical_key": "ti",
+                    "command_id": "triage_issue",
+                    "requires_arg": True,
+                    "aliases": ["ti", ",ti"],
+                    "template": "triage issue {arg}",
+                }
+            }
+        }), encoding="utf-8")
+        claude_c3 = home / ".claude/projects/demo/c3.jsonl"
+        claude_c3.write_text(json.dumps({
+            "type": "user",
+            "timestamp": int(now * 1000),
+            "message": {"content": "ti auth-service"},
+        }) + "\n")
+        with_shortcuts = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
+        self.assertEqual(with_shortcuts["config_status"]["status"], "ok")
+        self.assertEqual(with_shortcuts["autopilot_activity"].get("entry:ti"), 1)
+        # Template-similar free-form prompts remain in manual_messages and surface in uncertain_template_matches
+        self.assertEqual(with_shortcuts["uncertain_template_matches"].get("entry:ti"), 2)
         cfg_path.unlink()
 
         cli_out = self.cli("distill", "--home-dir", str(home), "--days", "7", "--max-sessions", "10")

@@ -121,6 +121,7 @@ def distill_chat_history(
         all_records.extend(records)
 
     autopilot_counts: Counter[str] = Counter()
+    uncertain_template_counts: Counter[str] = Counter()
     pattern_groups: dict[str, dict[str, Any]] = {}
     manual_records: list[dict[str, Any]] = []
     entry_count = 0
@@ -137,11 +138,15 @@ def distill_chat_history(
             unknown_role_count += 1
 
         matched_autopilot = item.get("tag_provenance") or _match_installed_autopilot(
-            item["text"], installed_shortcuts
+            item["text"], installed_shortcuts, role
         )
         if matched_autopilot is not None:
             autopilot_counts[matched_autopilot] += 1
             continue
+
+        uncertain_match = _match_template_similarity(item["text"], installed_shortcuts)
+        if uncertain_match is not None:
+            uncertain_template_counts[uncertain_match] += 1
 
         manual_records.append(item)
         signature = _normalize_signature(item["text"])
@@ -157,9 +162,12 @@ def distill_chat_history(
                 "unknown_count": 0,
                 "agents": set(),
                 "examples": [],
+                "uncertain_template_match": uncertain_match,
             }
             pattern_groups[signature] = group
         group["count"] += 1
+        if uncertain_match is not None and group.get("uncertain_template_match") is None:
+            group["uncertain_template_match"] = uncertain_match
         if role == "entry":
             group["entry_count"] += 1
         elif role == "followup":
@@ -182,7 +190,7 @@ def distill_chat_history(
             group["entry_count"], group["followup_count"], group["unknown_count"]
         )
         category, suggestion = _classify_pattern(group["signature"], turn_role, group["count"])
-        recurring_patterns.append({
+        pattern_entry: dict[str, Any] = {
             "signature": group["signature"],
             "count": group["count"],
             "turn_role": turn_role,
@@ -190,7 +198,10 @@ def distill_chat_history(
             "category": category,
             "examples": group["examples"],
             "suggested_automation": suggestion,
-        })
+        }
+        if group.get("uncertain_template_match"):
+            pattern_entry["uncertain_template_match"] = group["uncertain_template_match"]
+        recurring_patterns.append(pattern_entry)
 
     evidence_complete = (
         config_status.get("status") != "error"
@@ -219,9 +230,11 @@ def distill_chat_history(
             "followup_messages": followup_count,
             "unknown_role_messages": unknown_role_count,
             "autopilot_expanded_messages": sum(autopilot_counts.values()),
+            "uncertain_template_messages": sum(uncertain_template_counts.values()),
             "manual_messages": len(manual_records),
         },
         "autopilot_activity": dict(autopilot_counts.most_common(15)),
+        "uncertain_template_matches": dict(uncertain_template_counts.most_common(15)),
         "recurring_patterns": recurring_patterns,
         "recommendations": recommendations,
         "sampled_prompts": sampled_prompts,
@@ -311,9 +324,9 @@ def _collect_antigravity(
         for line in lines:
             step_type = line.get("type")
             if step_type == "PLANNER_RESPONSE":
-                tag = _extract_autopilot_tag(str(line.get("content") or ""))
-                if tag is not None:
-                    pending_tag = tag
+                content_text = str(line.get("content") or "").strip()
+                if content_text:
+                    pending_tag = _extract_autopilot_tag(content_text)
                 continue
             if step_type != "USER_INPUT":
                 continue
@@ -424,11 +437,10 @@ def _collect_claude(
     records: list[dict[str, Any]] = []
     for sid in selected_sessions:
         session_records: list[dict[str, Any]] = []
-        seen_file_texts: Counter[str] = Counter()
         file_truncated = False
         if sid in file_by_session:
             _, path = file_by_session[sid]
-            session_records, seen_file_texts, file_truncated = _parse_claude_session_file(
+            session_records, file_truncated = _parse_claude_session_file(
                 path, sid, cutoff_ts, stats, max_lines=max_lines
             )
             records.extend(session_records)
@@ -438,7 +450,7 @@ def _collect_claude(
                     "claude",
                     sid,
                     history_by_session[sid],
-                    seen_file_texts,
+                    session_records,
                     sid in file_by_session,
                     cutoff_ts,
                     stats,
@@ -456,21 +468,19 @@ def _parse_claude_session_file(
     stats: dict[str, Any],
     *,
     max_lines: int,
-) -> tuple[list[dict[str, Any]], Counter[str], bool]:
+) -> tuple[list[dict[str, Any]], bool]:
     lines, truncated = _read_tail_jsonl(path, stats, max_lines=max_lines)
     if truncated:
         stats["truncated_files"] += 1
     session_turn_idx = 0
     pending_tag: dict[str, Any] | None = None
     records: list[dict[str, Any]] = []
-    seen_texts: Counter[str] = Counter()
     for line in lines:
         msg_type = line.get("type")
         if msg_type == "assistant":
             text = _extract_claude_content(line.get("message"))
-            tag = _extract_autopilot_tag(text)
-            if tag is not None:
-                pending_tag = tag
+            if text:
+                pending_tag = _extract_autopilot_tag(text)
             continue
         if msg_type != "user" or line.get("isMeta"):
             continue
@@ -481,7 +491,6 @@ def _parse_claude_session_file(
             stats["filtered_machine_messages"] += 1
             pending_tag = None
             continue
-        seen_texts[text] += 1
         role = "unknown" if truncated else ("entry" if session_turn_idx == 0 else "followup")
         session_turn_idx += 1
         matched_scene = _match_pending_tag(text, pending_tag)
@@ -500,7 +509,7 @@ def _parse_claude_session_file(
             "text": text,
             "tag_provenance": matched_scene,
         })
-    return records, seen_texts, truncated
+    return records, truncated
 
 
 def _collect_codex(
@@ -576,11 +585,10 @@ def _collect_codex(
     records: list[dict[str, Any]] = []
     for sid in selected_sessions:
         session_records: list[dict[str, Any]] = []
-        seen_file_texts: Counter[str] = Counter()
         file_truncated = False
         if sid in file_by_session:
             _, path = file_by_session[sid]
-            session_records, seen_file_texts, file_truncated = _parse_codex_session_file(
+            session_records, file_truncated = _parse_codex_session_file(
                 path, sid, cutoff_ts, stats, max_lines=max_lines
             )
             records.extend(session_records)
@@ -590,7 +598,7 @@ def _collect_codex(
                     "codex",
                     sid,
                     history_by_session[sid],
-                    seen_file_texts,
+                    session_records,
                     sid in file_by_session,
                     cutoff_ts,
                     stats,
@@ -608,15 +616,14 @@ def _parse_codex_session_file(
     stats: dict[str, Any],
     *,
     max_lines: int,
-) -> tuple[list[dict[str, Any]], Counter[str], bool]:
+) -> tuple[list[dict[str, Any]], bool]:
     lines, truncated = _read_tail_jsonl(path, stats, max_lines=max_lines)
     if truncated:
         stats["truncated_files"] += 1
     session_turn_idx = 0
     pending_tag: dict[str, Any] | None = None
-    last_event_user_text: str | None = None
+    last_user_mirror: tuple[str, str] | None = None
     records: list[dict[str, Any]] = []
-    seen_texts: Counter[str] = Counter()
 
     for line in lines:
         item_type = line.get("type")
@@ -624,17 +631,16 @@ def _parse_codex_session_file(
         if not isinstance(payload, dict):
             continue
         if item_type == "response_item" and payload.get("role") == "assistant":
-            last_event_user_text = None
+            last_user_mirror = None
             assistant_text = _extract_codex_text_blocks(payload.get("content"))
-            tag = _extract_autopilot_tag(assistant_text)
-            if tag is not None:
-                pending_tag = tag
+            if assistant_text:
+                pending_tag = _extract_autopilot_tag(assistant_text)
             continue
         if item_type == "event_msg" and payload.get("type") == "agent_message":
-            last_event_user_text = None
-            tag = _extract_autopilot_tag(str(payload.get("message") or ""))
-            if tag is not None:
-                pending_tag = tag
+            last_user_mirror = None
+            msg_text = str(payload.get("message") or "").strip()
+            if msg_text:
+                pending_tag = _extract_autopilot_tag(msg_text)
             continue
 
         is_event_user = item_type == "event_msg" and payload.get("type") == "user_message"
@@ -642,6 +648,7 @@ def _parse_codex_session_file(
         if not (is_event_user or is_resp_user):
             continue
 
+        kind = "event" if is_event_user else "response"
         text = (
             str(payload.get("message") or "").strip()
             if is_event_user
@@ -649,16 +656,15 @@ def _parse_codex_session_file(
         )
         if not text:
             continue
-        if is_resp_user and last_event_user_text == text:
-            last_event_user_text = None
+        if last_user_mirror is not None and last_user_mirror[0] != kind and last_user_mirror[1] == text:
+            last_user_mirror = None
             continue
-        last_event_user_text = text if is_event_user else None
+        last_user_mirror = (kind, text)
 
         if _is_machine_message(text):
             stats["filtered_machine_messages"] += 1
             pending_tag = None
             continue
-        seen_texts[text] += 1
         role = "unknown" if truncated else ("entry" if session_turn_idx == 0 else "followup")
         session_turn_idx += 1
         matched_scene = _match_pending_tag(text, pending_tag)
@@ -677,7 +683,7 @@ def _parse_codex_session_file(
             "text": text,
             "tag_provenance": matched_scene,
         })
-    return records, seen_texts, truncated
+    return records, truncated
 
 
 def _collect_cursor(
@@ -711,9 +717,8 @@ def _collect_cursor(
             role = line.get("role") or line.get("type")
             text = str(line.get("content") or line.get("text") or "").strip()
             if role in ("assistant", "MODEL", "PLANNER_RESPONSE"):
-                tag = _extract_autopilot_tag(text)
-                if tag is not None:
-                    pending_tag = tag
+                if text:
+                    pending_tag = _extract_autopilot_tag(text)
                 continue
             if role not in ("user", "USER_INPUT") or not text:
                 continue
@@ -750,12 +755,14 @@ def _reconcile_history_records(
     agent: str,
     session_id: str,
     history_entries: list[tuple[float, str]],
-    seen_file_texts: Counter[str],
+    session_records: list[dict[str, Any]],
     has_session_file: bool,
     cutoff_ts: float,
     stats: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    remaining_session_texts = Counter(seen_file_texts)
+    unmatched_session_turns: list[tuple[float, str]] = [
+        (float(item["timestamp"]), str(item["text"])) for item in session_records
+    ]
     extra_records: list[dict[str, Any]] = []
     for ts, text in history_entries:
         if _is_machine_message(text):
@@ -764,8 +771,17 @@ def _reconcile_history_records(
             continue
         if ts < cutoff_ts:
             continue
-        if remaining_session_texts.get(text, 0) > 0:
-            remaining_session_texts[text] -= 1
+        matched_idx = -1
+        best_delta: float | None = None
+        for idx, (file_ts, file_text) in enumerate(unmatched_session_turns):
+            if file_text != text:
+                continue
+            delta = abs(file_ts - ts)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                matched_idx = idx
+        if matched_idx >= 0:
+            unmatched_session_turns.pop(matched_idx)
             continue
         extra_records.append({
             "agent": agent,
@@ -897,7 +913,13 @@ def _extract_autopilot_tag(text: str) -> dict[str, Any] | None:
                     parsed = json.loads(payload)
                 except ValueError:
                     return None
-                return parsed if isinstance(parsed, dict) else None
+                if not isinstance(parsed, dict):
+                    return None
+                scene = str(parsed.get("scene") or "").strip()
+                if not scene or scene == "NONE":
+                    return None
+                return parsed
+            return None
         search_end = open_idx
     return None
 
@@ -953,35 +975,70 @@ def _load_installed_shortcuts(gemini_dir: Path) -> tuple[dict[str, Any], list[di
 
     shortcuts: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for section, label_prefix in (
-        ("entry_shortcuts", "entry:"),
-        ("comma_commands", "comma:,"),
+    for section, label_prefix, is_entry in (
+        ("entry_shortcuts", "entry:", True),
+        ("comma_commands", "comma:,", False),
     ):
+        if section not in config:
+            continue
         section_obj = config.get(section)
         if not isinstance(section_obj, dict):
-            continue
+            return {
+                "status": "error",
+                "path": str(config_path),
+                "error": f"config.json {section} must be a JSON object",
+            }, []
         for key, spec in section_obj.items():
-            if not isinstance(spec, dict):
-                continue
-            canonical = str(spec.get("canonical_key") or key).strip()
-            command_id = str(spec.get("command_id") or canonical).strip()
+            if not isinstance(key, str) or not key.strip() or not isinstance(spec, dict):
+                return {
+                    "status": "error",
+                    "path": str(config_path),
+                    "error": f"config.json {section}[{key!r}] must be a JSON object",
+                }, []
+            raw_canonical = spec.get("canonical_key", key)
+            raw_command_id = spec.get("command_id", raw_canonical)
+            raw_tmpl = spec.get("template", "")
+            raw_requires_arg = spec.get("requires_arg", False)
+            raw_aliases = spec.get("aliases", [])
+            if (
+                not isinstance(raw_canonical, str)
+                or not raw_canonical.strip()
+                or not isinstance(raw_command_id, str)
+                or not raw_command_id.strip()
+                or not isinstance(raw_tmpl, str)
+                or not isinstance(raw_requires_arg, bool)
+                or not isinstance(raw_aliases, list)
+                or any(not isinstance(a, str) or not a.strip() for a in raw_aliases)
+            ):
+                return {
+                    "status": "error",
+                    "path": str(config_path),
+                    "error": f"config.json {section}[{key!r}] has malformed fields",
+                }, []
+            canonical = raw_canonical.strip()
+            command_id = raw_command_id.strip()
             if command_id in seen_ids:
                 continue
             seen_ids.add(command_id)
-            tmpl = str(spec.get("template") or "").strip()
-            aliases = [str(a).strip().lower() for a in (spec.get("aliases") or []) if str(a).strip()]
-            if canonical:
+            tmpl = raw_tmpl.strip()
+            aliases = [a.strip().lower() for a in raw_aliases]
+            if is_entry:
                 aliases.append(canonical.lower())
                 aliases.append(f",{canonical.lower()}")
             shortcuts.append({
                 "label": f"{label_prefix}{canonical}",
+                "canonical_key": canonical.lower(),
+                "is_entry": is_entry,
+                "requires_arg": raw_requires_arg,
                 "aliases": sorted(set(aliases)),
                 "template": tmpl,
             })
     return {"status": "ok", "path": str(config_path), "shortcuts_loaded": len(shortcuts)}, shortcuts
 
 
-def _match_installed_autopilot(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
+def _match_installed_autopilot(
+    text: str, shortcuts: list[dict[str, Any]], turn_role: str
+) -> str | None:
     stripped = text.strip()
     lower = stripped.lower()
     if lower in (",1", ",2", ",3") or lower.startswith((",1 ", ",2 ", ",3 ")):
@@ -992,27 +1049,49 @@ def _match_installed_autopilot(text: str, shortcuts: list[dict[str, Any]]) -> st
         return "command:,worker"
     if lower.startswith(",autopilot"):
         return "command:,autopilot"
-    first_token = lower.split()[0] if lower.split() else ""
+    tokens = lower.split(maxsplit=1)
+    if not tokens:
+        return None
+    first_token = tokens[0]
+    has_arg = len(tokens) > 1 and bool(tokens[1].strip())
     for item in shortcuts:
-        if lower in item["aliases"] or (first_token in item["aliases"] and first_token.startswith(",")):
+        if first_token.startswith(",") and first_token in item["aliases"]:
+            if item["requires_arg"] and not has_arg:
+                continue
             return item["label"]
-        if item["template"] and _matches_template(stripped, item["template"]):
+        if item["is_entry"] and turn_role == "entry" and first_token == item["canonical_key"]:
+            if item["requires_arg"] and not has_arg:
+                continue
+            return item["label"]
+    return None
+
+
+def _match_template_similarity(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
+    stripped = text.strip()
+    for item in shortcuts:
+        tmpl = item["template"]
+        if tmpl and _matches_template(stripped, tmpl):
             return item["label"]
     return None
 
 
 def _matches_template(text: str, template: str) -> bool:
     if "{arg}" not in template:
-        return text == template or text.startswith(template + "\n") or text.startswith(template + " ")
-    parts = [part.strip() for part in template.split("{arg}") if part.strip()]
+        return text == template
+    raw_parts = template.split("{arg}")
+    parts = [part.strip() for part in raw_parts if part.strip()]
     if not parts:
         return False
+    must_anchor_start = not template.lstrip().startswith("{arg}")
+    must_anchor_end = not template.rstrip().endswith("{arg}")
+    if must_anchor_start and not text.startswith(parts[0]):
+        return False
+    if must_anchor_end and not text.endswith(parts[-1]):
+        return False
     pos = 0
-    for idx, part in enumerate(parts):
+    for part in parts:
         found = text.find(part, pos)
         if found < 0:
-            return False
-        if idx == 0 and template.lstrip().startswith(part) and found != 0:
             return False
         pos = found + len(part)
     return True
