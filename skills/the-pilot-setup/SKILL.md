@@ -6,7 +6,12 @@ description: Install, customize, upgrade, inspect or remove The Pilot through in
 # Set up The Pilot
 
 Read [customization and operations](references/customization-guide.md).
-Use `pilot` from PATH, or `<the-pilot-checkout>/bin/pilot`. Python 3.11+ is required.
+Check Python >= 3.11 and `pilot --help`. If the CLI is not installed, install it from GitHub
+(`uv tool install git+https://github.com/sensebeing/the-pilot` or
+`python3 -m pip install git+https://github.com/sensebeing/the-pilot`), from a local checkout
+(`python3 -m pip install /path/to/the-pilot`), or run `<the-pilot-checkout>/bin/pilot`.
+To register the skills globally across coding agents, run
+`npx skills add sensebeing/the-pilot --global --agent '*'` or symlink `skills/the-pilot*`.
 
 1. Run `pilot probe --json` (add `--project <repo>` for a project overlay).
    Inspect installed preferences and available CLIs without writing files.

@@ -1,0 +1,23 @@
+{
+  "name": "the-pilot",
+  "description": "Scene-based Turn Autopilot and Orca Coordinator/Worker governance for AI coding sessions.",
+  "version": "0.1.0",
+  "author": {
+    "name": "SenseBeing",
+    "url": "https://github.com/sensebeing"
+  },
+  "homepage": "https://github.com/sensebeing/the-pilot",
+  "repository": "https://github.com/sensebeing/the-pilot",
+  "license": "MIT",
+  "keywords": [
+    "ai-coding",
+    "coding-agents",
+    "orca",
+    "turn-autopilot",
+    "workflow-automation"
+  ],
+  "skills": [
+    "./skills/the-pilot",
+    "./skills/the-pilot-setup"
+  ]
+}

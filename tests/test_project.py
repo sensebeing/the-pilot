@@ -13,9 +13,11 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
+from the_pilot import __version__
 from the_pilot.compiler import compile_bundle, merge_hooks_json
 from the_pilot.profile import resolve_profile
 from the_pilot.project import ProfileError, normalize_project
@@ -137,3 +139,27 @@ class ProjectTest(unittest.TestCase):
         self.cli("apply", "--project", str(path), ok=False)
         self.assertFalse((self.gemini / "config/autopilot/profile.json").exists())
         self.cli("probe", "--project", str(self.root / "absent"), ok=False)
+
+    def test_plugin_and_agent_manifests_match_package_metadata(self):
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(pyproject["project"]["name"], "the-pilot")
+        self.assertEqual(pyproject["project"]["version"], __version__)
+        claude_plugin = json.loads((ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+        marketplace = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+        cursor_plugin = json.loads((ROOT / ".cursor-plugin/plugin.json").read_text(encoding="utf-8"))
+        expected_skills = ["./skills/the-pilot", "./skills/the-pilot-setup"]
+        for manifest in (claude_plugin, cursor_plugin, marketplace["plugins"][0]):
+            self.assertEqual(manifest["name"], "the-pilot")
+            self.assertEqual(manifest["version"], __version__)
+            self.assertEqual(manifest["license"], pyproject["project"]["license"])
+            self.assertEqual(manifest["keywords"], pyproject["project"]["keywords"])
+        self.assertEqual(claude_plugin["skills"], expected_skills)
+        self.assertEqual(cursor_plugin["skills"], expected_skills)
+        for rel_skill in ("skills/the-pilot", "skills/the-pilot-setup"):
+            skill_dir = ROOT / rel_skill
+            self.assertTrue((skill_dir / "SKILL.md").is_file())
+            openai_yaml = (skill_dir / "agents/openai.yaml").read_text(encoding="utf-8")
+            self.assertIn("display_name:", openai_yaml)
+            self.assertIn("short_description:", openai_yaml)
+            self.assertIn("default_prompt:", openai_yaml)
+

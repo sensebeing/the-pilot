@@ -3,6 +3,8 @@
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![Zero runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](pyproject.toml)
+[![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--pilot-black)](https://skills.sh/sensebeing/the-pilot)
+[![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-pilot?style=social)](https://github.com/sensebeing/the-pilot/stargazers)
 
 **Keep your AI coding sessions moving safely from design to delivery.**
 
@@ -12,17 +14,21 @@ Multi-step engineering tasks rarely finish in one prompt. A feature or root-caus
 
 `the-pilot` turns each completed agent turn into a deterministic next step. The Coordinator session owns architecture and review, Orca workers implement changes on isolated branches, and the runtime reads a single trailing JSON tag (`json.loads`, zero regex) to prefill or submit the next prompt once questions are settled and the terminal is idle.
 
+| Without `the-pilot` | With `the-pilot` |
+| --- | --- |
+| A multi-step task pauses after every turn waiting for someone to type *"review the branch"*, *"merge and verify"*, or *"clean up the worktree"*, while naive auto-continue scripts press Enter over open clarifying questions or break when Markdown prose contains backticks. | Coordinator sessions design and review while Orca child workers implement changes on isolated branches. At the end of each turn, the runtime reads a single trailing JSON tag (`json.loads`, zero regex) to auto-advance routine stages in `gate` mode, prefill design decisions (`gate=pause`), and stop whenever an `ask_question` tool call is open. |
+
 [中文文档](README.zh-CN.md) · [Quick start](#quick-start) · [Presets & 4 dimensions](#presets-and-four-dimension-customization) · [Four-scene state machine](#four-scene-state-machine) · [Workflow](#workflow) · [Project overlay](#project-extension-tier-pilotprojectjson) · [Setup skill](skills/the-pilot-setup/SKILL.md) · [Daily skill](skills/the-pilot/SKILL.md)
 
 ## Get started in 30 seconds: paste to your agent
 
-Paste this into Antigravity, Claude Code, Codex, or Orca:
+Paste this into Antigravity, Claude Code, Codex, Cursor, or Orca:
 
 ```text
 Install and set up https://github.com/sensebeing/the-pilot for my environment.
-Clone or update ~/the-pilot, register skills/the-pilot and skills/the-pilot-setup,
-then follow skills/the-pilot-setup/SKILL.md to help me configure the 4 dimensions
-(with --project <repo> if .pilot/project.json exists) and verify pilot status.
+Install the CLI (`uv tool install git+https://github.com/sensebeing/the-pilot` or `python3 -m pip install git+https://github.com/sensebeing/the-pilot`),
+install the skills (`npx skills add sensebeing/the-pilot --global --agent '*'` or symlink from a checkout),
+then follow skills/the-pilot-setup/SKILL.md to help me configure the 4 dimensions (with --project <repo> if .pilot/project.json exists) and verify pilot status.
 ```
 
 ## Why we built it
@@ -37,13 +43,28 @@ Humans read the visible `,1` and `,2` Markdown lines (which can contain inline b
 
 ### 1. Install
 
-With Python 3.11+ on macOS or Linux (`fcntl` file locking):
+Install the `pilot` CLI with Python 3.11+ on macOS or Linux (`fcntl` file locking):
 
 ```sh
-python3 -m pip install /path/to/the-pilot
+uv tool install git+https://github.com/sensebeing/the-pilot
+# or with pip:
+python3 -m pip install git+https://github.com/sensebeing/the-pilot
 ```
 
-You can also run `/path/to/the-pilot/bin/pilot` directly from a checkout. The CLI has no external runtime dependencies. Terminal prefill and auto-submission use Orca and an Antigravity-compatible lifecycle Hook host (`PreInvocation` and `Stop`).
+Install the agent skills (`$the-pilot` and `$the-pilot-setup`) for Antigravity, Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, or Windsurf:
+
+```sh
+npx skills add sensebeing/the-pilot --global --agent '*'
+```
+
+In Claude Code, you can also install via the plugin marketplace:
+
+```text
+/plugin marketplace add sensebeing/the-pilot
+/plugin install the-pilot@the-pilot
+```
+
+The CLI has no external runtime dependencies. Terminal prefill and auto-submission use Orca and an Antigravity-compatible lifecycle Hook host (`PreInvocation` and `Stop`).
 
 ### 2. Initialize
 
@@ -89,9 +110,9 @@ Inside an active chat session or from the terminal:
 
 | Dimension | Profile keys | Supported values and defaults | What it governs |
 | --- | --- | --- | --- |
-| 1. Orchestration | `worker_priority`<br>`review_priority` | Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Coordinator and Dispatched Worker separation, child-worktree isolation, branch-first review loop, and hot-reloadable executor priority. |
-| 2. Autopilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..20` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
-| 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`custom_guardrails` | Strategies: `merge_dev_only` \| `merge_dev_e2e` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
+| 1. Orchestration | `worker_agents`<br>`review_agents` | Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Coordinator and Dispatched Worker separation, child-worktree isolation, branch-first review loop, and hot-reloadable executor priority. |
+| 2. Autopilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..50` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
+| 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | Strategies: `merge_dev_only` \| `merge_dev_e2e` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
 | 4. Shortcuts | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | Universal entries: `r`, `rt`, `d`, `pull`<br>Plus project entries and custom aliases | Short prompt templates expanded deterministically on `PreInvocation` (for example, `r auth` expands into a full architectural review prompt). |
 
 ## Four-scene state machine
@@ -134,7 +155,7 @@ flowchart TD
 | --- | --- | --- |
 | Orca (`orca` CLI) | Worktrees, terminal multiplexing, and supervised Coordinator/Worker runs. | Dispatches workers, verifies terminal idle state, and delivers prefill or auto-submit keystrokes to the bound session terminal. |
 | [the-guard](https://github.com/sensebeing/the-guard) | Repository architecture policies, static topology ratchets, and independent pre-merge review. | Drives the `architecture-re-review` loop so Coordinator sessions audit whole-task changes before advancing to delivery. |
-| The Dealer (`dealer` CLI) | Same-machine and cross-team encrypted P2P task dispatch. | Project overlays can register Dealer wave shortcuts (`dl`, `dls`, `dla`) while keeping network transport out of `the-pilot`. |
+| [the-dealer](https://github.com/sensebeing/the-dealer) | Same-machine and cross-team encrypted P2P task dispatch. | Project overlays can register Dealer wave shortcuts (`dl`, `dls`, `dla`) while keeping network transport out of `the-pilot`. |
 
 ## Project extension tier (`.pilot/project.json`)
 
@@ -190,6 +211,17 @@ guard review --repo-root .
 ```
 
 See [src/the_pilot/README.md](src/the_pilot/README.md) for package structure and module boundaries, [Contributing](CONTRIBUTING.md) for setup and review requirements, [Security](SECURITY.md) for vulnerability reporting, and [Changelog](CHANGELOG.md) for release history.
+
+## Related projects
+
+`the-pilot` is part of the SenseBeing open-source toolkit for AI-native engineering teams:
+
+| Project | What it does |
+| --- | --- |
+| [the-guard](https://github.com/sensebeing/the-guard) | Architecture guardrails, deterministic topology ratchets, and independent pre-merge agent review. |
+| [the-dealer](https://github.com/sensebeing/the-dealer) | Same-machine multi-agent dispatch and encrypted P2P task collaboration across machines and teams. |
+
+If `the-pilot` helps your team build with AI, a star on GitHub helps other teams find it.
 
 ## License
 

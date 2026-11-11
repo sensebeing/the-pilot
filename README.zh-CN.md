@@ -3,6 +3,8 @@
 [![MIT 许可证](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![零运行时依赖](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](pyproject.toml)
+[![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--pilot-black)](https://skills.sh/sensebeing/the-pilot)
+[![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-pilot?style=social)](https://github.com/sensebeing/the-pilot/stargazers)
 
 **让你的 AI 编程会话从方案设计一路推进到合入交付。**
 
@@ -12,16 +14,21 @@
 
 `the-pilot` 把每次 Agent 回合结束转化为确定性的下一步：主会话负责架构设计与复审，Orca 子会话在独立分支内编码；运行时只通过 `json.loads` 读取回复末尾的结构化 JSON 标签（零正则），在提问已结算、轮数未超限且终端空闲时完成预填或自动提交。
 
+| 没有 `the-pilot` | 接入 `the-pilot` |
+| --- | --- |
+| 多步骤任务每跑完一轮就停下等人输入“继续 review”、“合入 main”或“清理工作区”；简单的自动回车脚本又会在 Agent 还在提问等待确认时盲目回车，或者用正则抓 Markdown 正文时被反引号截断。 | 主会话负责架构设计与复审，Orca 子工作区在独立分支编码；每轮结束时运行时只通过 `json.loads` 读取末尾 JSON 标签（零正则），在 `gate` 模式下自动推进常规研发阶段，遇到方案取舍时仅预填输入框（`gate=pause`），遇到未回答的 `ask_question` 时自动停下。 |
+
 [English](README.md) · [快速开始](#快速开始) · [预设与四维定制](#三档预设与四维定制矩阵) · [四场景状态机](#四场景状态机) · [工作流](#工作流) · [项目扩展层](#项目扩展层-pilotprojectjson) · [安装技能](skills/the-pilot-setup/SKILL.md) · [日常技能](skills/the-pilot/SKILL.md)
 
 ## 30 秒上手：复制给你的 Agent
 
-把下面这段话发给 Antigravity、Claude Code、Codex 或 Orca：
+把下面这段话发给 Antigravity、Claude Code、Codex、Cursor 或 Orca：
 
 ```text
 请为我的开发环境安装并配置 https://github.com/sensebeing/the-pilot。
-将仓库克隆或更新至 ~/the-pilot，注册 skills/the-pilot 与 skills/the-pilot-setup 技能，
-按 skills/the-pilot-setup/SKILL.md 引导我确认四维偏好（若当前仓库含 .pilot/project.json 则带上 --project）并完成 pilot status 验证。
+安装 CLI（`uv tool install git+https://github.com/sensebeing/the-pilot` 或 `python3 -m pip install git+https://github.com/sensebeing/the-pilot`），
+安装技能（`npx skills add sensebeing/the-pilot --global --agent '*'` 或从本地检出目录创建软链），
+然后按 skills/the-pilot-setup/SKILL.md 引导我确认四维偏好（若当前仓库含 .pilot/project.json 则带上 --project）并完成 pilot status 验证。
 ```
 
 ## 为什么做这个工具
@@ -36,13 +43,28 @@
 
 ### 1. 安装
 
-需 Python 3.11+，支持 macOS 与 Linux（使用 `fcntl` 文件锁）：
+需 Python 3.11+，支持 macOS 与 Linux（使用 `fcntl` 文件锁），可直接从 GitHub 安装 `pilot` CLI：
 
 ```sh
-python3 -m pip install /path/to/the-pilot
+uv tool install git+https://github.com/sensebeing/the-pilot
+# 或使用 pip：
+python3 -m pip install git+https://github.com/sensebeing/the-pilot
 ```
 
-也可以直接运行检出目录下的 `/path/to/the-pilot/bin/pilot`。CLI 无外部运行时依赖；终端预填与自动回车依赖 Orca 以及兼容 Antigravity 生命周期 Hook（`PreInvocation` 与 `Stop`）的宿主。
+为 Antigravity、Claude Code、Codex、Cursor、Gemini CLI、GitHub Copilot 或 Windsurf 安装技能（`$the-pilot` 与 `$the-pilot-setup`）：
+
+```sh
+npx skills add sensebeing/the-pilot --global --agent '*'
+```
+
+在 Claude Code 中也可以通过插件市场安装：
+
+```text
+/plugin marketplace add sensebeing/the-pilot
+/plugin install the-pilot@the-pilot
+```
+
+CLI 无外部运行时依赖；终端预填与自动回车依赖 Orca 以及兼容 Antigravity 生命周期 Hook（`PreInvocation` 与 `Stop`）的宿主。
 
 ### 2. 初始化
 
@@ -88,9 +110,9 @@ pilot apply --project /path/to/repo --preset recommended --json
 
 | 定制维度 | Profile 配置键 | 可选值与默认值 | 控制内容 |
 | --- | --- | --- | --- |
-| 1. 主从编排（Orchestration） | `worker_priority`<br>`review_priority` | 子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | 主会话（设计/Review）与子会话（分支编码）职责分离、父子工作区层级、执行器优先级持久化与下一轮热加载。 |
-| 2. 自动推进（Autopilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..20`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
-| 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`custom_guardrails` | 交付策略：`merge_dev_only` \| `merge_dev_e2e` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线要求。 |
+| 1. 主从编排（Orchestration） | `worker_agents`<br>`review_agents` | 子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | 主会话（设计/Review）与子会话（分支编码）职责分离、父子工作区层级、执行器优先级持久化与下一轮热加载。 |
+| 2. 自动推进（Autopilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..50`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
+| 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | 交付策略：`merge_dev_only` \| `merge_dev_e2e` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线要求。 |
 | 4. 快捷口令（Shortcuts） | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | 通用口令：`r`、`rt`、`d`、`pull`<br>外加项目扩展口令与自定义 `,` 别名 | 在 `PreInvocation` 阶段将简短口令（例如 `r auth`）展开为完整的架构审查或编排提示词。 |
 
 ## 四场景状态机
@@ -133,7 +155,7 @@ flowchart TD
 | --- | --- | --- |
 | Orca (`orca` CLI) | 工作区生命周期、终端复用与主从受控编排（Coordinator / Worker）。 | 规范主从工作区创建与释放纪律，校验终端空闲证据，并将预填和自动回车投递到当前会话终端。 |
 | [the-guard](https://github.com/sensebeing/the-guard) | 仓库级工程质量规范、静态拓扑棘轮与独立 Agent 合入前架构审查。 | 驱动 `architecture-re-review` 场景循环，在每次代码改动后先完成全局最简架构复审再进入交付。 |
-| The Dealer (`dealer` CLI) | 同机多 Agent 与跨机、跨团队加密 P2P 协作派发。 | 支持通过项目 `.pilot/project.json` 挂载团队协作波次口令（如 `dl`、`dls`、`dla`），保持传输层职责独立。 |
+| [the-dealer](https://github.com/sensebeing/the-dealer) | 同机多 Agent 与跨机、跨团队加密 P2P 协作派发。 | 支持通过项目 `.pilot/project.json` 挂载团队协作波次口令（如 `dl`、`dls`、`dla`），保持传输层职责独立。 |
 
 ## 项目扩展层（`.pilot/project.json`）
 
@@ -189,6 +211,17 @@ guard review --repo-root .
 ```
 
 内部包结构与模块职责边界见 [src/the_pilot/README.md](src/the_pilot/README.md)，环境搭建与审查要求见[贡献指南](CONTRIBUTING.md)，私密漏洞报告见[安全政策](SECURITY.md)，版本历史见[变更日志](CHANGELOG.md)。
+
+## 相关开源项目
+
+`the-pilot` 是 SenseBeing 面向 AI 原生研发团队开源工具集的组成部分：
+
+| 项目 | 作用 |
+| --- | --- |
+| [the-guard](https://github.com/sensebeing/the-guard) | 仓库级工程质量护栏、确定性拓扑棘轮与独立 Agent 合入前架构审查。 |
+| [the-dealer](https://github.com/sensebeing/the-dealer) | 同机多 Agent 派发与跨机、跨团队加密 P2P 任务协同节点。 |
+
+如果 `the-pilot` 对你们团队用 AI 写代码有帮助，欢迎在 GitHub 点一颗 Star，让更多团队看到它。
 
 ## 许可证
 

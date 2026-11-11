@@ -16,7 +16,7 @@ apply deletes a previous link. Probe and status never write the link.
 ## Profile dimensions
 
 - `orchestration`: ordered `worker_agents` and `review_agents`.
-- `autopilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (1–50).
+- `autopilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (`1..50`).
 - `scenes`: enabled scenes, delivery strategy, feedback notification preference,
   and additional guardrails. An overlay defines what the notification preference
   means; it never grants external-send permission by itself.

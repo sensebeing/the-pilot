@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "the-pilot",
+  "owner": {
+    "name": "SenseBeing",
+    "url": "https://github.com/sensebeing"
+  },
+  "description": "Install the-pilot skills as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "the-pilot",
+      "source": "./",
+      "description": "Scene-based Turn Autopilot and Orca Coordinator/Worker governance for AI coding sessions.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "keywords": [
+        "ai-coding",
+        "coding-agents",
+        "orca",
+        "turn-autopilot",
+        "workflow-automation"
+      ]
+    }
+  ]
+}
