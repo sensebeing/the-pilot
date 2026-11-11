@@ -105,9 +105,9 @@ Inside an active chat session or from the terminal:
 
 | Preset | Autopilot mode | Max auto turns | Enabled scenes | Delivery strategy | Default shortcuts | Best fit |
 | --- | --- | --- | --- | --- | --- | --- |
-| `recommended` | `gate` | `8` | All 4 scenes | `merge_dev_only` | `r`, `rt`, `d`, `pull` (+ project overlay) | Recommended default: advances automatically across routine engineering stages and pauses on design decisions or prod gates. |
-| `conservative` | `confirm` | `4` | All 4 scenes | `merge_dev_only` | `r`, `rt`, `d`, `pull` (+ project overlay) | Human-in-the-loop: prefills the next prompt at the end of each turn and waits for you to press Enter. |
-| `orchestration-only` | `off` | `4` | None (`[]`) | `merge_dev_only` | None (`[]`) | Coordinator/Worker rules only: installs Orca orchestration governance without end-of-turn prefill. |
+| `recommended` | `gate` | `8` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` (+ project overlay) | Recommended default: advances automatically across routine engineering stages and pauses on design decisions or prod gates. |
+| `conservative` | `confirm` | `4` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` (+ project overlay) | Human-in-the-loop: prefills the next prompt at the end of each turn and waits for you to press Enter. |
+| `orchestration-only` | `off` | `4` | None (`[]`) | `merge_dev_e2e` | None (`[]`) | Coordinator/Worker rules only: installs Orca orchestration governance without end-of-turn prefill. |
 
 ### Four customization dimensions (`orca-autopilot-profile/v1`)
 
@@ -230,3 +230,5 @@ If `the-pilot` helps your team build with AI, a star on GitHub helps other teams
 ## License
 
 [MIT](LICENSE)
+
+The default `merge_dev_e2e` strategy runs targeted dev E2E after deployment. If unnecessary or prerequisites are unavailable, report the concrete reason and remaining risk, then close out. Prod and full/batch suites still require explicit current-turn authorization. Select `merge_dev_only` explicitly for deployment verification only.

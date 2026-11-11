@@ -105,9 +105,9 @@ pilot apply --project /path/to/repo --preset recommended --json
 
 | 预设档位 | Autopilot 模式 | 连续自动轮数上限 | 启用场景 | 默认交付策略 | 默认口令 | 适用场景 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `recommended` | `gate` | `8` | 全部 4 个场景 | `merge_dev_only` | `r`、`rt`、`d`、`pull`（含项目扩展） | 推荐默认：确定性研发阶段自动衔接推进，遇到方案裁决或生产发布暂停确认。 |
-| `conservative` | `confirm` | `4` | 全部 4 个场景 | `merge_dev_only` | `r`、`rt`、`d`、`pull`（含项目扩展） | 人工确认模式：每轮结束把建议预填到输入框，等待按 Enter 发送。 |
-| `orchestration-only` | `off` | `4` | 无（`[]`） | `merge_dev_only` | 无（`[]`） | 仅主从编排规范：注入 Orca 主从职责与分支隔离规范，关闭回合末自动预填。 |
+| `recommended` | `gate` | `8` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull`（含项目扩展） | 推荐默认：确定性研发阶段自动衔接推进，遇到方案裁决或生产发布暂停确认。 |
+| `conservative` | `confirm` | `4` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull`（含项目扩展） | 人工确认模式：每轮结束把建议预填到输入框，等待按 Enter 发送。 |
+| `orchestration-only` | `off` | `4` | 无（`[]`） | `merge_dev_e2e` | 无（`[]`） | 仅主从编排规范：注入 Orca 主从职责与分支隔离规范，关闭回合末自动预填。 |
 
 ### 四维定制能力矩阵（`orca-autopilot-profile/v1`）
 
@@ -230,3 +230,5 @@ guard review --repo-root .
 ## 许可证
 
 [MIT](LICENSE)
+
+默认交付策略为 `merge_dev_e2e`：部署后执行受影响链路的定向 dev E2E；无需验证或缺少执行条件时说明具体原因与剩余风险后收尾。prod 与全量/批量套件仍需当轮明确授权。`merge_dev_only` 可显式选择仅部署核验。

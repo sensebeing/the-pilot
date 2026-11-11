@@ -278,6 +278,13 @@ class CompilerTest(unittest.TestCase):
             self.assertIn(clause, feedback)
 
         conservative = resolve_profile(self.base, preset="conservative")
+        # resident-fact: admission: default delivery runs targeted dev E2E, retaining prod/suite gates.
+        for preset in ("recommended", "conservative", "orchestration-only"):
+            self.assertEqual(resolve_profile(self.base, preset=preset)["scenes"]["deliver_strategy"], "merge_dev_e2e")
+        scene = compile_bundle(resolve_profile(self.base)).scenes["03-deliver-and-verify.md"]
+        self.assertIn("部署后默认执行受影响链路的定向 dev E2E", scene)
+        self.assertIn("当前环境不具备执行条件", scene)
+        self.assertIn("全量/批量套件", scene)
         self.assertEqual(conservative["autopilot"]["mode"], "confirm")
         self.assertEqual(conservative["autopilot"]["max_consecutive_auto_turns"], 4)
         self.assertEqual(conservative["shortcuts"]["enabled_entry"], ["r", "rt", "d", "pull"])

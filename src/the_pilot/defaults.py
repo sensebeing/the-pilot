@@ -79,7 +79,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                            'architecture-re-review',
                                                            'deliver-and-verify',
                                                            'closeout-and-sync'],
-                                        'deliver_strategy': 'merge_dev_only',
+                                        'deliver_strategy': 'merge_dev_e2e',
                                         'enable_feedback_email': False},
                              'shortcuts': {'enabled_entry': ['r', 'rt', 'd', 'pull']}},
              'conservative': {'autopilot': {'mode': 'confirm', 'max_consecutive_auto_turns': 4},
@@ -87,12 +87,12 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                             'architecture-re-review',
                                                             'deliver-and-verify',
                                                             'closeout-and-sync'],
-                                         'deliver_strategy': 'merge_dev_only',
+                                         'deliver_strategy': 'merge_dev_e2e',
                                          'enable_feedback_email': False},
                               'shortcuts': {'enabled_entry': ['r', 'rt', 'd', 'pull']}},
              'orchestration-only': {'autopilot': {'mode': 'off', 'max_consecutive_auto_turns': 4},
                                     'scenes': {'enabled_scenes': [],
-                                               'deliver_strategy': 'merge_dev_only',
+                                               'deliver_strategy': 'merge_dev_e2e',
                                                'enable_feedback_email': False},
                                     'shortcuts': {'enabled_entry': [],
                                                   'custom_entry': {},
@@ -178,7 +178,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                 '`scenes.deliver_strategy`，已注入本场景）**：\n'
                                                 '{{DELIVER_STRATEGY_BINDING}}\n'
                                                 '进入 `/ship` 发布 prod 前必须 '
-                                                '`gate=pause`，人工确认一次；未获当轮明确要求的真实 E2E 不自动执行。\n'
+                                                '`gate=pause`，人工确认一次；`prod` 真实 E2E 与全量/批量套件 E2E 须获当轮明确要求。\n'
                                                 '2. **主推建议（动态核对实际交付进度，绝不重复已完成动作）**：\n'
                                                 '{{DELIVER_GUIDANCE}}\n'
                                                 '3. **备选 `,2` 构造方向（分步交付或跳过未授权动作）**：\n'
@@ -213,30 +213,25 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                '{{FEEDBACK_REPLY_EXAMPLES}}\n'
                                                '\n'
                                                '{{CUSTOM_GUARDRAILS}}'}},
- 'deliver_content': {'merge_dev_e2e': {'binding': '   - **`merge_dev_e2e`**：主推按「合入 main → 发 dev → '
-                                                  'E2E」推进；已完成步骤直接跳过，**绝不重复**。E2E 只在用户本轮明确要求时执行。',
-                                       'guidance': '   - 未合入 `main`：主推「合入 main 并发 dev，然后执行相关链路的 '
-                                                   'E2E 测试」；已合入未发 dev：「发 dev 并执行本次改动链路的 E2E 测试」；已发 '
-                                                   'dev：「直接执行本次修复链路的 E2E 测试」。\n'
-                                                   '   - **E2E '
-                                                   '只在用户本轮明确要求时进入主推**，不得用历史偏好代替本轮授权；只保留未完成的步骤。\n'
-                                                   '   - 句末带上「过程中若发现问题遵循最简架构设计修复，最后给我整体报告」。',
-                                       'alternatives': '   - 主推包含 E2E 时，备选 `,2` 给「先完成合入 / 发 dev '
-                                                       '的部署核验，暂不执行 E2E 测试」。\n'
-                                                       '   - 主推已是 E2E 最后一步时，备选 `,2` 给「跳过 '
-                                                       'E2E，再整体核查本会话整个任务涉及的相关文档」。',
-                                       'examples': '- **,1（主推）**：`合入 main 并发 dev，然后执行相关链路的 E2E '
-                                                   '测试；过程中若发现问题按最简架构修复，最后给我整体报告`\n'
-                                                   '- **,2（备选）**：`先合入 main 并发 dev 完成部署核验，暂不执行 E2E`',
-                                       'fallback': '合入 main 并发 dev，然后执行相关链路的 E2E '
-                                                   '测试；过程中若发现问题遵循最简架构设计进行修复，最后给我整体报告',
-                                       'completion': '已经完成 main 合入、dev 发布及用户明确要求的 E2E 验证',
-                                       're_review_alt': '合入 main 并发 dev，然后执行相关链路的 E2E '
-                                                        '测试；过程中若发现问题遵循最简架构设计进行修复，最后给我整体报告',
-                                       're_review_progress': '按当前交付状态（未合入 `main` 从「合入 main 并发 '
-                                                             'dev」开始；已合入从「发 dev」开始）给出推进交付与 E2E '
-                                                             '验证的指令；E2E 只在用户本轮明确要求时进入主推，方便一键 `,2` '
-                                                             '进入交付。'},
+ 'deliver_content': {'merge_dev_e2e': {'binding': '   - **`merge_dev_e2e`**：主推按「合入 main → 发 dev → 相关链路定向 '
+                                                 'E2E」推进；已完成步骤直接跳过，**绝不重复**。部署后默认执行受影响链路的定向 dev E2E，除非 Agent 判断本次改动无需 '
+                                                 'E2E（如纯文档、脚本或离线契约已完整覆盖）或当前环境不具备执行条件（如实说明原因与剩余风险后直接进入收尾）。',
+                                      'guidance': '   - 未合入 `main`：主推「合入 main 并发 dev，然后执行相关链路的定向 E2E 测试（若判断无需做或无条件做则说明原因跳过）」；已合入未发 '
+                                                  'dev：「发 dev 并执行本次改动链路的定向 E2E 测试」；已发 dev（或纯客户端改动无需发后端 dev）：「执行本次改动链路的定向 dev E2E 测试」。\n'
+                                                  '   - 若已核实本次改动无需 E2E 或当前环境无条件执行，说明具体原因与剩余风险后直接转入 `closeout-and-sync`，不生成空转 E2E '
+                                                  '指令；全量/批量套件与 `prod` E2E 仍须当轮明确要求。\n'
+                                                  '   - 句末带上「过程中若发现问题遵循最简架构设计修复，最后给我整体报告」。',
+                                      'alternatives': '   - 主推包含 E2E 时，备选 `,2` 给「先完成合入 / 发 dev 的部署核验，暂不执行 E2E 测试」。\n'
+                                                      '   - 主推已是 E2E 最后一步时，备选 `,2` 给「跳过 E2E，再整体核查本会话整个任务涉及的相关文档」。',
+                                      'examples': '- **,1（主推）**：`合入 main 并发 dev，然后执行相关链路的定向 E2E '
+                                                  '测试（若判断无需做或无条件做则说明原因跳过）；过程中若发现问题按最简架构修复，最后给我整体报告`\n'
+                                                  '- **,2（备选）**：`先合入 main 并发 dev 完成部署核验，暂不执行 E2E`',
+                                      'fallback': '合入 main 并发 dev，然后执行相关链路的定向 E2E 测试（若判断无需做或无条件做则说明原因跳过）；过程中若发现问题遵循最简架构设计进行修复，最后给我整体报告',
+                                      'completion': '已经完成 main 合入、dev 发布及定向 E2E 验证（或已核实无需/无条件执行 E2E 并说明原因）',
+                                      're_review_alt': '合入 main 并发 dev，然后执行相关链路的定向 E2E '
+                                                       '测试（若判断无需做或无条件做则说明原因跳过）；过程中若发现问题遵循最简架构设计进行修复，最后给我整体报告',
+                                      're_review_progress': '按当前交付状态（未合入 `main` 从「合入 main 并发 dev」开始；已合入从「发 dev」开始）给出推进交付与相关链路定向 E2E '
+                                                            '验证的指令（若判断无需做或无条件做则说明原因跳过），方便一键 `,2` 进入交付。'},
                      'merge_dev_only': {'binding': '   - **`merge_dev_only`**：主推按「合入 main → 发 dev '
                                                    '完成部署核验」推进；**不生成 E2E 主推**，`dev` '
                                                    '完成即交付闭环，已完成步骤直接跳过。',

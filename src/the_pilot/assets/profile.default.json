@@ -22,7 +22,7 @@
       "deliver-and-verify",
       "closeout-and-sync"
     ],
-    "deliver_strategy": "merge_dev_only",
+    "deliver_strategy": "merge_dev_e2e",
     "enable_feedback_email": false,
     "guardrails": []
   },
