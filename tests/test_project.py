@@ -283,6 +283,11 @@ class ProjectTest(unittest.TestCase):
                 "timestamp": int(now * 1000),
                 "message": {"content": "You are an independent Adversarial Architecture & Engineering Quality Reviewer."},
             }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": "Generate a short git branch slug (2-4 lowercase hyphenated words) for: fix timeout."},
+            }),
         ]) + "\n")
         claude_c2 = home / ".claude/projects/demo/c2.jsonl"
         claude_c2.write_text(json.dumps({
@@ -364,7 +369,7 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(report["sources"]["antigravity"]["sampled_files"], 2)
         # Claude c1 has 4 distinct in-window turns (1x "继续" from 24h ago in file, 1x "继续" from 30m ago in history, 1x "继续" at now mirrored in both, 1x deliver); c2 has 1; c_extra has 1
         self.assertEqual(report["sources"]["claude"]["human_messages"], 6)
-        self.assertEqual(report["sources"]["claude"]["filtered_machine_messages"], 1)
+        self.assertEqual(report["sources"]["claude"]["filtered_machine_messages"], 2)
         # Codex rollout event_msg + response_item + history.jsonl mirror of same UUID session counts once
         self.assertEqual(report["sources"]["codex"]["human_messages"], 1)
         self.assertEqual(report["sources"]["codex"]["filtered_machine_messages"], 1)

@@ -38,6 +38,7 @@ MACHINE_PREFIXES = (
     "Read-only static review: no writes",
     "This session is being continued from a previous conversation",
     "Generate a short git branch name that summarizes the coding task",
+    "Generate a short git branch slug",
     "Reply with ONLY:",
     "<environment_context>",
     "<permissions instructions>",
