@@ -8,7 +8,7 @@ recommendations for agent-assisted setup or tuning.
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 import json
 from pathlib import Path
@@ -21,9 +21,15 @@ MAX_DAYS = 90
 DEFAULT_MAX_SESSIONS = 80
 MAX_SESSIONS_LIMIT = 500
 MAX_LINES_PER_SESSION = 2000
+MAX_HISTORY_LINES = 5000
+MAX_BYTES_PER_FILE = 4 * 1024 * 1024
 MAX_EXAMPLES_PER_PATTERN = 3
 MAX_PATTERNS = 25
 MAX_SAMPLED_PROMPTS = 30
+MAX_ERRORS_PER_SOURCE = 5
+
+AUTOPILOT_COMMENT_OPEN = "<!--"
+AUTOPILOT_COMMENT_CLOSE = "-->"
 
 MACHINE_PREFIXES = (
     "Please carry out this task from my Orca coordinator",
@@ -36,22 +42,6 @@ MACHINE_PREFIXES = (
     "<environment_context>",
     "<permissions instructions>",
     "# AGENTS.md instructions",
-)
-
-BUILTIN_AUTOPILOT_PREFIXES: tuple[tuple[str, str], ...] = (
-    ("再整体 review", "architecture-re-review"),
-    ("对照最初的审查结果文档和设计文档", "architecture-re-review"),
-    ("对照最初的设计方案", "architecture-re-review"),
-    ("对照最初的设计文档", "architecture-re-review"),
-    ("先保存审查结果文档", "plan-and-orchestrate"),
-    ("先输出详细分阶段方案", "plan-and-orchestrate"),
-    ("合入 main 并发 dev", "deliver-and-verify"),
-    ("发 dev 完成环境部署核验", "deliver-and-verify"),
-    ("核查同步本会话整个任务涉及的文档", "closeout-and-sync"),
-    ("同步本任务文档、待发台账与 WORKING.md", "closeout-and-sync"),
-    ("把这条反馈标记完成", "closeout-and-sync"),
-    ("只把这条反馈标记完成", "closeout-and-sync"),
-    ("再整体核查一下本会话整个任务涉及的相关文档", "closeout-and-sync"),
 )
 
 CONTINUE_NUDGES = frozenset({
@@ -76,6 +66,7 @@ def distill_chat_history(
     days: int = DEFAULT_DAYS,
     max_sessions_per_agent: int = DEFAULT_MAX_SESSIONS,
     now_ts: float | None = None,
+    max_lines_per_session: int = MAX_LINES_PER_SESSION,
 ) -> dict[str, Any]:
     """Collect and cluster recent user messages across local coding agents."""
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= MAX_DAYS:
@@ -86,18 +77,44 @@ def distill_chat_history(
         or not 1 <= max_sessions_per_agent <= MAX_SESSIONS_LIMIT
     ):
         raise ValueError(f"max_sessions 必须是 1..{MAX_SESSIONS_LIMIT} 的整数")
+    if (
+        isinstance(max_lines_per_session, bool)
+        or not isinstance(max_lines_per_session, int)
+        or max_lines_per_session < 2
+    ):
+        raise ValueError("max_lines_per_session 必须是 >= 2 的整数")
 
     current_ts = float(time.time() if now_ts is None else now_ts)
     cutoff_ts = current_ts - days * 86400.0
-    installed_templates = _load_installed_templates(gemini_dir)
+    config_status, installed_shortcuts = _load_installed_shortcuts(gemini_dir)
 
-    sources: dict[str, dict[str, int]] = {}
+    sources: dict[str, dict[str, Any]] = {}
     all_records: list[dict[str, Any]] = []
     for agent, collector in (
-        ("antigravity", lambda: _collect_antigravity(home_dir, gemini_dir, cutoff_ts, max_sessions_per_agent)),
-        ("claude", lambda: _collect_claude(home_dir, cutoff_ts, max_sessions_per_agent)),
-        ("codex", lambda: _collect_codex(home_dir, cutoff_ts, max_sessions_per_agent)),
-        ("cursor", lambda: _collect_cursor(home_dir, cutoff_ts, max_sessions_per_agent)),
+        (
+            "antigravity",
+            lambda: _collect_antigravity(
+                home_dir, gemini_dir, cutoff_ts, max_sessions_per_agent, max_lines_per_session
+            ),
+        ),
+        (
+            "claude",
+            lambda: _collect_claude(
+                home_dir, cutoff_ts, max_sessions_per_agent, max_lines_per_session
+            ),
+        ),
+        (
+            "codex",
+            lambda: _collect_codex(
+                home_dir, cutoff_ts, max_sessions_per_agent, max_lines_per_session
+            ),
+        ),
+        (
+            "cursor",
+            lambda: _collect_cursor(
+                home_dir, cutoff_ts, max_sessions_per_agent, max_lines_per_session
+            ),
+        ),
     ):
         stats, records = collector()
         sources[agent] = stats
@@ -108,15 +125,20 @@ def distill_chat_history(
     manual_records: list[dict[str, Any]] = []
     entry_count = 0
     followup_count = 0
+    unknown_role_count = 0
 
     for item in all_records:
         role = item["turn_role"]
         if role == "entry":
             entry_count += 1
-        else:
+        elif role == "followup":
             followup_count += 1
+        else:
+            unknown_role_count += 1
 
-        matched_autopilot = _match_autopilot_activity(item["text"], installed_templates)
+        matched_autopilot = item.get("tag_provenance") or _match_installed_autopilot(
+            item["text"], installed_shortcuts
+        )
         if matched_autopilot is not None:
             autopilot_counts[matched_autopilot] += 1
             continue
@@ -132,6 +154,7 @@ def distill_chat_history(
                 "count": 0,
                 "entry_count": 0,
                 "followup_count": 0,
+                "unknown_count": 0,
                 "agents": set(),
                 "examples": [],
             }
@@ -139,8 +162,10 @@ def distill_chat_history(
         group["count"] += 1
         if role == "entry":
             group["entry_count"] += 1
-        else:
+        elif role == "followup":
             group["followup_count"] += 1
+        else:
+            group["unknown_count"] += 1
         group["agents"].add(item["agent"])
         preview = _single_line_preview(item["text"], limit=180)
         if preview and preview not in group["examples"] and len(group["examples"]) < MAX_EXAMPLES_PER_PATTERN:
@@ -153,7 +178,9 @@ def distill_chat_history(
 
     recurring_patterns: list[dict[str, Any]] = []
     for group in sorted_groups:
-        turn_role = _resolve_turn_role(group["entry_count"], group["followup_count"])
+        turn_role = _resolve_turn_role(
+            group["entry_count"], group["followup_count"], group["unknown_count"]
+        )
         category, suggestion = _classify_pattern(group["signature"], turn_role, group["count"])
         recurring_patterns.append({
             "signature": group["signature"],
@@ -165,18 +192,32 @@ def distill_chat_history(
             "suggested_automation": suggestion,
         })
 
-    recommendations = _build_recommendations(recurring_patterns, autopilot_counts, manual_records)
+    evidence_complete = (
+        config_status.get("status") != "error"
+        and all(
+            src["status"] != "degraded"
+            and src["truncated_files"] == 0
+            and src["undated_messages"] == 0
+            for src in sources.values()
+        )
+    )
+    recommendations = _build_recommendations(
+        recurring_patterns, autopilot_counts, manual_records, config_status, evidence_complete
+    )
     sampled_prompts = _sample_diverse_prompts(manual_records, limit=MAX_SAMPLED_PROMPTS)
 
     return {
         "schema": DISTILL_SCHEMA,
         "window_days": days,
         "max_sessions_per_agent": max_sessions_per_agent,
+        "evidence_complete": evidence_complete,
+        "config_status": config_status,
         "sources": sources,
         "totals": {
             "human_messages": len(all_records),
             "entry_messages": entry_count,
             "followup_messages": followup_count,
+            "unknown_role_messages": unknown_role_count,
             "autopilot_expanded_messages": sum(autopilot_counts.values()),
             "manual_messages": len(manual_records),
         },
@@ -191,307 +232,600 @@ def distill_chat_history(
     }
 
 
+def _new_source_stats() -> dict[str, Any]:
+    return {
+        "status": "absent",
+        "discovered_files": 0,
+        "sampled_files": 0,
+        "truncated_files": 0,
+        "read_errors": 0,
+        "malformed_lines": 0,
+        "undated_messages": 0,
+        "human_messages": 0,
+        "filtered_machine_messages": 0,
+        "errors": [],
+    }
+
+
+def _record_error(stats: dict[str, Any], message: str) -> None:
+    stats["read_errors"] += 1
+    if len(stats["errors"]) < MAX_ERRORS_PER_SOURCE:
+        stats["errors"].append(message)
+
+
+def _finalize_source_stats(stats: dict[str, Any], root_exists: bool) -> dict[str, Any]:
+    if stats["read_errors"] > 0 or stats["malformed_lines"] > 0:
+        stats["status"] = "degraded"
+    elif root_exists or stats["discovered_files"] > 0:
+        stats["status"] = "ok"
+    else:
+        stats["status"] = "absent"
+    return stats
+
+
 def _collect_antigravity(
     home_dir: Path,
     gemini_dir: Path,
     cutoff_ts: float,
     max_sessions: int,
-) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    max_lines: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    stats = _new_source_stats()
     roots = [gemini_dir / "antigravity-cli/brain"]
     default_brain = home_dir / ".gemini/antigravity-cli/brain"
     if default_brain != roots[0]:
         roots.append(default_brain)
 
+    root_exists = any(r.is_dir() for r in roots)
     seen_files: set[Path] = set()
     candidates: list[tuple[float, Path]] = []
     for brain_root in roots:
         if not brain_root.is_dir():
             continue
         for path in brain_root.glob("*/.system_generated/logs/transcript.jsonl"):
-            resolved = path.resolve()
+            try:
+                resolved = path.resolve()
+            except OSError as exc:
+                _record_error(stats, f"{path}: {exc}")
+                continue
             if resolved in seen_files:
                 continue
             seen_files.add(resolved)
-            mtime = _safe_mtime(path)
-            if mtime >= cutoff_ts:
+            mtime = _stat_mtime(path, stats)
+            if mtime is not None and mtime >= cutoff_ts:
                 candidates.append((mtime, path))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     sampled = candidates[:max_sessions]
+    stats["discovered_files"] = len(candidates)
+    stats["sampled_files"] = len(sampled)
     records: list[dict[str, Any]] = []
-    machine_filtered = 0
 
-    for mtime, path in sampled:
-        turn_idx = 0
-        for line in _iter_jsonl_lines(path):
-            if line.get("type") != "USER_INPUT":
+    for _, path in sampled:
+        lines, truncated = _read_tail_jsonl(path, stats, max_lines=max_lines)
+        if truncated:
+            stats["truncated_files"] += 1
+        session_turn_idx = 0
+        pending_tag: dict[str, Any] | None = None
+        session_id = path.parents[2].name
+        for line in lines:
+            step_type = line.get("type")
+            if step_type == "PLANNER_RESPONSE":
+                tag = _extract_autopilot_tag(str(line.get("content") or ""))
+                if tag is not None:
+                    pending_tag = tag
+                continue
+            if step_type != "USER_INPUT":
                 continue
             source = line.get("source")
             if source not in (None, "", "USER_EXPLICIT"):
                 continue
-            ts = _parse_timestamp(line.get("created_at"), fallback=mtime)
-            if ts < cutoff_ts:
+            requests = _extract_user_requests(str(line.get("content") or ""))
+            if not requests:
                 continue
-            for text in _extract_user_requests(str(line.get("content") or "")):
+            ts = _parse_optional_timestamp(line.get("created_at"))
+            for text in requests:
                 if _is_machine_message(text):
-                    machine_filtered += 1
+                    stats["filtered_machine_messages"] += 1
+                    pending_tag = None
+                    continue
+                role = "unknown" if truncated else ("entry" if session_turn_idx == 0 else "followup")
+                session_turn_idx += 1
+                matched_scene = _match_pending_tag(text, pending_tag)
+                pending_tag = None
+                if ts is None:
+                    stats["undated_messages"] += 1
+                    continue
+                if ts < cutoff_ts:
                     continue
                 records.append({
                     "agent": "antigravity",
-                    "session_id": path.parents[2].name,
-                    "turn_role": "entry" if turn_idx == 0 else "followup",
+                    "session_id": session_id,
+                    "turn_role": role,
                     "timestamp": ts,
                     "text": text,
+                    "tag_provenance": matched_scene,
                 })
-                turn_idx += 1
 
-    return {
-        "discovered_files": len(candidates),
-        "sampled_files": len(sampled),
-        "human_messages": len(records),
-        "filtered_machine_messages": machine_filtered,
-    }, records
+    stats["human_messages"] = len(records)
+    return _finalize_source_stats(stats, root_exists), records
 
 
 def _collect_claude(
     home_dir: Path,
     cutoff_ts: float,
     max_sessions: int,
-) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    max_lines: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    stats = _new_source_stats()
     claude_dir = home_dir / ".claude"
-    candidates: list[tuple[float, Path]] = []
     projects_dir = claude_dir / "projects"
+    history_path = claude_dir / "history.jsonl"
+    root_exists = claude_dir.is_dir()
+
+    file_by_session: dict[str, tuple[float, Path]] = {}
     if projects_dir.is_dir():
         for path in projects_dir.glob("*/*.jsonl"):
-            mtime = _safe_mtime(path)
-            if mtime >= cutoff_ts:
-                candidates.append((mtime, path))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    sampled = candidates[:max_sessions]
+            mtime = _stat_mtime(path, stats)
+            if mtime is not None and mtime >= cutoff_ts:
+                sid = path.stem
+                prev = file_by_session.get(sid)
+                if prev is None or mtime > prev[0]:
+                    file_by_session[sid] = (mtime, path)
+
+    history_by_session: dict[str, list[tuple[float, str]]] = {}
+    history_latest_ts: dict[str, float] = {}
+    human_history_sids: set[str] = set()
+    if history_path.is_file():
+        hist_mtime = _stat_mtime(history_path, stats)
+        if hist_mtime is not None and hist_mtime >= cutoff_ts:
+            hist_lines, history_truncated = _read_tail_jsonl(
+                history_path, stats, max_lines=MAX_HISTORY_LINES
+            )
+            if history_truncated:
+                stats["truncated_files"] += 1
+            for line in hist_lines:
+                text = str(line.get("display") or "").strip()
+                if not text:
+                    continue
+                sid = str(line.get("sessionId") or "").strip() or "claude-history"
+                ts = _parse_optional_timestamp(line.get("timestamp"))
+                if ts is None:
+                    if sid not in file_by_session and not _is_machine_message(text):
+                        stats["undated_messages"] += 1
+                    continue
+                if ts < cutoff_ts:
+                    continue
+                history_by_session.setdefault(sid, []).append((ts, text))
+                if ts > history_latest_ts.get(sid, 0.0):
+                    history_latest_ts[sid] = ts
+                if not _is_machine_message(text):
+                    human_history_sids.add(sid)
+
+    all_session_ids: dict[str, float] = {
+        sid: info[0] for sid, info in file_by_session.items()
+    }
+    for sid, latest in history_latest_ts.items():
+        if latest > all_session_ids.get(sid, 0.0):
+            all_session_ids[sid] = latest
+
+    ordered_sessions = sorted(
+        all_session_ids.items(),
+        key=lambda item: (
+            1 if (item[0] in file_by_session or item[0] in human_history_sids) else 0,
+            item[1],
+        ),
+        reverse=True,
+    )
+    selected_sessions = [sid for sid, _ in ordered_sessions[:max_sessions]]
+    stats["discovered_files"] = len(all_session_ids)
+    stats["sampled_files"] = len(selected_sessions)
 
     records: list[dict[str, Any]] = []
-    seen_messages: set[tuple[str, str]] = set()
-    session_turns: Counter[str] = Counter()
-    machine_filtered = 0
+    for sid in selected_sessions:
+        session_records: list[dict[str, Any]] = []
+        seen_file_texts: Counter[str] = Counter()
+        file_truncated = False
+        if sid in file_by_session:
+            _, path = file_by_session[sid]
+            session_records, seen_file_texts, file_truncated = _parse_claude_session_file(
+                path, sid, cutoff_ts, stats, max_lines=max_lines
+            )
+            records.extend(session_records)
+        if sid in history_by_session and not file_truncated:
+            records.extend(
+                _reconcile_history_records(
+                    "claude",
+                    sid,
+                    history_by_session[sid],
+                    seen_file_texts,
+                    sid in file_by_session,
+                    cutoff_ts,
+                    stats,
+                )
+            )
 
-    for mtime, path in sampled:
-        session_id = path.stem
-        for line in _iter_jsonl_lines(path):
-            if line.get("type") != "user" or line.get("isMeta"):
-                continue
-            ts = _parse_timestamp(line.get("timestamp"), fallback=mtime)
-            if ts < cutoff_ts:
-                continue
+    stats["human_messages"] = len(records)
+    return _finalize_source_stats(stats, root_exists), records
+
+
+def _parse_claude_session_file(
+    path: Path,
+    session_id: str,
+    cutoff_ts: float,
+    stats: dict[str, Any],
+    *,
+    max_lines: int,
+) -> tuple[list[dict[str, Any]], Counter[str], bool]:
+    lines, truncated = _read_tail_jsonl(path, stats, max_lines=max_lines)
+    if truncated:
+        stats["truncated_files"] += 1
+    session_turn_idx = 0
+    pending_tag: dict[str, Any] | None = None
+    records: list[dict[str, Any]] = []
+    seen_texts: Counter[str] = Counter()
+    for line in lines:
+        msg_type = line.get("type")
+        if msg_type == "assistant":
             text = _extract_claude_content(line.get("message"))
-            if not text:
-                continue
-            if _is_machine_message(text):
-                machine_filtered += 1
-                continue
-            dedup_key = (session_id, text)
-            if dedup_key in seen_messages:
-                continue
-            seen_messages.add(dedup_key)
-            turn_idx = session_turns[session_id]
-            session_turns[session_id] += 1
-            records.append({
-                "agent": "claude",
-                "session_id": session_id,
-                "turn_role": "entry" if turn_idx == 0 else "followup",
-                "timestamp": ts,
-                "text": text,
-            })
-
-    history_path = claude_dir / "history.jsonl"
-    discovered_count = len(candidates)
-    sampled_count = len(sampled)
-    if history_path.is_file() and _safe_mtime(history_path) >= cutoff_ts:
-        discovered_count += 1
-        sampled_count += 1
-        for line in _iter_jsonl_lines(history_path, max_lines=4000):
-            ts = _parse_timestamp(line.get("timestamp"), fallback=0.0)
-            if ts < cutoff_ts:
-                continue
-            text = str(line.get("display") or "").strip()
-            if not text:
-                continue
-            if _is_machine_message(text):
-                machine_filtered += 1
-                continue
-            session_id = str(line.get("sessionId") or "claude-history")
-            dedup_key = (session_id, text)
-            if dedup_key in seen_messages:
-                continue
-            seen_messages.add(dedup_key)
-            turn_idx = session_turns[session_id]
-            session_turns[session_id] += 1
-            records.append({
-                "agent": "claude",
-                "session_id": session_id,
-                "turn_role": "entry" if turn_idx == 0 else "followup",
-                "timestamp": ts,
-                "text": text,
-            })
-
-    return {
-        "discovered_files": discovered_count,
-        "sampled_files": sampled_count,
-        "human_messages": len(records),
-        "filtered_machine_messages": machine_filtered,
-    }, records
+            tag = _extract_autopilot_tag(text)
+            if tag is not None:
+                pending_tag = tag
+            continue
+        if msg_type != "user" or line.get("isMeta"):
+            continue
+        text = _extract_claude_content(line.get("message"))
+        if not text:
+            continue
+        if _is_machine_message(text):
+            stats["filtered_machine_messages"] += 1
+            pending_tag = None
+            continue
+        seen_texts[text] += 1
+        role = "unknown" if truncated else ("entry" if session_turn_idx == 0 else "followup")
+        session_turn_idx += 1
+        matched_scene = _match_pending_tag(text, pending_tag)
+        pending_tag = None
+        ts = _parse_optional_timestamp(line.get("timestamp"))
+        if ts is None:
+            stats["undated_messages"] += 1
+            continue
+        if ts < cutoff_ts:
+            continue
+        records.append({
+            "agent": "claude",
+            "session_id": session_id,
+            "turn_role": role,
+            "timestamp": ts,
+            "text": text,
+            "tag_provenance": matched_scene,
+        })
+    return records, seen_texts, truncated
 
 
 def _collect_codex(
     home_dir: Path,
     cutoff_ts: float,
     max_sessions: int,
-) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    max_lines: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    stats = _new_source_stats()
     codex_dir = home_dir / ".codex"
-    candidates: list[tuple[float, Path]] = []
     sessions_dir = codex_dir / "sessions"
+    history_path = codex_dir / "history.jsonl"
+    root_exists = codex_dir.is_dir()
+
+    file_by_session: dict[str, tuple[float, Path]] = {}
     if sessions_dir.is_dir():
         for path in sessions_dir.glob("*/*/*/*.jsonl"):
-            mtime = _safe_mtime(path)
-            if mtime >= cutoff_ts:
-                candidates.append((mtime, path))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    sampled = candidates[:max_sessions]
+            mtime = _stat_mtime(path, stats)
+            if mtime is not None and mtime >= cutoff_ts:
+                sid = _canonical_codex_session_id(path.stem)
+                prev = file_by_session.get(sid)
+                if prev is None or mtime > prev[0]:
+                    file_by_session[sid] = (mtime, path)
+
+    history_by_session: dict[str, list[tuple[float, str]]] = {}
+    history_latest_ts: dict[str, float] = {}
+    human_history_sids: set[str] = set()
+    if history_path.is_file():
+        hist_mtime = _stat_mtime(history_path, stats)
+        if hist_mtime is not None and hist_mtime >= cutoff_ts:
+            hist_lines, hist_truncated = _read_tail_jsonl(
+                history_path, stats, max_lines=MAX_HISTORY_LINES
+            )
+            if hist_truncated:
+                stats["truncated_files"] += 1
+            for line in hist_lines:
+                text = str(line.get("text") or "").strip()
+                if not text:
+                    continue
+                sid = _canonical_codex_session_id(str(line.get("session_id") or "").strip() or "codex-history")
+                ts = _parse_optional_timestamp(line.get("ts"))
+                if ts is None:
+                    if sid not in file_by_session and not _is_machine_message(text):
+                        stats["undated_messages"] += 1
+                    continue
+                if ts < cutoff_ts:
+                    continue
+                history_by_session.setdefault(sid, []).append((ts, text))
+                if ts > history_latest_ts.get(sid, 0.0):
+                    history_latest_ts[sid] = ts
+                if not _is_machine_message(text):
+                    human_history_sids.add(sid)
+
+    all_session_ids: dict[str, float] = {
+        sid: info[0] for sid, info in file_by_session.items()
+    }
+    for sid, latest in history_latest_ts.items():
+        if latest > all_session_ids.get(sid, 0.0):
+            all_session_ids[sid] = latest
+
+    ordered_sessions = sorted(
+        all_session_ids.items(),
+        key=lambda item: (
+            1 if (item[0] in file_by_session or item[0] in human_history_sids) else 0,
+            item[1],
+        ),
+        reverse=True,
+    )
+    selected_sessions = [sid for sid, _ in ordered_sessions[:max_sessions]]
+    stats["discovered_files"] = len(all_session_ids)
+    stats["sampled_files"] = len(selected_sessions)
 
     records: list[dict[str, Any]] = []
-    seen_messages: set[tuple[str, str]] = set()
-    session_turns: Counter[str] = Counter()
-    machine_filtered = 0
+    for sid in selected_sessions:
+        session_records: list[dict[str, Any]] = []
+        seen_file_texts: Counter[str] = Counter()
+        file_truncated = False
+        if sid in file_by_session:
+            _, path = file_by_session[sid]
+            session_records, seen_file_texts, file_truncated = _parse_codex_session_file(
+                path, sid, cutoff_ts, stats, max_lines=max_lines
+            )
+            records.extend(session_records)
+        if sid in history_by_session and not file_truncated:
+            records.extend(
+                _reconcile_history_records(
+                    "codex",
+                    sid,
+                    history_by_session[sid],
+                    seen_file_texts,
+                    sid in file_by_session,
+                    cutoff_ts,
+                    stats,
+                )
+            )
 
-    for mtime, path in sampled:
-        session_id = path.stem
-        for line in _iter_jsonl_lines(path):
-            text = _extract_codex_session_message(line)
-            if not text:
-                continue
-            ts = _parse_timestamp(line.get("timestamp"), fallback=mtime)
-            if ts < cutoff_ts:
-                continue
-            if _is_machine_message(text):
-                machine_filtered += 1
-                continue
-            dedup_key = (session_id, text)
-            if dedup_key in seen_messages:
-                continue
-            seen_messages.add(dedup_key)
-            turn_idx = session_turns[session_id]
-            session_turns[session_id] += 1
-            records.append({
-                "agent": "codex",
-                "session_id": session_id,
-                "turn_role": "entry" if turn_idx == 0 else "followup",
-                "timestamp": ts,
-                "text": text,
-            })
+    stats["human_messages"] = len(records)
+    return _finalize_source_stats(stats, root_exists), records
 
-    history_path = codex_dir / "history.jsonl"
-    discovered_count = len(candidates)
-    sampled_count = len(sampled)
-    if history_path.is_file() and _safe_mtime(history_path) >= cutoff_ts:
-        discovered_count += 1
-        sampled_count += 1
-        for line in _iter_jsonl_lines(history_path, max_lines=5000):
-            ts = _parse_timestamp(line.get("ts"), fallback=0.0)
-            if ts < cutoff_ts:
-                continue
-            text = str(line.get("text") or "").strip()
-            if not text:
-                continue
-            if _is_machine_message(text):
-                machine_filtered += 1
-                continue
-            session_id = str(line.get("session_id") or "codex-history")
-            dedup_key = (session_id, text)
-            if dedup_key in seen_messages:
-                continue
-            seen_messages.add(dedup_key)
-            turn_idx = session_turns[session_id]
-            session_turns[session_id] += 1
-            records.append({
-                "agent": "codex",
-                "session_id": session_id,
-                "turn_role": "entry" if turn_idx == 0 else "followup",
-                "timestamp": ts,
-                "text": text,
-            })
 
-    return {
-        "discovered_files": discovered_count,
-        "sampled_files": sampled_count,
-        "human_messages": len(records),
-        "filtered_machine_messages": machine_filtered,
-    }, records
+def _parse_codex_session_file(
+    path: Path,
+    session_id: str,
+    cutoff_ts: float,
+    stats: dict[str, Any],
+    *,
+    max_lines: int,
+) -> tuple[list[dict[str, Any]], Counter[str], bool]:
+    lines, truncated = _read_tail_jsonl(path, stats, max_lines=max_lines)
+    if truncated:
+        stats["truncated_files"] += 1
+    session_turn_idx = 0
+    pending_tag: dict[str, Any] | None = None
+    last_event_user_text: str | None = None
+    records: list[dict[str, Any]] = []
+    seen_texts: Counter[str] = Counter()
+
+    for line in lines:
+        item_type = line.get("type")
+        payload = line.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if item_type == "response_item" and payload.get("role") == "assistant":
+            last_event_user_text = None
+            assistant_text = _extract_codex_text_blocks(payload.get("content"))
+            tag = _extract_autopilot_tag(assistant_text)
+            if tag is not None:
+                pending_tag = tag
+            continue
+        if item_type == "event_msg" and payload.get("type") == "agent_message":
+            last_event_user_text = None
+            tag = _extract_autopilot_tag(str(payload.get("message") or ""))
+            if tag is not None:
+                pending_tag = tag
+            continue
+
+        is_event_user = item_type == "event_msg" and payload.get("type") == "user_message"
+        is_resp_user = item_type == "response_item" and payload.get("role") == "user"
+        if not (is_event_user or is_resp_user):
+            continue
+
+        text = (
+            str(payload.get("message") or "").strip()
+            if is_event_user
+            else _extract_codex_text_blocks(payload.get("content"))
+        )
+        if not text:
+            continue
+        if is_resp_user and last_event_user_text == text:
+            last_event_user_text = None
+            continue
+        last_event_user_text = text if is_event_user else None
+
+        if _is_machine_message(text):
+            stats["filtered_machine_messages"] += 1
+            pending_tag = None
+            continue
+        seen_texts[text] += 1
+        role = "unknown" if truncated else ("entry" if session_turn_idx == 0 else "followup")
+        session_turn_idx += 1
+        matched_scene = _match_pending_tag(text, pending_tag)
+        pending_tag = None
+        ts = _parse_optional_timestamp(line.get("timestamp"))
+        if ts is None:
+            stats["undated_messages"] += 1
+            continue
+        if ts < cutoff_ts:
+            continue
+        records.append({
+            "agent": "codex",
+            "session_id": session_id,
+            "turn_role": role,
+            "timestamp": ts,
+            "text": text,
+            "tag_provenance": matched_scene,
+        })
+    return records, seen_texts, truncated
 
 
 def _collect_cursor(
     home_dir: Path,
     cutoff_ts: float,
     max_sessions: int,
-) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    max_lines: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    stats = _new_source_stats()
     cursor_projects = home_dir / ".cursor/projects"
+    root_exists = cursor_projects.is_dir()
     candidates: list[tuple[float, Path]] = []
-    if cursor_projects.is_dir():
+    if root_exists:
         for path in cursor_projects.glob("*/agent-transcripts/*.jsonl"):
-            mtime = _safe_mtime(path)
-            if mtime >= cutoff_ts:
+            mtime = _stat_mtime(path, stats)
+            if mtime is not None and mtime >= cutoff_ts:
                 candidates.append((mtime, path))
     candidates.sort(key=lambda item: item[0], reverse=True)
     sampled = candidates[:max_sessions]
+    stats["discovered_files"] = len(candidates)
+    stats["sampled_files"] = len(sampled)
 
     records: list[dict[str, Any]] = []
-    machine_filtered = 0
-    for mtime, path in sampled:
-        turn_idx = 0
-        for line in _iter_jsonl_lines(path):
+    for _, path in sampled:
+        lines, truncated = _read_tail_jsonl(path, stats, max_lines=max_lines)
+        if truncated:
+            stats["truncated_files"] += 1
+        session_turn_idx = 0
+        pending_tag: dict[str, Any] | None = None
+        for line in lines:
             role = line.get("role") or line.get("type")
-            if role not in ("user", "USER_INPUT"):
-                continue
             text = str(line.get("content") or line.get("text") or "").strip()
-            if not text:
+            if role in ("assistant", "MODEL", "PLANNER_RESPONSE"):
+                tag = _extract_autopilot_tag(text)
+                if tag is not None:
+                    pending_tag = tag
+                continue
+            if role not in ("user", "USER_INPUT") or not text:
                 continue
             if _is_machine_message(text):
-                machine_filtered += 1
+                stats["filtered_machine_messages"] += 1
+                pending_tag = None
+                continue
+            turn_role = "unknown" if truncated else ("entry" if session_turn_idx == 0 else "followup")
+            session_turn_idx += 1
+            matched_scene = _match_pending_tag(text, pending_tag)
+            pending_tag = None
+            ts = _parse_optional_timestamp(
+                line.get("timestamp") or line.get("created_at") or line.get("ts")
+            )
+            if ts is None:
+                stats["undated_messages"] += 1
+                continue
+            if ts < cutoff_ts:
                 continue
             records.append({
                 "agent": "cursor",
                 "session_id": path.stem,
-                "turn_role": "entry" if turn_idx == 0 else "followup",
-                "timestamp": mtime,
+                "turn_role": turn_role,
+                "timestamp": ts,
                 "text": text,
+                "tag_provenance": matched_scene,
             })
-            turn_idx += 1
 
-    return {
-        "discovered_files": len(candidates),
-        "sampled_files": len(sampled),
-        "human_messages": len(records),
-        "filtered_machine_messages": machine_filtered,
-    }, records
+    stats["human_messages"] = len(records)
+    return _finalize_source_stats(stats, root_exists), records
 
 
-def _iter_jsonl_lines(path: Path, *, max_lines: int = MAX_LINES_PER_SESSION) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+def _reconcile_history_records(
+    agent: str,
+    session_id: str,
+    history_entries: list[tuple[float, str]],
+    seen_file_texts: Counter[str],
+    has_session_file: bool,
+    cutoff_ts: float,
+    stats: dict[str, Any],
+) -> list[dict[str, Any]]:
+    remaining_session_texts = Counter(seen_file_texts)
+    extra_records: list[dict[str, Any]] = []
+    for ts, text in history_entries:
+        if _is_machine_message(text):
+            if not has_session_file:
+                stats["filtered_machine_messages"] += 1
+            continue
+        if ts < cutoff_ts:
+            continue
+        if remaining_session_texts.get(text, 0) > 0:
+            remaining_session_texts[text] -= 1
+            continue
+        extra_records.append({
+            "agent": agent,
+            "session_id": session_id,
+            "turn_role": "unknown",
+            "timestamp": ts,
+            "text": text,
+            "tag_provenance": None,
+        })
+    return extra_records
+
+
+def _read_tail_jsonl(
+    path: Path,
+    stats: dict[str, Any],
+    *,
+    max_lines: int,
+    max_bytes: int = MAX_BYTES_PER_FILE,
+) -> tuple[list[dict[str, Any]], bool]:
+    ring: deque[dict[str, Any]] = deque(maxlen=max_lines)
+    valid_count = 0
+    byte_truncated = False
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for idx, raw_line in enumerate(handle):
-                if idx >= max_lines:
-                    break
-                stripped = raw_line.strip()
+        file_size = path.stat().st_size
+        with path.open("rb") as raw_handle:
+            if file_size > max_bytes:
+                byte_truncated = True
+                raw_handle.seek(file_size - max_bytes)
+                raw_handle.readline()
+            for line_no, raw_bytes in enumerate(raw_handle, start=1):
+                stripped = raw_bytes.decode("utf-8", errors="replace").strip()
                 if not stripped:
                     continue
                 try:
                     value = json.loads(stripped)
-                except ValueError:
+                except ValueError as exc:
+                    stats["malformed_lines"] += 1
+                    if len(stats["errors"]) < MAX_ERRORS_PER_SOURCE:
+                        stats["errors"].append(f"{path}:{line_no}: invalid JSON ({exc})")
                     continue
-                if isinstance(value, dict):
-                    items.append(value)
-    except OSError:
-        return []
-    return items
+                if not isinstance(value, dict):
+                    stats["malformed_lines"] += 1
+                    if len(stats["errors"]) < MAX_ERRORS_PER_SOURCE:
+                        stats["errors"].append(f"{path}:{line_no}: JSON line is not an object")
+                    continue
+                valid_count += 1
+                ring.append(value)
+    except OSError as exc:
+        _record_error(stats, f"{path}: {exc}")
+        return [], False
+    return list(ring), byte_truncated or (valid_count > max_lines)
+
+
+def _canonical_codex_session_id(raw_stem: str) -> str:
+    cleaned = raw_stem.strip()
+    if len(cleaned) >= 36:
+        tail = cleaned[-36:]
+        if _is_uuid_or_hex_sha(tail) and tail.count("-") == 4:
+            return tail
+    return cleaned
 
 
 def _extract_user_requests(raw: str) -> list[str]:
@@ -535,23 +869,55 @@ def _extract_claude_content(message: Any) -> str:
     return ""
 
 
-def _extract_codex_session_message(line: dict[str, Any]) -> str:
-    item_type = line.get("type")
-    payload = line.get("payload")
-    if not isinstance(payload, dict):
+def _extract_codex_text_blocks(content: Any) -> str:
+    if not isinstance(content, list):
         return ""
-    if item_type == "event_msg" and payload.get("type") == "user_message":
-        return str(payload.get("message") or "").strip()
-    if item_type == "response_item" and payload.get("role") == "user":
-        content = payload.get("content")
-        if isinstance(content, list):
-            parts = [
-                str(block.get("text") or "").strip()
-                for block in content
-                if isinstance(block, dict) and block.get("type") in ("input_text", "text")
-            ]
-            return "\n".join(p for p in parts if p).strip()
-    return ""
+    parts = [
+        str(block.get("text") or "").strip()
+        for block in content
+        if isinstance(block, dict) and block.get("type") in ("input_text", "output_text", "text")
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _extract_autopilot_tag(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped.endswith(AUTOPILOT_COMMENT_CLOSE):
+        return None
+    search_end = len(stripped) - len(AUTOPILOT_COMMENT_CLOSE)
+    while search_end >= 0:
+        open_idx = stripped.rfind(AUTOPILOT_COMMENT_OPEN, 0, search_end)
+        if open_idx < 0:
+            return None
+        inner = stripped[open_idx + len(AUTOPILOT_COMMENT_OPEN):-len(AUTOPILOT_COMMENT_CLOSE)].strip()
+        if inner.lower().startswith("autopilot:"):
+            payload = inner[len("autopilot:"):].strip()
+            if payload.startswith("{") and payload.endswith("}"):
+                try:
+                    parsed = json.loads(payload)
+                except ValueError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+        search_end = open_idx
+    return None
+
+
+def _match_pending_tag(user_text: str, pending_tag: dict[str, Any] | None) -> str | None:
+    if not isinstance(pending_tag, dict):
+        return None
+    scene = str(pending_tag.get("scene") or "").strip()
+    if not scene or scene == "NONE":
+        return None
+    stripped = user_text.strip()
+    for key in ("1", "2", "3"):
+        candidate = str(pending_tag.get(key) or "").strip()
+        if candidate and (
+            stripped == candidate
+            or stripped.startswith(candidate + "\n")
+            or stripped.startswith(candidate + " ")
+        ):
+            return f"scene:{scene}"
+    return None
 
 
 def _is_machine_message(text: str) -> bool:
@@ -570,36 +936,52 @@ def _is_machine_message(text: str) -> bool:
     return False
 
 
-def _load_installed_templates(gemini_dir: Path) -> dict[str, str]:
+def _load_installed_shortcuts(gemini_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     config_path = gemini_dir / "config/autopilot/config.json"
     if not config_path.is_file():
-        return {}
+        return {"status": "absent", "path": str(config_path)}, []
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as exc:
+        return {"status": "error", "path": str(config_path), "error": str(exc)}, []
     if not isinstance(config, dict):
-        return {}
-    templates: dict[str, str] = {}
+        return {
+            "status": "error",
+            "path": str(config_path),
+            "error": "config.json root must be a JSON object",
+        }, []
+
+    shortcuts: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for section, label_prefix in (
         ("entry_shortcuts", "entry:"),
         ("comma_commands", "comma:,"),
     ):
-        for key, spec in (config.get(section) or {}).items():
+        section_obj = config.get(section)
+        if not isinstance(section_obj, dict):
+            continue
+        for key, spec in section_obj.items():
             if not isinstance(spec, dict):
                 continue
             canonical = str(spec.get("canonical_key") or key).strip()
-            tmpl = str(spec.get("template") or "").strip()
-            if not tmpl:
+            command_id = str(spec.get("command_id") or canonical).strip()
+            if command_id in seen_ids:
                 continue
-            segments = [seg.strip() for seg in tmpl.split("{arg}") if len(seg.strip()) >= 10]
-            if segments:
-                longest = max(segments, key=len)[:48]
-                templates[longest] = f"{label_prefix}{canonical}"
-    return templates
+            seen_ids.add(command_id)
+            tmpl = str(spec.get("template") or "").strip()
+            aliases = [str(a).strip().lower() for a in (spec.get("aliases") or []) if str(a).strip()]
+            if canonical:
+                aliases.append(canonical.lower())
+                aliases.append(f",{canonical.lower()}")
+            shortcuts.append({
+                "label": f"{label_prefix}{canonical}",
+                "aliases": sorted(set(aliases)),
+                "template": tmpl,
+            })
+    return {"status": "ok", "path": str(config_path), "shortcuts_loaded": len(shortcuts)}, shortcuts
 
 
-def _match_autopilot_activity(text: str, installed_templates: dict[str, str]) -> str | None:
+def _match_installed_autopilot(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
     stripped = text.strip()
     lower = stripped.lower()
     if lower in (",1", ",2", ",3") or lower.startswith((",1 ", ",2 ", ",3 ")):
@@ -608,13 +990,32 @@ def _match_autopilot_activity(text: str, installed_templates: dict[str, str]) ->
         return "command:,mode"
     if lower.startswith((",worker", ",agent")):
         return "command:,worker"
-    for prefix, scene in BUILTIN_AUTOPILOT_PREFIXES:
-        if stripped.startswith(prefix):
-            return f"scene:{scene}"
-    for fragment, label in installed_templates.items():
-        if fragment in stripped:
-            return label
+    if lower.startswith(",autopilot"):
+        return "command:,autopilot"
+    first_token = lower.split()[0] if lower.split() else ""
+    for item in shortcuts:
+        if lower in item["aliases"] or (first_token in item["aliases"] and first_token.startswith(",")):
+            return item["label"]
+        if item["template"] and _matches_template(stripped, item["template"]):
+            return item["label"]
     return None
+
+
+def _matches_template(text: str, template: str) -> bool:
+    if "{arg}" not in template:
+        return text == template or text.startswith(template + "\n") or text.startswith(template + " ")
+    parts = [part.strip() for part in template.split("{arg}") if part.strip()]
+    if not parts:
+        return False
+    pos = 0
+    for idx, part in enumerate(parts):
+        found = text.find(part, pos)
+        if found < 0:
+            return False
+        if idx == 0 and template.lstrip().startswith(part) and found != 0:
+            return False
+        pos = found + len(part)
+    return True
 
 
 def _normalize_signature(text: str) -> str:
@@ -666,11 +1067,13 @@ def _is_uuid_or_hex_sha(token: str) -> bool:
     return False
 
 
-def _resolve_turn_role(entry_count: int, followup_count: int) -> str:
-    if entry_count > 0 and followup_count == 0:
+def _resolve_turn_role(entry_count: int, followup_count: int, unknown_count: int) -> str:
+    if entry_count > 0 and followup_count == 0 and unknown_count == 0:
         return "entry"
-    if followup_count > 0 and entry_count == 0:
+    if followup_count > 0 and entry_count == 0 and unknown_count == 0:
         return "followup"
+    if unknown_count > 0 and entry_count == 0 and followup_count == 0:
+        return "unknown"
     return "mixed"
 
 
@@ -683,7 +1086,7 @@ def _classify_pattern(signature: str, turn_role: str, count: int) -> tuple[str, 
             "profile_patch": {"autopilot": {"mode": "gate"}},
         }
     if any(kw in lower for kw in ("认领", "排查", "报警", "告警", "反馈", "方案", "设计", "子工作区", "orca")):
-        target = "shortcuts.custom_entry" if turn_role in ("entry", "mixed") else "scenes.plan-and-orchestrate"
+        target = "shortcuts.custom_entry" if turn_role == "entry" else "scenes.plan-and-orchestrate"
         return "plan_and_dispatch", {
             "target": target,
             "action": (
@@ -725,6 +1128,8 @@ def _build_recommendations(
     recurring_patterns: list[dict[str, Any]],
     autopilot_counts: Counter[str],
     manual_records: list[dict[str, Any]],
+    config_status: dict[str, Any],
+    evidence_complete: bool,
 ) -> list[dict[str, Any]]:
     recommendations: list[dict[str, Any]] = []
     seen_targets: set[str] = set()
@@ -744,12 +1149,17 @@ def _build_recommendations(
             "action": suggestion["action"],
         })
 
-    if not autopilot_counts and manual_records:
+    if (
+        evidence_complete
+        and config_status.get("status") == "absent"
+        and not autopilot_counts
+        and manual_records
+    ):
         recommendations.insert(0, {
             "category": "onboarding",
             "target": "preset.recommended",
             "evidence_count": len(manual_records),
-            "pattern_signature": "(no active autopilot tags detected)",
+            "pattern_signature": "(no installed config.json or autopilot tags detected)",
             "action": "Install the `recommended` preset (`gate` mode + all 4 scenes) to automate routine review, delivery, and closeout transitions.",
         })
     return recommendations[:12]
@@ -779,16 +1189,19 @@ def _single_line_preview(text: str, *, limit: int = 180) -> str:
     return collapsed[:limit]
 
 
-def _safe_mtime(path: Path) -> float:
+def _stat_mtime(path: Path, stats: dict[str, Any]) -> float | None:
     try:
         return path.stat().st_mtime
-    except OSError:
-        return 0.0
+    except OSError as exc:
+        _record_error(stats, f"{path}: {exc}")
+        return None
 
 
-def _parse_timestamp(raw: Any, *, fallback: float) -> float:
+def _parse_optional_timestamp(raw: Any) -> float | None:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         val = float(raw)
+        if val <= 0:
+            return None
         return val / 1000.0 if val > 1e11 else val
     if isinstance(raw, str) and raw.strip():
         text = raw.strip()
@@ -797,5 +1210,5 @@ def _parse_timestamp(raw: Any, *, fallback: float) -> float:
         try:
             return datetime.fromisoformat(text).timestamp()
         except ValueError:
-            return fallback
-    return fallback
+            return None
+    return None
