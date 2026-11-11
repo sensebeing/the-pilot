@@ -27,7 +27,6 @@ MAX_EXAMPLES_PER_PATTERN = 3
 MAX_PATTERNS = 25
 MAX_SAMPLED_PROMPTS = 30
 MAX_ERRORS_PER_SOURCE = 5
-HISTORY_MIRROR_MAX_DELTA_SECONDS = 60.0
 
 AUTOPILOT_COMMENT_OPEN = "<!--"
 AUTOPILOT_COMMENT_CLOSE = "-->"
@@ -752,6 +751,11 @@ def _collect_cursor(
     return _finalize_source_stats(stats, root_exists), records
 
 
+def _timestamps_equivalent(file_ts: float, history_ts: float) -> bool:
+    """Confirm mirror equivalence across millisecond/ISO session logs and integer-second history logs."""
+    return int(file_ts) == int(history_ts) or abs(file_ts - history_ts) < 1.0
+
+
 def _reconcile_history_records(
     agent: str,
     session_id: str,
@@ -775,12 +779,10 @@ def _reconcile_history_records(
         matched_idx = -1
         best_delta: float | None = None
         for idx, (file_ts, file_text) in enumerate(unmatched_session_turns):
-            if file_text != text:
+            if file_text != text or not _timestamps_equivalent(file_ts, ts):
                 continue
             delta = abs(file_ts - ts)
-            if delta <= HISTORY_MIRROR_MAX_DELTA_SECONDS and (
-                best_delta is None or delta < best_delta
-            ):
+            if best_delta is None or delta < best_delta:
                 best_delta = delta
                 matched_idx = idx
         if matched_idx >= 0:

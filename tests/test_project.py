@@ -265,7 +265,7 @@ class ProjectTest(unittest.TestCase):
             }),
             json.dumps({
                 "type": "user",
-                "timestamp": int((now - 86400) * 1000),
+                "timestamp": int((now - 30) * 1000),
                 "message": {"content": "继续"},
             }),
             json.dumps({
@@ -295,7 +295,7 @@ class ProjectTest(unittest.TestCase):
         claude_hist.write_text("\n".join([
             json.dumps({
                 "sessionId": "c1",
-                "timestamp": int((now - 1800) * 1000),
+                "timestamp": int((now - 60) * 1000),
                 "display": "继续",
             }),
             json.dumps({
