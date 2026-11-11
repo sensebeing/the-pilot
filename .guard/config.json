@@ -38,6 +38,7 @@
           "the_pilot.project",
           "the_pilot.profile",
           "the_pilot.compiler",
+          "the_pilot.distill",
           "the_pilot.installer",
           "the_pilot.runtime",
           "the_pilot.cli"
@@ -52,6 +53,7 @@
         "imports": [
           "the_pilot.profile",
           "the_pilot.compiler",
+          "the_pilot.distill",
           "the_pilot.installer",
           "the_pilot.runtime",
           "the_pilot.cli"
@@ -65,6 +67,7 @@
         ],
         "imports": [
           "the_pilot.compiler",
+          "the_pilot.distill",
           "the_pilot.installer",
           "the_pilot.runtime",
           "the_pilot.cli"
@@ -77,12 +80,29 @@
           "src/the_pilot/compiler.py"
         ],
         "imports": [
+          "the_pilot.distill",
           "the_pilot.installer",
           "the_pilot.runtime",
           "the_pilot.cli"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "compiler.py is pure in-memory compilation and must not import installer, runtime or cli."
+        "message": "compiler.py is pure in-memory compilation and must not import distill, installer, runtime or cli."
+      },
+      {
+        "scope_prefixes": [
+          "src/the_pilot/distill.py"
+        ],
+        "imports": [
+          "the_pilot.defaults",
+          "the_pilot.project",
+          "the_pilot.profile",
+          "the_pilot.compiler",
+          "the_pilot.installer",
+          "the_pilot.runtime",
+          "the_pilot.cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "distill.py is standalone read-only chat history distillation and must not import installer, runtime or cli."
       },
       {
         "scope_prefixes": [

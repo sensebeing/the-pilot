@@ -28,7 +28,7 @@ Paste this into Antigravity, Claude Code, Codex, Cursor, or Orca:
 Install and set up https://github.com/sensebeing/the-pilot for my environment.
 Install the CLI (`uv tool install git+https://github.com/sensebeing/the-pilot` or `python3 -m pip install git+https://github.com/sensebeing/the-pilot`),
 install the skills (`npx skills add sensebeing/the-pilot --global --agent '*'` or symlink from a checkout),
-then follow skills/the-pilot-setup/SKILL.md to help me configure the 4 dimensions (with --project <repo> if .pilot/project.json exists) and verify pilot status.
+then follow skills/the-pilot-setup/SKILL.md to run `pilot distill --days 7 --json`, recommend scenes and shortcuts from my recent chat history, configure the 4 dimensions, and verify pilot status.
 ```
 
 ## Why we built it
@@ -70,9 +70,12 @@ The CLI has no external runtime dependencies. Terminal prefill and auto-submissi
 
 ```sh
 pilot probe --no-project --json
+pilot distill --days 7 --json
 pilot apply --no-project --preset recommended --json
 pilot status --json
 ```
+
+`pilot distill --days 7 --json` scans the last 7 days of local agent conversations (Antigravity, Claude Code, Codex, and Cursor) to surface recurring manual prompts and suggest scenes, guardrails, and shortcuts before you apply a profile.
 
 If your repository has a project overlay at `<repo>/.pilot/project.json`, bind it during apply:
 
@@ -187,6 +190,7 @@ Overlay discovery checks explicit `--no-project`, then explicit `--project <repo
 | Command | Purpose |
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | Read-only discovery of installed profile, project overlay, and available agent CLIs (`codex`, `claude`, `agy`). |
+| `pilot distill [--days 7] [--max-sessions 80] --json` | Read-only distillation of recent local agent chat logs (`antigravity`, `claude`, `codex`, `cursor`) into recurring prompt patterns and automation suggestions. |
 | `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `autopilot.py`, `config.json`, `scenes/*.md`, `GEMINI.md` block, and Hook group. |
 | `pilot status [--project <repo>] --json` | Verify installation health, active mode, worker priority, and byte-level artifact drift (`drift: []`). |
 | `pilot uninstall --json` | Remove managed files, `GEMINI.md` managed block, and Hook entries while preserving unrelated user config. |

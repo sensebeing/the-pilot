@@ -6,6 +6,7 @@ resident-fact: admission: invalid overlays cannot escape scene paths or write an
 installation; project compilation matches the reviewed structured-tag contract.
 """
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -13,12 +14,14 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from the_pilot import __version__
 from the_pilot.compiler import compile_bundle, merge_hooks_json
+from the_pilot.distill import distill_chat_history
 from the_pilot.profile import resolve_profile
 from the_pilot.project import ProfileError, normalize_project
 
@@ -162,4 +165,137 @@ class ProjectTest(unittest.TestCase):
             self.assertIn("display_name:", openai_yaml)
             self.assertIn("short_description:", openai_yaml)
             self.assertIn("default_prompt:", openai_yaml)
+
+    def test_distill_multi_agent_chat_history_and_recommendations(self):
+        home = self.root / "home"
+        now = time.time()
+        recent_iso = datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat()
+        old_ts = now - 10 * 86400
+
+        # 1. Antigravity recent and old transcripts
+        agy_recent = self.gemini / "antigravity-cli/brain/s1/.system_generated/logs/transcript.jsonl"
+        agy_recent.parent.mkdir(parents=True)
+        agy_recent.write_text("\n".join([
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": recent_iso,
+                "content": "<USER_REQUEST>\ntriage issue 95c4bb96-c616-4fdd-98c1-ad6b31d884ff in services/api/handler.py\n</USER_REQUEST>",
+            }),
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": recent_iso,
+                "content": "<USER_REQUEST>\n继续\n</USER_REQUEST>",
+            }),
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": recent_iso,
+                "content": "<USER_REQUEST>\n,1\n</USER_REQUEST>",
+            }),
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": recent_iso,
+                "content": "<SYSTEM_MESSAGE>background task finished</SYSTEM_MESSAGE>",
+            }),
+        ]) + "\n")
+
+        agy_old = self.gemini / "antigravity-cli/brain/s_old/.system_generated/logs/transcript.jsonl"
+        agy_old.parent.mkdir(parents=True)
+        agy_old.write_text(json.dumps({
+            "type": "USER_INPUT",
+            "source": "USER_EXPLICIT",
+            "content": "<USER_REQUEST>\nold message outside window\n</USER_REQUEST>",
+        }) + "\n")
+        os.utime(agy_old, (old_ts, old_ts))
+
+        # 2. Claude Code project session + history (with machine noise and deduplication)
+        claude_proj = home / ".claude/projects/demo/c1.jsonl"
+        claude_proj.parent.mkdir(parents=True)
+        claude_proj.write_text("\n".join([
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": "triage issue e2931f0c-03bf-45fe-ac1b-d6b7edddd83e in services/auth/login.py"},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": [{"type": "text", "text": "合并当前分支到 main 并完成实跑验证"}]},
+            }),
+            json.dumps({
+                "type": "user",
+                "timestamp": int(now * 1000),
+                "message": {"content": "You are an independent Adversarial Architecture & Engineering Quality Reviewer."},
+            }),
+        ]) + "\n")
+        claude_hist = home / ".claude/history.jsonl"
+        claude_hist.write_text(json.dumps({
+            "sessionId": "c1",
+            "timestamp": int(now * 1000),
+            "display": "triage issue e2931f0c-03bf-45fe-ac1b-d6b7edddd83e in services/auth/login.py",
+        }) + "\n")
+
+        # 3. Codex session + history (with Orca worker machine noise)
+        codex_sess = home / ".codex/sessions/2026/11/11/rollout-1.jsonl"
+        codex_sess.parent.mkdir(parents=True)
+        codex_sess.write_text("\n".join([
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": recent_iso,
+                "payload": {"type": "user_message", "message": "You are working inside Orca, a multi-agent IDE. You are a dispatched worker."},
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": recent_iso,
+                "payload": {"type": "user_message", "message": "继续"},
+            }),
+            json.dumps({
+                "type": "response_item",
+                "timestamp": recent_iso,
+                "payload": {"role": "user", "content": [{"type": "input_text", "text": "合并当前分支到 main 并完成实跑验证"}]},
+            }),
+        ]) + "\n")
+
+        # 4. Cursor transcript
+        cursor_sess = home / ".cursor/projects/demo/agent-transcripts/u1.jsonl"
+        cursor_sess.parent.mkdir(parents=True)
+        cursor_sess.write_text(json.dumps({
+            "role": "user",
+            "content": "继续",
+        }) + "\n")
+
+        report = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
+        self.assertEqual(report["schema"], "the-pilot-distillation/v1")
+        self.assertEqual(report["sources"]["antigravity"]["sampled_files"], 1)
+        self.assertEqual(report["sources"]["claude"]["human_messages"], 2)
+        self.assertEqual(report["sources"]["claude"]["filtered_machine_messages"], 1)
+        self.assertEqual(report["sources"]["codex"]["human_messages"], 2)
+        self.assertEqual(report["sources"]["codex"]["filtered_machine_messages"], 1)
+        self.assertEqual(report["sources"]["cursor"]["human_messages"], 1)
+        self.assertEqual(report["autopilot_activity"].get("candidate:,1"), 1)
+
+        by_sig = {item["signature"]: item for item in report["recurring_patterns"]}
+        self.assertIn("继续", by_sig)
+        self.assertEqual(by_sig["继续"]["count"], 3)
+        self.assertEqual(by_sig["继续"]["category"], "continue_nudge")
+        self.assertEqual(by_sig["继续"]["agents"], ["antigravity", "codex", "cursor"])
+
+        triage_sig = "triage issue <id> in <path>"
+        self.assertIn(triage_sig, by_sig)
+        self.assertEqual(by_sig[triage_sig]["count"], 2)
+        self.assertEqual(by_sig[triage_sig]["turn_role"], "entry")
+        self.assertEqual(by_sig[triage_sig]["suggested_automation"]["target"], "shortcuts.custom_entry")
+
+        deliver_sig = "合并当前分支到 main 并完成实跑验证"
+        self.assertIn(deliver_sig, by_sig)
+        self.assertEqual(by_sig[deliver_sig]["category"], "deliver_and_verify")
+
+        cli_out = self.cli("distill", "--home-dir", str(home), "--days", "7", "--max-sessions", "10")
+        self.assertEqual(cli_out["schema"], "the-pilot-distillation/v1")
+        self.assertTrue(cli_out["recommendations"])
+        self.cli("distill", "--home-dir", str(home), "--days", "0", ok=False)
+
 

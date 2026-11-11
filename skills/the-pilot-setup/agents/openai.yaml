@@ -1,4 +1,4 @@
 interface:
   display_name: "The Pilot Setup"
-  short_description: "Install, customize, upgrade, inspect, or remove The Pilot across four dimensions"
-  default_prompt: "Use $the-pilot-setup to install or customize The Pilot across orchestration, autopilot, scenes, and shortcuts."
+  short_description: "Install, distill 7-day agent chat patterns, customize, or upgrade The Pilot"
+  default_prompt: "Use $the-pilot-setup to distill my recent agent chat history and configure The Pilot across orchestration, autopilot, scenes, and shortcuts."

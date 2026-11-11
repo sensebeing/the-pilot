@@ -21,6 +21,7 @@ import tempfile
 from typing import Any
 
 from . import compiler as profile_compiler
+from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .profile import resolve_profile, validate_profile
 from .project import normalize_project
 from .defaults import DEFAULT_SPECS, MODES, DELIVER_STRATEGIES
@@ -50,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "probe":
             result = probe(args)
+        elif args.command == "distill":
+            result = distill(args)
         elif args.command == "apply":
             result = apply(args)
         elif args.command == "status":
@@ -77,6 +80,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe_parser = subparsers.add_parser("probe", help="只读探测本机环境与已有安装")
     add_common_arguments(probe_parser)
+
+    distill_parser = subparsers.add_parser(
+        "distill",
+        help="只读扫描近期多 Agent 聊天记录，提炼重复输入模式与场景自动化建议",
+    )
+    add_common_arguments(distill_parser)
+    distill_parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help=f"扫描最近 N 天的聊天记录（默认 {DEFAULT_DAYS}）",
+    )
+    distill_parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=DEFAULT_MAX_SESSIONS,
+        help=f"每个 Agent 产品最多抽样的最近会话数（默认 {DEFAULT_MAX_SESSIONS}）",
+    )
+    distill_parser.add_argument(
+        "--home-dir",
+        default=str(Path.home()),
+        help="用户主目录（用于定位 ~/.claude、~/.codex、~/.cursor 与 ~/.gemini）",
+    )
 
     apply_parser = subparsers.add_parser("apply", help="编译并原子写入配置")
     add_common_arguments(apply_parser)
@@ -163,6 +189,17 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
         except profile_compiler.ProfileError as exc:
             report["installed_profile_error"] = str(exc)
     return report
+
+
+def distill(args: argparse.Namespace) -> dict[str, Any]:
+    gemini_dir = gemini_dir_for(args)
+    home_dir = Path(os.path.expanduser(args.home_dir)).resolve()
+    return distill_chat_history(
+        home_dir,
+        gemini_dir,
+        days=args.days,
+        max_sessions_per_agent=args.max_sessions,
+    )
 
 
 def apply(args: argparse.Namespace) -> dict[str, Any]:
@@ -590,8 +627,21 @@ def print_human(command: str, result: dict[str, Any]) -> None:
         print(f"installed: {result['installed']}")
         if "mode" in result:
             print(f"mode: {result['mode']}  max_turns: {result['max_consecutive_auto_turns']}")
-            print("scenes: " + (", ".join(result["scenes"]) or "（无）"))
+            print("scenes: " + (", ".join(result['scenes']) or "（无）"))
         print("drift: " + ("none" if not result["drift"] else "; ".join(result["drift"])))
+    elif command == "distill":
+        totals = result["totals"]
+        print(
+            f"window_days: {result['window_days']}  "
+            f"human_messages: {totals['human_messages']}  "
+            f"manual_messages: {totals['manual_messages']}"
+        )
+        print("sources: " + ", ".join(
+            f"{agent}(sampled={info['sampled_files']}/{info['discovered_files']}, msgs={info['human_messages']})"
+            for agent, info in result["sources"].items()
+        ))
+        for item in result["recurring_patterns"][:10]:
+            print(f"[{item['count']}x][{item['category']}] {item['signature']}")
     else:
         print("removed: " + (", ".join(result["removed"]) or "（无）"))
         if result["preserved"]:

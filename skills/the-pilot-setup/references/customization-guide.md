@@ -29,7 +29,10 @@ A project may override these presets. User overrides are applied last.
 
 `pilot apply --help` lists individual override flags. `--profile` accepts inline
 JSON, a file, or `@file`; `--upgrade` uses installed preferences and cannot be
-combined with `--profile`. Use `pilot set` for durable template edits.
+combined with `--profile`. Use `pilot set` for durable template edits, and
+`pilot distill --days 7 --json` (see [distillation-guide.md](distillation-guide.md))
+to discover repeated user prompt patterns across local coding agents before
+proposing custom shortcuts or scene guardrails.
 
 ## Safety and repair
 

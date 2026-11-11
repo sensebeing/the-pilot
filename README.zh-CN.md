@@ -28,7 +28,7 @@
 请为我的开发环境安装并配置 https://github.com/sensebeing/the-pilot。
 安装 CLI（`uv tool install git+https://github.com/sensebeing/the-pilot` 或 `python3 -m pip install git+https://github.com/sensebeing/the-pilot`），
 安装技能（`npx skills add sensebeing/the-pilot --global --agent '*'` 或从本地检出目录创建软链），
-然后按 skills/the-pilot-setup/SKILL.md 引导我确认四维偏好（若当前仓库含 .pilot/project.json 则带上 --project）并完成 pilot status 验证。
+然后按 skills/the-pilot-setup/SKILL.md 运行 `pilot distill --days 7 --json` 分析我最近 7 天的多 Agent 聊天记录，给出场景与快捷口令建议、确认四维偏好并完成 pilot status 验证。
 ```
 
 ## 为什么做这个工具
@@ -70,9 +70,12 @@ CLI 无外部运行时依赖；终端预填与自动回车依赖 Orca 以及兼�
 
 ```sh
 pilot probe --no-project --json
+pilot distill --days 7 --json
 pilot apply --no-project --preset recommended --json
 pilot status --json
 ```
+
+`pilot distill --days 7 --json` 会只读扫描最近 7 天本机常用编码 Agent（Antigravity、Claude Code、Codex 与 Cursor）的聊天记录，过滤机器派发噪声，提炼重复出现的手动输入模式并给出场景、质量底线与快捷口令建议。
 
 如果当前仓库带有 `<repo>/.pilot/project.json` 项目扩展配置，可在安装时一并绑定：
 
@@ -187,6 +190,7 @@ pilot apply --no-project --json    # 解除项目扩展绑定，恢复通用默�
 | 命令 | 用途 |
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | 只读探测已安装的个人偏好、项目扩展与本机可用的 Agent CLI（`codex`、`claude`、`agy`）。 |
+| `pilot distill [--days 7] [--max-sessions 80] --json` | 只读扫描最近 N 天多 Agent 聊天记录（`antigravity`、`claude`、`codex`、`cursor`），提炼重复输入模式与场景、口令自动化建议。 |
 | `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `autopilot.py`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块与 Hook 组。 |
 | `pilot status [--project <repo>] --json` | 检查安装完整性、当前模式、执行器优先级与字节级产物漂移（`drift: []`）。 |
 | `pilot uninstall --json` | 移除托管文件、`GEMINI.md` 托管块与 Hook 条目，保留用户其他配置。 |

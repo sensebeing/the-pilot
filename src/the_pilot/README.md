@@ -4,6 +4,7 @@
 - `project.py`: pure overlay validation and composition; no filesystem access.
 - `profile.py`: durable user preference normalization and preset resolution.
 - `compiler.py`: pure rendering and managed-document merges; no IO.
+- `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs.
 - `installer.py`: project discovery, installation lock and atomic file writes.
 - `assets/autopilot.py`: the single runtime owner, copied unchanged on install.
 - `runtime.py`: subprocess adapter to the installed runtime (no second engine).

@@ -1,4 +1,4 @@
 interface:
   display_name: "The Pilot"
-  short_description: "Operate scene-based Turn Autopilot, switch modes or workers, and manage shortcuts"
-  default_prompt: "Use $the-pilot to inspect Turn Autopilot status, switch modes or worker priority, and manage shortcuts."
+  short_description: "Operate Turn Autopilot, distill 7-day chat patterns, and manage shortcuts"
+  default_prompt: "Use $the-pilot to inspect Turn Autopilot status, distill recent chat patterns, switch modes or workers, and manage shortcuts."
