@@ -328,7 +328,13 @@ class ProjectTest(unittest.TestCase):
             json.dumps({
                 "type": "response_item",
                 "timestamp": recent_iso,
-                "payload": {"role": "user", "content": [{"type": "input_text", "text": "合并当前分支到 main 并完成实跑验证"}]},
+                "payload": {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "合并当前分支到 main 并完成实跑验证"},
+                        {"type": "input_text", "text": "<skill>\n<name>the-pilot</name>\n</skill>"},
+                    ],
+                },
             }),
             json.dumps({
                 "type": "event_msg",

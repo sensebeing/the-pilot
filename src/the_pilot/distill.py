@@ -42,6 +42,11 @@ MACHINE_PREFIXES = (
     "<environment_context>",
     "<permissions instructions>",
     "# AGENTS.md instructions",
+    "<task-notification>",
+    "<skill>",
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
 )
 
 CONTINUE_NUDGES = frozenset({
@@ -893,12 +898,19 @@ def _extract_claude_content(message: Any) -> str:
 def _extract_codex_text_blocks(content: Any) -> str:
     if not isinstance(content, list):
         return ""
-    parts = [
-        str(block.get("text") or "").strip()
-        for block in content
-        if isinstance(block, dict) and block.get("type") in ("input_text", "output_text", "text")
-    ]
-    return "\n".join(p for p in parts if p).strip()
+    all_parts: list[str] = []
+    human_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in ("input_text", "output_text", "text"):
+            continue
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        all_parts.append(text)
+        if not _is_machine_message(text):
+            human_parts.append(text)
+    selected = human_parts if human_parts else all_parts
+    return "\n".join(selected).strip()
 
 
 def _extract_autopilot_tag(text: str) -> dict[str, Any] | None:
