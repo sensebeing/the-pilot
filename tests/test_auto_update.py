@@ -1,6 +1,7 @@
 """Focused contracts for the zero-touch update paths."""
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -355,7 +356,6 @@ class AutoUpdateTest(unittest.TestCase):
             home = root / "home"
             checkout = home / "the-pilot"
             checkout.mkdir(parents=True)
-            shutil = __import__("shutil")
             shutil.copytree(Path(__file__).parents[1] / "src", checkout / "src")
             shutil.copytree(Path(__file__).parents[1] / "bin", checkout / "bin")
             subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
@@ -396,7 +396,6 @@ class AutoUpdateTest(unittest.TestCase):
             root = Path(root)
             home, gemini = root / "home", root / "gemini"
             checkout = home / "the-pilot"
-            shutil = __import__("shutil")
             shutil.copytree(Path(__file__).parents[1], checkout, ignore=shutil.ignore_patterns(".git", ".venv"))
             subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.com"], check=True)
@@ -434,11 +433,34 @@ class AutoUpdateTest(unittest.TestCase):
             source = Path(__file__).parents[1] / "src/the_pilot/assets/autopilot.py"
             engine = autopilot_dir / "autopilot.py"
             engine.write_bytes(source.read_bytes())
-            marker = "\n# reexec marker\n"
-            payload = {"conversationId": "c", "lastUserInput": ",mode status", "workspacePaths": []}
-            with mock.patch.object(autopilot, "AUTOPILOT_DIR", autopilot_dir), mock.patch.object(autopilot, "GEMINI_DIR", gemini), mock.patch.object(autopilot, "maybe_sync_project_overlay", side_effect=lambda _payload: engine.write_text(engine.read_text() + marker)), mock.patch.object(autopilot, "maybe_trigger_auto_update"), mock.patch.object(autopilot, "is_first_invocation_of_turn", return_value=True), mock.patch.object(autopilot, "read_steps", return_value=([], True)), mock.patch.object(autopilot.subprocess, "run") as run:
-                run.return_value = mock.Mock(returncode=0, stdout='{"reexec":true}', stderr="")
-                result = autopilot.handle_pre_invocation(payload)
-            self.assertEqual(result, {"reexec": True})
-            self.assertTrue(any(call.kwargs.get("env", {}).get("ORCA_AUTOPILOT_REEXEC") == "1" for call in run.call_args_list))
+            installer.apply(installer.build_parser().parse_args(["apply", "--gemini-dir", str(gemini), "--no-project", "--json"]))
+            shim = root / "pilot-shim.py"
+            shim.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "if sys.argv[1:3] == ['self-update', '--project-only']:\n"
+                "    d = pathlib.Path(os.environ['ORCA_AUTOPILOT_GEMINI_DIR']) / 'config/autopilot'\n"
+                "    (d / 'autopilot.py').write_text((d / 'autopilot.py').read_text() + '\\n# upgraded\\n')\n"
+                "    config = json.loads((d / 'config.json').read_text())\n"
+                "    config['entry_shortcuts']['ping'] = {'template': 'upgraded shortcut body', 'requires_arg': False}\n"
+                "    (d / 'config.json').write_text(json.dumps(config))\n"
+                "    print(json.dumps({'local_source_status': 'updated'}))\n"
+                "else:\n"
+                "    print(json.dumps({}))\n"
+            )
+            shim.chmod(0o755)
+            payload = {"conversationId": "c", "lastUserInput": "ping", "workspacePaths": []}
+            env = {
+                **os.environ,
+                "HOME": str(root / "home"),
+                "ORCA_AUTOPILOT_GEMINI_DIR": str(gemini),
+                "ORCA_AUTOPILOT_PILOT_BIN": str(shim),
+                "ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE": "1",
+            }
+            result = subprocess.run(
+                [sys.executable, str(engine), "hook", "--event", "PreInvocation"],
+                input=json.dumps(payload), text=True, capture_output=True, env=env, check=True,
+            )
+            receipt = json.loads(result.stdout)
+            self.assertIn("upgraded shortcut body", json.dumps(receipt, ensure_ascii=False))
 
