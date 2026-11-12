@@ -72,17 +72,22 @@ class ProjectTest(unittest.TestCase):
                                      "confirm" if preset == "conservative" else "gate")
                     self.assertEqual(bundle.profile_json["scenes"]["deliver_strategy"], strategy)
                     self.assertEqual(bundle.profile_json["scenes"]["enable_feedback_email"], feedback)
+                    self.assertEqual(bundle.config_json["entry_shortcuts"]["r"]["command_id"], "CMD_MOD_REVIEW")
+                    self.assertEqual(bundle.config_json["entry_shortcuts"]["r"]["canonical_key"], "r")
+                    self.assertEqual(bundle.config_json["entry_shortcuts"]["r"]["usage"], "r <module>")
                     self.assertEqual(set(bundle.scenes), {
                         DEFAULT_SPECS["scene_specs"][name]["file"]
                         for name in SCENE_ORDER
                     })
                     self.assertTrue(all("{{" not in text for text in (*bundle.scenes.values(), bundle.gemini_block)))
                     self.assertTrue(bundle.gemini_block.startswith("<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"))
+                    self.assertIn("<!-- END AUTOPILOT SCENES -->", bundle.gemini_block)
+                    self.assertIn("<!-- autopilot: scene=NONE -->", bundle.gemini_block)
                     self.assertTrue(bundle.gemini_block.endswith("\n"))
-                    self.assertEqual(
-                        merge_hooks_json({"other": {"hooks": []}}, "/pilot/autopilot.py")["other"],
-                        {"hooks": []},
-                    )
+                    hooks = merge_hooks_json({"other": {"hooks": []}}, "/pilot/autopilot.py")
+                    self.assertEqual(hooks["other"], {"hooks": []})
+                    self.assertIn("orca-agy-autopilot", hooks)
+                    self.assertIn("/pilot/autopilot.py", json.dumps(hooks["orca-agy-autopilot"]))
         original = copy.deepcopy(self.project)
         def compile_for(project):
             profile = resolve_profile(self.base, project=project)
