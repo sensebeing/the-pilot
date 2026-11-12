@@ -1501,15 +1501,19 @@ def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
     """Return whether a final planner reply stops at a question lead-in.
 
     Long Antigravity answers can end right after `请确认以下 2 个问题：`
-    without ever emitting the question tool call. Only a complete planner
-    response whose last non-code-fence line ends with a colon proves that
-    shape; a truncated prefix ending in a colon is never evidence.
+    without ever emitting the question tool call. Both `content` and
+    `tool_calls` must be complete (`TRUNCATING_STEP_FIELDS` must not intersect
+    the step) and `tool_calls`, when present, must be a real list; only then
+    does a last non-code-fence line ending with a colon prove that shape. A
+    truncated prefix ending in a colon is never evidence.
     """
     if planner_step.get("type") != "PLANNER_RESPONSE":
         return False
     if planner_step.get("tool_calls"):
         return False
-    if "content" in _truncated_fields(planner_step):
+    if TRUNCATING_STEP_FIELDS.intersection(_truncated_fields(planner_step)):
+        return False
+    if "tool_calls" in planner_step and not isinstance(planner_step.get("tool_calls"), list):
         return False
     content = planner_step.get("content")
     if not isinstance(content, str):

@@ -1931,27 +1931,68 @@ class EngineTest(unittest.TestCase):
         )
 
     def test_unasked_question_guard_fails_closed_without_complete_content(self) -> None:
-        # Failure means a truncated prefix ending in a colon is guessed into a
-        # continuation instead of failing closed and clearing the suggestion.
-        truncated = self.stop_decision(
-            "c-truncated-lead",
-            [
-                {"type": "USER_INPUT", "content": "开始"},
+        # Failure means incomplete or malformed transcript evidence (a
+        # truncated field or non-list tool_calls) is trusted as proof that the
+        # model meant to ask, fabricating a continuation from an unknown state.
+        cases = (
+            (
+                "content",
                 {
-                    "type": "PLANNER_RESPONSE",
                     "content": "请确认以下 2 个问题：",
                     "truncated_fields": ["content"],
                 },
-            ],
+            ),
+            (
+                "tool-calls-empty",
+                {
+                    "content": "请确认以下 2 个问题：",
+                    "tool_calls": [],
+                    "truncated_fields": ["tool_calls"],
+                },
+            ),
+            (
+                "tool-calls-omitted",
+                {
+                    "content": "请确认以下 2 个问题：",
+                    "truncated_fields": ["tool_calls"],
+                },
+            ),
+            (
+                "tool-calls-string",
+                {
+                    "content": "请确认以下 2 个问题：",
+                    "tool_calls": "truncated",
+                    "truncated_fields": ["tool_calls"],
+                },
+            ),
+            (
+                "tool-calls-empty-string",
+                {
+                    "content": "请确认以下 2 个问题：",
+                    "tool_calls": "",
+                },
+            ),
         )
-        self.assertEqual(truncated["decision"], "allow")
-        self.assertNotIn(
-            "continued_unasked_turn_id", read_state(self.state, "c-truncated-lead")
-        )
-        self.assertIn(
-            '"event": "stop_invalid_tag", "cid": "c-truncated-lead", "reason": "missing_tag"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
-        )
+        log_path = self.state / "autopilot.log"
+        for label, fields in cases:
+            with self.subTest(case=label):
+                session = f"c-truncated-{label}"
+                decision = self.stop_decision(
+                    session,
+                    [
+                        {"type": "USER_INPUT", "content": "开始"},
+                        {"type": "PLANNER_RESPONSE", **fields},
+                    ],
+                )
+                self.assertEqual(decision["decision"], "allow")
+                self.assertNotIn(
+                    "continued_unasked_turn_id", read_state(self.state, session)
+                )
+                self.assertIn(
+                    f'"event": "stop_invalid_tag", "cid": "{session}", '
+                    '"reason": "missing_tag"',
+                    log_path.read_text(encoding="utf-8"),
+                )
 
     def test_unasked_question_guard_is_silent_for_dispatched_workers(self) -> None:
         # Failure means a worker turn ending on a colon is force-continued or
