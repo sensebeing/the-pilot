@@ -409,7 +409,7 @@ def _discover_checkout(explicit: str | None, *, home_dir: Path | None = None) ->
             raise SetupError(f"Checkout directory is not a Git repository: {path}")
         return path, True
     if home_dir is not None and home_dir.expanduser().resolve() != Path.home().resolve():
-        candidates = [home_dir.expanduser() / "the-pilot"]
+        candidates = [home_dir.expanduser() / "the-pilot", SCRIPTS_DIR.parents[1], Path.home() / "the-pilot"]
     else:
         candidates = [SCRIPTS_DIR.parents[1], Path.home() / "the-pilot"]
     for path in candidates:
@@ -721,9 +721,11 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     is_real_home = home_dir.resolve() == Path.home().resolve()
                     has_installed_pilot = pilot_bin.exists() or (is_real_home and bool(shutil.which("pilot")))
                     manages_uv_tool = not explicit and bool(shutil.which("uv")) and has_installed_pilot
-                    installed_ok = not manages_uv_tool or not uv_needs_reinstall
+                    installed_ok = not uv_needs_reinstall
                     if manages_uv_tool and uv_needs_reinstall:
                         subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
+                        installed_ok = True
+                    elif not manages_uv_tool and not explicit and _installed_uv_package_dir(home_dir) is None:
                         installed_ok = True
                     if installed_ok:
                         report["installed_sha"] = after_sha
