@@ -617,7 +617,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         result = {
             "status": "none",
             "source_status": "skipped_project_only",
-            "project_status": project_status,
+            "project_status": "none",
             "local_source_status": "none",
             "head_sha": None,
             "synced_skills": [],
