@@ -224,8 +224,8 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                        'body': '## 收尾清单\n'
                                                '\n'
                                                '1. 同步本任务设计、契约与操作文档，记录尚未完成的义务及其 owner。\n'
-                                               '2. 完成已授权且证据充分的结案操作；外部发送仍遵循当前授权。对已认领 dev 反馈，根因修复合入 main 且目标 dev 验证完成后，Autopilot closeout-and-sync 将 resolved 结案及 enable_feedback_email=true 的标准英文验证通知视为 A 类确定性收尾（gate=auto）；尚有此类义务未清时必须路由到 closeout-and-sync，自动生成并推进 ,1，严禁因正文反问确认而输出 scene=NONE 或 gate=pause。\n'
-                                               '{{FEEDBACK_CLOSEOUT_BLOCK}}\n'                                               '   - 尚未结清已授权反馈结案、通知或工作区收尾义务时，必须保持 scene=closeout-and-sync、gate=auto，预填并自动推进 ,1；不得在正文反问是否确认完成，也不得输出 scene=NONE 或 gate=pause。\n'
+                                               '2. 完成已授权且证据充分的结案操作；外部发送仍遵循当前授权。当尚有已授权的结案、通知或工作区释放义务未在本轮直接执行完毕时，必须路由到 closeout-and-sync 并标 gate=auto，生成并自动推进 ,1；严禁在正文反问确认并输出 scene=NONE 或 gate=pause。\n'
+                                               '{{FEEDBACK_CLOSEOUT_BLOCK}}\n'
                                                '3. 释放受控 Orca worker，按项目生命周期清理工作区；保留共享工作区和归属不明的文件。\n'
                                                '4. 将已授权改动交付到目标分支；全部义务结清后输出 `<!-- autopilot: '
                                                'scene=NONE -->`。\n'
@@ -300,7 +300,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                            're_review_progress': '按当前实际交付状态给出「合入 main → 本地实跑验收 → '
                                                                  '整体报告」的指令（不发布 dev、不执行 '
                                                                  'E2E），方便用户确认无需再审时一键 `,2` 进入交付。'}},
- 'feedback_closeout': {'false': {'block': '   - Dev 反馈已授权从 claim、根因修复、dev 部署与定向 dev E2E 到 closeout-and-sync；验证通过后 gate=auto 自动标记 resolved 并同步收尾，不反问确认；,2 提供标记完成并发送标准英文通知邮件入口。\n', 'examples': '- **,1（主推）**：`自动标记反馈完成并同步文档与工作区收尾`', 'trigger': ''},
-                       'true': {'block': '   - Dev 反馈已授权从 claim、根因修复、dev 部署与定向 dev E2E 到 closeout-and-sync；复审与验证通过后 gate=auto 自动标记 resolved，完成 review_verification_email + fill_batch_email_copy 校验并发送标准英文通知邮件，禁止反问确认；,2 仅标记完成并暂不发信。\n',
-                                'examples': '- **,1（主推）**：`自动标记反馈完成并直接发英文通知邮件，同时同步文档与工作区收尾`',
-                                'trigger': '或反馈发信'}}}
+ 'feedback_closeout': {'false': {'block': '', 'examples': '', 'trigger': ''},
+                       'true': {'block': '   - 在已启用反馈通知授权的范围内，验证通过后按 gate=auto 自动完成结案与通知闭环，禁止在正文反问确认后输出 scene=NONE 或 gate=pause；缺少证据时等待用户。\n',
+                                'examples': '',
+                                'trigger': ''}}}
