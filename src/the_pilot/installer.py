@@ -684,7 +684,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 result["error"] = str(exc)
         return result
     report: dict[str, Any] = {
-        "last_checked_at": time.time(), "last_updated_at": None,
+        "last_checked_at": None if getattr(args, "local_only", False) else time.time(), "last_updated_at": None,
         "status": "failed", "source_status": "failed", "project_status": "none",
         "head_sha": None, "synced_skills": [], "error": None,
     }
