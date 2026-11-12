@@ -3190,8 +3190,10 @@ class EngineTest(unittest.TestCase):
         )
 
     def test_corrupt_profile_fails_closed_across_commands_and_hooks(self) -> None:
-        """Failure means a corrupt profile degrades into empty preferences.
+        """Verify that corrupt profile.json fails closed with exit code 2 and diagnostics across CLI commands and hooks.
 
+        If this test fails, a corrupt profile may be treated as empty
+        preferences or a hook may act without surfacing the failure.
         resident-fact: fail-closed: a corrupt profile.json makes status, mode,
         worker, sync and both hooks exit 2 with diagnostics, while the
         session's loaded worker list stays intact and nothing is sent.
@@ -3250,8 +3252,10 @@ class EngineTest(unittest.TestCase):
         self.assertIn("stop_config_corrupt", log)
 
     def test_corrupt_config_fails_closed_in_status_set_and_pre_invocation(self) -> None:
-        """Failure means a corrupt config degrades into default shortcuts.
+        """Verify that corrupt config.json fails closed with exit code 2 and diagnostics in status, set and PreInvocation.
 
+        If this test fails, a corrupt config may be treated as default
+        shortcuts or a failed write may proceed against unreadable data.
         resident-fact: fail-closed: a corrupt config.json makes status, set and
         PreInvocation exit 2 with diagnostics, leaves the installed config
         untouched, and preserves the session's loaded worker list.
@@ -3289,9 +3293,118 @@ class EngineTest(unittest.TestCase):
         log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("pre_invocation_config_corrupt", log)
 
-    def test_unreadable_scene_fails_closed_across_commands_and_hooks(self) -> None:
-        """Failure means an unreadable scene file is silently dropped from routing.
+    def test_missing_profile_and_config_are_distinct_from_empty_object_and_fail_closed(self) -> None:
+        """Verify that absent profile/config files are reported as missing, not as empty configuration.
 
+        If this test fails, status, mode, worker or the hooks may silently treat
+        absent installed configuration as valid empty defaults.
+        resident-fact: fail-closed: an on-disk {} profile is valid ("ok"), while
+        a missing profile or config reports "missing", exits 2 with null mode,
+        and refuses hooks with config_missing and zero terminal sends.
+        """
+        profile_path = self.gemini / PROFILE_REL
+        config_path = self.gemini / CONFIG_REL
+        valid_profile = profile_path.read_bytes()
+        write_json(profile_path, {})
+
+        empty_profile = run_engine(
+            self.root, self.gemini, self.state, "status", "--json"
+        )
+        self.assertEqual(empty_profile.returncode, 0, empty_profile.stderr)
+        empty_report = json.loads(empty_profile.stdout)
+        self.assertEqual(empty_report["profile_status"], "ok")
+        self.assertTrue(empty_report["ok"])
+
+        profile_path.unlink()
+        missing_profile = run_engine(
+            self.root, self.gemini, self.state, "status", "--json"
+        )
+        self.assertEqual(missing_profile.returncode, 2)
+        report = json.loads(missing_profile.stdout)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["installed"])
+        self.assertEqual(report["profile_status"], "missing")
+        self.assertIsNone(report["mode"])
+        self.assertEqual(report["worker_agents"], [])
+        self.assertIsNone(report["max_consecutive_auto_turns"])
+
+        mode = run_engine(self.root, self.gemini, self.state, "mode", "status")
+        self.assertEqual(mode.returncode, 2)
+        self.assertIn("未安装（缺少 profile.json）", mode.stderr)
+
+        worker = run_engine(
+            self.root, self.gemini, self.state, "worker", "status", "--json"
+        )
+        self.assertEqual(worker.returncode, 2)
+        worker_report = json.loads(worker.stdout)
+        self.assertFalse(worker_report["ok"])
+        self.assertEqual(worker_report["status"], "missing")
+
+        pre = self.pre("c-missing-profile", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_missing")
+        self.assertFalse(state_path(self.state, "c-missing-profile").exists())
+
+        stop = self.stop("c-missing-profile", suggestion("继续推进", gate="auto"))
+        self.assertEqual(stop.returncode, 2)
+        self.assertEqual(stop.stdout, "")
+        self.assertEqual(json.loads(stop.stderr)["error"], "config_missing")
+        self.assertEqual(send_calls(self.root), [])
+
+        profile_path.write_bytes(valid_profile)
+        config_path.unlink()
+        missing_config = run_engine(
+            self.root, self.gemini, self.state, "status", "--json"
+        )
+        self.assertEqual(missing_config.returncode, 2)
+        config_report = json.loads(missing_config.stdout)
+        self.assertFalse(config_report["installed"])
+        self.assertEqual(config_report["config_status"], "missing")
+        self.assertEqual(config_report["entry_shortcuts"], [])
+        self.assertEqual(config_report["comma_commands"], [])
+
+        pre = self.pre("c-missing-config", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_missing")
+        self.assertEqual(send_calls(self.root), [])
+
+    def test_corrupt_session_recovery_requires_valid_installed_configuration(self) -> None:
+        """Verify that ,pilot recover refuses a corrupt session while the installed profile is corrupt.
+
+        If this test fails, recovery may certify automatic delivery against an
+        unreadable profile or overwrite and back up a corrupt session file anyway.
+        resident-fact: fail-closed: config corruption is reported before session
+        recovery, leaves the corrupt session untouched, and recovery succeeds
+        once the profile is valid again.
+        """
+        conversation_id = "c-recover-corrupt"
+        session = state_path(self.state, conversation_id)
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_bytes(b"{broken")
+        profile_path = self.gemini / PROFILE_REL
+        valid_profile = profile_path.read_bytes()
+        profile_path.write_bytes(b"{broken")
+
+        refused = self.pre(conversation_id, ",pilot recover")
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused.stdout, "")
+        self.assertEqual(json.loads(refused.stderr)["error"], "config_corrupt")
+        self.assertEqual(session.read_bytes(), b"{broken")
+        self.assertEqual(
+            list(session.parent.glob(session.name + ".corrupt-*")), []
+        )
+
+        profile_path.write_bytes(valid_profile)
+        recovered = self.pre(conversation_id, ",pilot recover")
+        self.assertIn("状态已恢复", self.injection(recovered))
+        self.assertNotEqual(session.read_bytes(), b"{broken")
+
+    def test_unreadable_scene_fails_closed_across_commands_and_hooks(self) -> None:
+        """Verify that an unreadable scene file fails closed with exit code 2 across CLI commands and hooks.
+
+        If this test fails, routing may proceed with an incomplete scene set or
+        an unreadable scene may be silently omitted from status and sync.
         resident-fact: fail-closed: an unreadable scene file makes status, sync,
         PreInvocation (including `,mode status`) and Stop exit 2, and Stop
         refuses to deliver against an incomplete scene set.
@@ -3335,8 +3448,10 @@ class EngineTest(unittest.TestCase):
         self.assertIn("stop_config_corrupt", log)
 
     def test_hook_rejects_invalid_payload_and_internal_errors(self) -> None:
-        """Failure means a broken hook input or runtime bug exits 0 as a no-op.
+        """Verify that malformed hook payloads and internal failures exit 2 with structured JSON errors.
 
+        If this test fails, a broken hook input or runtime bug may exit 0 as a
+        fake allow/no-op instead of surfacing the failure.
         resident-fact: observability: invalid hook payloads and internal
         exceptions exit 2 with a structured JSON error instead of a fake
         allow, and both shapes are recorded in the runtime log.
