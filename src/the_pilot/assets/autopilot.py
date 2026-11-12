@@ -237,7 +237,7 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
     except ValueError as exc:
         log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
         return
-    if isinstance(receipt, dict) and (receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated"):
+    if isinstance(receipt, dict) and not receipt.get("error") and (receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated"):
         log_event("project_auto_synced", workspace=workspace)
 
 

@@ -651,6 +651,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                             pilot_path = home_dir / ".local/bin/pilot"
                             is_real_home = home_dir.resolve() == Path.home().resolve()
                             has_installed_pilot = pilot_path.exists() or (is_real_home and bool(shutil.which("pilot")))
+                            existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
+                            atomic_write_text(state_dir / "auto_update.json", json_text(existing))
                             if uv_available and has_installed_pilot:
                                 try:
                                     elapsed = time.time() - float(existing.get("last_checked_at") or 0)
@@ -663,9 +665,9 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                                         subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                                     except OSError as exc:
                                         result["error"] = str(exc)
-                            else:
-                                existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
-                                atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+                        else:
+                            # No uv bundle is present; the runtime files are already current.
+                            pass
             except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
                 result["error"] = str(exc)
         return result
@@ -715,10 +717,13 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     pilot_bin = home_dir / ".local/bin/pilot"
                     is_real_home = home_dir.resolve() == Path.home().resolve()
                     has_installed_pilot = pilot_bin.exists() or (is_real_home and bool(shutil.which("pilot")))
+                    installed_ok = not uv_needs_reinstall
                     if uv_needs_reinstall and not explicit and shutil.which("uv") and has_installed_pilot:
                         subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
-                    report["installed_sha"] = after_sha
-                    report["installed_tree_digest"] = checkout_digest
+                        installed_ok = True
+                    if installed_ok:
+                        report["installed_sha"] = after_sha
+                        report["installed_tree_digest"] = checkout_digest
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
             elif not explicit and shutil.which("uv"):
                 uv_out = subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
