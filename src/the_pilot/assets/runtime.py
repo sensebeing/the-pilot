@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -59,6 +60,9 @@ STATE_DIR = Path(
 ).expanduser()
 LOG_PATH = STATE_DIR / "pilot.log"
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 3600
+# The installer gives its own ``apply`` child 30 s; this outer deadline must be
+# longer so a legitimate repair always finishes before the hook may kill it.
+PROJECT_SYNC_TIMEOUT_SECONDS = 45
 _RUNNING_SCRIPT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
@@ -233,49 +237,89 @@ def _pilot_binary() -> str:
     return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else ""
 
 
-def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
+def _run_project_sync(command: list[str]) -> tuple[int, str, str] | None:
+    """Run one project sync and kill the whole process group if it overruns.
+
+    The updater may spawn an ``apply`` child that writes the installation. Its
+    own 30 s budget fits inside this deadline, so a healthy repair finishes; if
+    the updater still overruns, the group is killed so the caller can never
+    leave an orphaned writer behind.
+    """
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        log_event("project_auto_sync_failed", error=str(exc))
+        return None
+    try:
+        stdout, stderr = process.communicate(timeout=PROJECT_SYNC_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        process.kill()
+        process.communicate()
+        log_event("project_auto_sync_timeout")
+        return None
+    return process.returncode, stdout, stderr
+
+
+def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
+    """Sync the project overlay and report whether no repair is outstanding.
+
+    A ``False`` result means a repair was started but did not confirm
+    completion, so callers must not inspect or re-execute the installed engine
+    this turn.
+    """
     workspace_paths = payload.get("workspacePaths")
     if not isinstance(workspace_paths, list):
         workspace_paths = []
     if (_env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
             and _env_value("THE_PILOT_ENABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE") != "1"
             and not _env_value("THE_PILOT_BIN", "ORCA_AUTOPILOT_PILOT_BIN")):
-        return
+        return True
     pilot_bin = _pilot_binary()
     if not pilot_bin:
-        return
+        return True
     workspace = str(workspace_paths[0]) if workspace_paths else ""
     command = [pilot_bin, "self-update", "--project-only"]
     if workspace:
         command.extend(["--workspace", workspace])
     command.extend(["--home-dir", str(Path.home()), "--gemini-dir", str(GEMINI_DIR), "--json"])
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
-        return
-    if result.returncode != 0:
+    completed = _run_project_sync(command)
+    if completed is None:
+        log_event("project_auto_sync_failed", workspace=workspace, error="project_sync_incomplete")
+        return False
+    returncode, stdout, stderr = completed
+    if returncode != 0:
         log_event(
             "project_auto_sync_failed",
             workspace=workspace,
-            returncode=result.returncode,
-            error=(result.stderr or result.stdout).strip()[-300:],
+            returncode=returncode,
+            error=(stderr or stdout).strip()[-300:],
         )
-        return
+        return False
     try:
-        receipt = json.loads(result.stdout)
+        receipt = json.loads(stdout) if stdout.strip() else {}
     except ValueError as exc:
         log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
-        return
-    if isinstance(receipt, dict) and receipt.get("error"):
+        return False
+    if not isinstance(receipt, dict):
+        log_event("project_auto_sync_failed", workspace=workspace, error="receipt_not_object")
+        return False
+    if receipt.get("error"):
         log_event("project_auto_sync_failed", workspace=workspace, error=str(receipt["error"]))
-    elif isinstance(receipt, dict) and (receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated"):
+        return False
+    if receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated":
         log_event("project_auto_synced", workspace=workspace)
+    return True
 
 
 def maybe_trigger_auto_update() -> None:
@@ -1469,8 +1513,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
-    maybe_sync_project_overlay(payload)
-    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
+    sync_confirmed = maybe_sync_project_overlay(payload)
+    if sync_confirmed and _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
         updated_engine = PILOT_DIR / "runtime.py"
         try:
             changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
@@ -1486,18 +1530,24 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                     timeout=10,
                     env={**os.environ, "THE_PILOT_REEXEC": "1"},
                 )
-                if result.returncode == 0:
-                    try:
-                        return json.loads(result.stdout) if result.stdout.strip() else {}
-                    except ValueError as exc:
-                        log_event("engine_reexec_failed", error=str(exc))
-                        return {"error": "engine_reexec_invalid_output"}
-                else:
-                    log_event("engine_reexec_failed", returncode=result.returncode, error=(result.stderr or result.stdout).strip()[-300:])
-                    return {"error": "engine_reexec_failed"}
             except (OSError, subprocess.SubprocessError) as exc:
                 log_event("engine_reexec_failed", error=str(exc))
-                return {"error": "engine_reexec_failed"}
+                raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()[-300:]
+                log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
+                raise HookExecutionError("engine_reexec_failed", detail)
+            try:
+                output = json.loads(result.stdout) if result.stdout.strip() else {}
+            except ValueError as exc:
+                log_event("engine_reexec_failed", error=str(exc))
+                raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
+            if not isinstance(output, dict):
+                log_event("engine_reexec_failed", error="output_not_object")
+                raise HookExecutionError(
+                    "engine_reexec_invalid_output", "hook output must be a JSON object"
+                )
+            return output
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
