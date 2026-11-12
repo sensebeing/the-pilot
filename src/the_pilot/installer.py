@@ -140,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--home-dir", default=str(Path.home()), help="技能链接根目录")
     update_parser.add_argument("--workspace", help="workspace directory for project overlay synchronization")
     update_parser.add_argument("--project-only", action="store_true", help="仅同步 workspace project overlay")
+    update_parser.add_argument("--local-only", action="store_true", help="仅同步本地 checkout，不执行远端检查")
 
     uninstall_parser = subparsers.add_parser("uninstall", help="移除本工具写入的文件与 Hook 组")
     add_common_arguments(uninstall_parser)
@@ -649,7 +650,11 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                             result["head_sha"] = sha
                             existing["runtime_tree_digest"] = checkout_digest
                             atomic_write_text(state_dir / "auto_update.json", json_text(existing))
-                        uv_or_skills_stale = existing.get("installed_tree_digest") != checkout_digest
+                        package_dir = _installed_uv_package_dir(home_dir)
+                        uv_or_skills_stale = (
+                            existing.get("installed_tree_digest") != checkout_digest
+                            or (package_dir is not None and _compute_source_tree_digest(package_dir) != checkout_digest)
+                        )
                         if uv_or_skills_stale:
                             uv_available = bool(shutil.which("uv"))
                             pilot_path = home_dir / ".local/bin/pilot"
@@ -657,18 +662,22 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                             has_installed_pilot = pilot_path.exists() or (is_real_home and bool(shutil.which("pilot")))
                             if uv_available and has_installed_pilot:
                                 try:
-                                    elapsed = time.time() - float(existing.get("last_checked_at") or 0)
+                                    local_elapsed = time.time() - float(existing.get("last_local_sync_at") or 0)
                                 except (TypeError, ValueError):
-                                    elapsed = 30
-                                # Local runtime sync is zero-cooldown; detached remote checks retain the six-hour cadence.
-                                if elapsed >= 6 * 3600:
-                                    existing["last_checked_at"] = time.time()
+                                    local_elapsed = 30
+                                if local_elapsed >= 30:
+                                    previous_local_sync = existing.get("last_local_sync_at")
+                                    existing["last_local_sync_at"] = time.time()
                                     atomic_write_text(state_dir / "auto_update.json", json_text(existing))
                                     try:
-                                        subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                                        subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--local-only", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                                     except OSError as exc:
-                                        result["error"] = str(exc)
-                        else:
+                                        if previous_local_sync is None:
+                                            existing.pop("last_local_sync_at", None)
+                                        else:
+                                            existing["last_local_sync_at"] = previous_local_sync
+                                        atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+                            elif package_dir is None:
                                 existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
                                 atomic_write_text(state_dir / "auto_update.json", json_text(existing))
             except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -702,7 +711,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     before_sha = subprocess_run(
                         ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
                     ).strip()
-                    subprocess_run(["git", "-C", str(checkout), "pull", "--ff-only"], 20)
+                    if not getattr(args, "local_only", False):
+                        subprocess_run(["git", "-C", str(checkout), "pull", "--ff-only"], 20)
                     after_sha = subprocess_run(
                         ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
                     ).strip()
@@ -732,7 +742,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                         report["installed_sha"] = after_sha
                         report["installed_tree_digest"] = checkout_digest
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
-            elif not explicit and shutil.which("uv"):
+            elif not getattr(args, "local_only", False) and not explicit and shutil.which("uv"):
                 uv_out = subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
                 report["source_status"] = (
                     "up_to_date" if "nothing to upgrade" in uv_out.lower() else "updated"
