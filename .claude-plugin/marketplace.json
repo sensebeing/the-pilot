@@ -10,14 +10,14 @@
     {
       "name": "the-pilot",
       "source": "./",
-      "description": "Stop being a human relay for coding agents. Distill 7-day chat history and run a 4-stage Turn Autopilot so you focus on product and architecture.",
+      "description": "Stop being a human relay for coding agents. Distill 7-day chat history and run a 4-stage Turn Pilot so you focus on product and architecture.",
       "version": "0.1.0",
       "license": "MIT",
       "keywords": [
         "ai-coding",
         "coding-agents",
         "orca",
-        "turn-autopilot",
+        "turn-pilot",
         "workflow-automation"
       ]
     }

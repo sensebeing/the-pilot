@@ -80,11 +80,17 @@ def normalize_project(raw: Any) -> dict[str, Any]:
                     or not all(isinstance(v, str) for v in spec.values())):
                 raise ProfileError(f"Invalid template fields: {field}.{key}")
     for name, preset in specs["presets"].items():
-        if not isinstance(preset, dict) or set(preset) - {"orchestration", "autopilot", "scenes", "shortcuts"}:
+        if not isinstance(preset, dict) or set(preset) - {"orchestration", "pilot", "autopilot", "scenes", "shortcuts"}:
             raise ProfileError(f"Invalid preset: {name}")
         if not all(isinstance(value, dict) for value in preset.values()):
             raise ProfileError(f"Preset sections must be objects: {name}")
-    return copy.deepcopy(raw)
+    normalized = copy.deepcopy(raw)
+    for name, preset in (normalized.get("presets") or {}).items():
+        if "pilot" in preset and "autopilot" in preset:
+            raise ProfileError(f"project.presets.{name} 同时包含 pilot 与旧版 autopilot 段")
+        if "autopilot" in preset:
+            preset["pilot"] = preset.pop("autopilot")
+    return normalized
 
 
 def project_specs(project: dict[str, Any] | None = None) -> dict[str, Any]:

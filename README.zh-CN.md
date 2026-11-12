@@ -6,7 +6,7 @@
 [![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--pilot-black)](https://skills.sh/sensebeing/the-pilot)
 [![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-pilot?style=social)](https://github.com/sensebeing/the-pilot/stargazers)
 
-**Coding Agent 回合自动驾驶（Turn Autopilot）：自动生成填入输入框的建议、流程性步骤自动回车推进、遇到产品与工程判断停下来等确认、支持快捷命令一键展开。**
+**Coding Agent 回合自动驾驶（Turn Pilot）：自动生成填入输入框的建议、流程性步骤自动回车推进、遇到产品与工程判断停下来等确认、支持快捷命令一键展开。**
 
 平时用 Coding Agent 写代码，大多数回合结束时人都在做同一件事：读一遍总结，然后手动把下一句衔接指令打进输入框（“review 一下这个分支”、“合入 main 并发 dev”、“跑一下 E2E”、“清理工作区并更新文档”）。`the-pilot` 在终端里接管这些流程性操作，让你把精力放在产品和工程架构判断上。
 
@@ -98,14 +98,14 @@
    - 回复末尾输出唯一一行 HTML 注释标签，运行时仅用 `json.loads` 解析该标签：
 
 ```html
-<!-- autopilot: {"scene": "deliver-and-verify", "gate": "auto", "1": "合入 main 并发 dev，然后执行定向 E2E 测试", "2": "先合入 main 并发 dev 完成部署核验"} -->
+<!-- pilot: {"scene": "deliver-and-verify", "gate": "auto", "1": "合入 main 并发 dev，然后执行定向 E2E 测试", "2": "先合入 main 并发 dev 完成部署核验"} -->
 ```
 
-### 第三步：生命周期 Hook 确定性校验与投递（`autopilot.py`）
+### 第三步：生命周期 Hook 确定性校验与投递（`runtime.py`）
 
 ```mermaid
 flowchart TD
-    A["用户输入或快捷命令 (r / d / ,1 / ,2 / ,mode / ,worker)"] --> B["PreInvocation 钩子 (autopilot.py)"]
+    A["用户输入或快捷命令 (r / d / ,1 / ,2 / ,mode / ,worker)"] --> B["PreInvocation 钩子 (runtime.py)"]
     B --> C["展开快捷命令、切换候选指令或热加载 Worker 优先级"]
     C --> D["主会话执行回合（子工作区 Worker 自动静默跳过）"]
     D --> E["Stop 钩子：检查会话转录与末尾 JSON 标签"]
@@ -115,9 +115,9 @@ flowchart TD
     E -->|合法 JSON 标签 + gate 模式下 gate=auto 且未超上限| I["核验终端空闲证据后自动提交 ,1 到 Orca 终端"]
 ```
 
-1. **未答提问转录核验**：每次 `Stop` 事件触发时，`autopilot.py` 会读取会话转录（截断行自动从 `transcript_full.jsonl` 补齐），确认当前回合所有 `ask_question`、`AskUserQuestion`、`request_user_input` 均已拿到用户回答，否则绝不执行预填或自动回车。
-2. **零正则 JSON 标签扫描**：使用识别字符串引号状态的扫描器提取末尾 `<!-- autopilot: ... -->` 并调用 `json.loads`。标签缺失、重复或格式非法时一律按暂停处理。
-3. **文件锁幂等投递**：向 Orca 终端发送按键前，先在 `fcntl` 排他锁下记录 `pending` 投递预留状态。若 `orca terminal send` 超时或状态不明，自动冻结后续自动回车（直到用户手动输入或执行 `,autopilot recover`），防止重复发送。
+1. **未答提问转录核验**：每次 `Stop` 事件触发时，`runtime.py` 会读取会话转录（截断行自动从 `transcript_full.jsonl` 补齐），确认当前回合所有 `ask_question`、`AskUserQuestion`、`request_user_input` 均已拿到用户回答，否则绝不执行预填或自动回车。
+2. **零正则 JSON 标签扫描**：使用识别字符串引号状态的扫描器提取末尾 `<!-- pilot: ... -->` 并调用 `json.loads`。标签缺失、重复或格式非法时一律按暂停处理。
+3. **文件锁幂等投递**：向 Orca 终端发送按键前，先在 `fcntl` 排他锁下记录 `pending` 投递预留状态。若 `orca terminal send` 超时或状态不明，自动冻结后续自动回车（直到用户手动输入或执行 `,pilot recover`），防止重复发送。
 
 ---
 
@@ -174,18 +174,18 @@ pilot status --json
 
 ### 内置三档预设
 
-| 预设档位 | Autopilot 模式 | 连续自动轮数上限 | 启用场景 | 默认交付策略 | 默认口令 | 适用场景 |
+| 预设档位 | Pilot 模式 | 连续自动轮数上限 | 启用场景 | 默认交付策略 | 默认口令 | 适用场景 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `recommended` | `gate` | `8` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull`（含项目扩展） | 推荐默认：流程性阶段自动回车推进，遇到产品/架构裁决或生产发布暂停确认。 |
 | `conservative` | `confirm` | `4` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull`（含项目扩展） | 人工确认模式：每轮结束把建议预填到输入框，始终等待你按 `Enter` 发送。 |
 | `orchestration-only` | `off` | `4` | 无（`[]`） | `merge_dev_e2e` | 无（`[]`） | 仅启用 Orca 主从职责与分支隔离规范，关闭回合末自动预填。 |
 
-### 四维定制能力矩阵（`orca-autopilot-profile/v1`）
+### 四维定制能力矩阵（`the-pilot-profile/v1`）
 
 | 定制维度 | Profile 配置键 | 可选值与默认值 | 控制内容 |
 | --- | --- | --- | --- |
 | 1. 主从编排（Orchestration） | `worker_agents`<br>`review_agents` | 子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | 主会话（设计/Review）与子会话（分支编码）职责分离、父子工作区隔离与执行器优先级。 |
-| 2. 自动推进（Autopilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..50`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
+| 2. 自动推进（Pilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..50`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
 | 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | 交付策略：`merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线。 |
 | 4. 快捷口令（Shortcuts） | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | 通用口令：`r`、`rt`、`d`、`pull`<br>外加项目扩展口令与自定义 `,` 别名 | 在 `PreInvocation` 阶段将简短口令展开为完整的架构审查、设计或编排提示词。 |
 
@@ -220,10 +220,12 @@ pilot apply --no-project --json    # 解除项目扩展绑定，恢复通用默�
 
 接入后，`the-pilot` 通过两层非阻塞机制自动保持最新，无需手动触发升级：
 
-1. **6 小时冷却后台自更新**：在 `Stop` 钩子执行时，若距离上次检查已满 6 小时，`autopilot.py` 会在后台异步拉起 `pilot self-update --quiet`。当本机 `~/the-pilot` 处于干净 `main` 分支时自动执行 `git pull --ff-only`，检测到新提交后刷新 `uv` CLI、自愈全局技能软链（`~/.agents/skills`、`~/.claude/skills`、`~/.gemini/config/skills`），并在保留个人 `profile.json` 的前提下执行 `pilot apply --upgrade`。脏工作区或非 `main` 分支绝不改动。
+1. **6 小时冷却后台自更新**：在 `Stop` 钩子执行时，若距离上次检查已满 6 小时，`runtime.py` 会在后台异步拉起 `pilot self-update --quiet`。当本机 `~/the-pilot` 处于干净 `main` 分支时自动执行 `git pull --ff-only`，检测到新提交后刷新 `uv` CLI、自愈全局技能软链（`~/.agents/skills`、`~/.claude/skills`、`~/.gemini/config/skills`），并在保留个人 `profile.json` 的前提下执行 `pilot apply --upgrade`。脏工作区或非 `main` 分支绝不改动。
 2. **当前工作区 `.pilot/project.json` 变更热同步**：当检测到当前工作区的 `.pilot/project.json` 发生哈希变化时，后台自动触发 `pilot self-update --project-only --workspace <cwd>`，使项目新增口令或场景规则即刻生效。
 
-可随时通过 `pilot status --json`（查看 `auto_update` 字段）检查更新状态，或运行 `pilot self-update --json` 立即更新。设置环境变量 `ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE=1` 可关闭后台自动检查。
+可随时通过 `pilot status --json`（查看 `auto_update` 字段）检查更新状态，或运行 `pilot self-update --json` 立即更新。设置环境变量 `THE_PILOT_DISABLE_AUTO_UPDATE=1` 可关闭后台自动检查。
+
+`pilot apply --upgrade` 同时执行旧版 `config/autopilot` 安装到 `config/the-pilot` 的一次性单向迁移：托管文件迁入新目录，`state/autopilot.log` 改名为 `state/pilot.log`，删除旧版 `orca-agy-autopilot` Hook 组，并保留自定义场景与会话状态。迁移窗口内，已打开会话中的 `<!-- autopilot: ... -->` 标签与 `,autopilot recover` 仍可正常工作。
 
 ---
 
@@ -233,15 +235,15 @@ pilot apply --no-project --json    # 解除项目扩展绑定，恢复通用默�
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | 只读探测已安装的个人偏好、项目扩展与本机可用的 Agent CLI（`codex`、`claude`、`agy`）。 |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | 只读扫描最近 N 天多 Agent 聊天记录（`antigravity`、`claude`、`codex`、`cursor`），提炼重复输入模式与流水线健康度诊断。 |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `autopilot.py`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块与 Hook 组。 |
+| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块与 `the-pilot` Hook 组。 |
 | `pilot self-update [--project-only] [--workspace <path>] --json` | 在文件排他锁下安全快进 `main`、刷新 CLI 与全局技能软链，并执行 `pilot apply --upgrade`。 |
 | `pilot status [--project <repo>] --json` | 检查安装完整性、当前模式、执行器优先级、`auto_update` 状态与字节级产物漂移（`drift: []`）。 |
 | `pilot uninstall --json` | 移除托管文件、`GEMINI.md` 托管块与 Hook 条目，保留用户其他配置。 |
-| `pilot mode [status\|gate\|confirm\|off]` | 查看或切换 Turn Autopilot 模式（`gate`、`confirm`、`off`）。 |
+| `pilot mode [status\|gate\|confirm\|off]` | 查看或切换 Turn Pilot 模式（`gate`、`confirm`、`off`）。 |
 | `pilot worker [status\|codex\|claude\|cc]` | 查看或持久化子会话执行器优先级（`codex > claude` 或 `claude > codex`），并在下一轮热加载。 |
 | `pilot sync` | 手工编辑已安装的 `scenes/*.md` 后，将其同步刷新到 `GEMINI.md` 场景段。 |
 | `pilot set <shortcut> <template>` | 在 `profile.json` 中持久化自定义口令模板并重新编译 `config.json`。 |
-| `pilot log [--lines <n>]` | 查看 `state/autopilot.log` 中的结构化运行时投递日志。 |
+| `pilot log [--lines <n>]` | 查看 `state/pilot.log` 中的结构化运行时投递日志。 |
 | `pilot hook --event <PreInvocation\|Stop>` | 供宿主 Agent 运行时调用的生命周期 Hook 入口。 |
 
 ---

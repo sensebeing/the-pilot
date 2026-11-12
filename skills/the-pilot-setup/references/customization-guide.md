@@ -9,14 +9,14 @@ Installed scene files can be edited for runtime use; `pilot sync` refreshes the
 GEMINI.md scene summary. An upgrade recompiles scenes from the profile/overlay.
 
 Discovery precedence is `--no-project`, explicit `--project` (root or JSON),
-installed `config/autopilot/project.json`, nearest cwd ancestor's `.pilot/project.json`,
+installed `config/the-pilot/project.json`, nearest cwd ancestor's `.pilot/project.json`,
 then universal defaults. Apply persists the selected normalized overlay; universal
 apply deletes a previous link. Probe and status never write the link.
 
 ## Profile dimensions
 
 - `orchestration`: ordered `worker_agents` and `review_agents`.
-- `autopilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (`1..50`).
+- `pilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (`1..50`).
 - `scenes`: enabled scenes, delivery strategy, feedback notification preference,
   and additional guardrails. An overlay defines what the notification preference
   means; it never grants external-send permission by itself.

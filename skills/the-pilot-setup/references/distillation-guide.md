@@ -1,6 +1,6 @@
 # Distilling scenes and shortcuts from recent chat history
 
-Run `pilot distill --days 7 --json` (optional `--max-sessions 80`). The command performs a read-only scan of recent conversations across Antigravity/Gemini CLI, Claude Code, Codex, and Cursor, filters out machine-generated Orca worker and independent reviewer preambles, separates confirmed Autopilot activity, and clusters recurring manual user prompts. It is evidence, not an automatic configuration write.
+Run `pilot distill --days 7 --json` (optional `--max-sessions 80`). The command performs a read-only scan of recent conversations across Antigravity/Gemini CLI, Claude Code, Codex, and Cursor, filters out machine-generated Orca worker and independent reviewer preambles, separates confirmed Pilot activity, and clusters recurring manual user prompts. It is evidence, not an automatic configuration write.
 
 ## Evidence review and uncertainty
 

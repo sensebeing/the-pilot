@@ -2,6 +2,11 @@
 
 Notable changes are recorded here. Version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Renamed the runtime and installed layout to canonical `the-pilot` identifiers: `<gemini-dir>/config/the-pilot/runtime.py`, the `the-pilot-profile/v1` schema, the `pilot` profile section, the `the-pilot` hook group, `<!-- pilot: ... -->` tags, `,pilot recover`, and `THE_PILOT_*` environment variables.
+- `pilot apply --upgrade` now performs a one-way migration of a legacy `config/autopilot` install (profile, project overlay, session state, custom scenes) and removes the legacy hook group; sessions opened before the rename keep working through transitional tag and recovery-command compatibility.
+
 ## 0.1.0
 
 Initial open-source alpha release.

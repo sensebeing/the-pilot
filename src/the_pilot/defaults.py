@@ -1,6 +1,25 @@
 """Universal profile vocabulary and project-neutral scene templates."""
+from pathlib import Path
 
-PROFILE_SCHEMA = "orca-autopilot-profile/v1"
+PROFILE_SCHEMA = "the-pilot-profile/v1"
+
+LEGACY_PROFILE_SCHEMA = "orca-autopilot-profile/v1"
+
+PILOT_SUBDIR = Path("config") / "the-pilot"
+
+LEGACY_AUTOPILOT_SUBDIR = Path("config") / "autopilot"
+
+ENGINE_NAME = "runtime.py"
+
+LEGACY_ENGINE_NAME = "autopilot.py"
+
+LOCK_NAME = ".pilot.lock"
+
+LEGACY_LOCK_NAME = ".autopilot.lock"
+
+HOOK_GROUP = "the-pilot"
+
+LEGACY_HOOK_GROUP = "orca-agy-autopilot"
 
 MODES = ("gate", "confirm", "off")
 
@@ -54,17 +73,25 @@ def is_entry_key(value: str) -> bool:
     return is_comma_alias(value) and value[0] in "abcdefghijklmnopqrstuvwxyz"
 
 
-GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
+GEMINI_BEGIN = "<!-- BEGIN THE_PILOT_PROFILE -->"
 
-GEMINI_END = "<!-- END ORCA_AUTOPILOT_PROFILE -->"
+GEMINI_END = "<!-- END THE_PILOT_PROFILE -->"
 
-SCENES_BEGIN = "<!-- BEGIN AUTOPILOT SCENES -->"
+SCENES_BEGIN = "<!-- BEGIN THE_PILOT_SCENES -->"
 
-SCENES_END = "<!-- END AUTOPILOT SCENES -->"
+SCENES_END = "<!-- END THE_PILOT_SCENES -->"
+
+LEGACY_GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
+
+LEGACY_GEMINI_END = "<!-- END ORCA_AUTOPILOT_PROFILE -->"
+
+LEGACY_SCENES_BEGIN = "<!-- BEGIN AUTOPILOT SCENES -->"
+
+LEGACY_SCENES_END = "<!-- END AUTOPILOT SCENES -->"
 
 UNMANAGED_SCENES_MARKERS_ERROR = (
-    "GEMINI.md 托管块外存在未托管的场景标记 <!-- BEGIN/END AUTOPILOT SCENES -->；"
-    "请先清理旧手工场景段再安装"
+    "GEMINI.md 托管块外存在未托管的场景标记 <!-- BEGIN/END THE_PILOT_SCENES -->"
+    "（或旧版 <!-- BEGIN/END AUTOPILOT SCENES -->）；请先清理旧手工场景段再安装"
 )
 
 HARNESS_ORCHESTRATION_SENTENCE = (
@@ -97,7 +124,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                           'requires_arg': False,
                           'usage': 'pull',
                           'template': '先拉下代码到最新 origin/main'}},
- 'presets': {'recommended': {'autopilot': {'mode': 'gate', 'max_consecutive_auto_turns': 8},
+ 'presets': {'recommended': {'pilot': {'mode': 'gate', 'max_consecutive_auto_turns': 8},
                              'scenes': {'enabled_scenes': ['plan-and-orchestrate',
                                                            'architecture-re-review',
                                                            'deliver-and-verify',
@@ -105,7 +132,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                         'deliver_strategy': 'merge_dev_e2e',
                                         'enable_feedback_email': False},
                              'shortcuts': {'enabled_entry': ['r', 'rt', 'd', 'pull']}},
-             'conservative': {'autopilot': {'mode': 'confirm', 'max_consecutive_auto_turns': 4},
+             'conservative': {'pilot': {'mode': 'confirm', 'max_consecutive_auto_turns': 4},
                               'scenes': {'enabled_scenes': ['plan-and-orchestrate',
                                                             'architecture-re-review',
                                                             'deliver-and-verify',
@@ -113,7 +140,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                          'deliver_strategy': 'merge_dev_e2e',
                                          'enable_feedback_email': False},
                               'shortcuts': {'enabled_entry': ['r', 'rt', 'd', 'pull']}},
-             'orchestration-only': {'autopilot': {'mode': 'off', 'max_consecutive_auto_turns': 4},
+             'orchestration-only': {'pilot': {'mode': 'off', 'max_consecutive_auto_turns': 4},
                                     'scenes': {'enabled_scenes': [],
                                                'deliver_strategy': 'merge_dev_e2e',
                                                'enable_feedback_email': False},
@@ -227,7 +254,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                '2. 完成已授权且证据充分的结案操作；外部发送仍遵循当前授权。当尚有已授权的结案、通知或工作区释放义务未在本轮直接执行完毕时，必须路由到 closeout-and-sync 并标 gate=auto，生成并自动推进 ,1；严禁在正文反问确认并输出 scene=NONE 或 gate=pause。\n'
                                                '{{FEEDBACK_CLOSEOUT_BLOCK}}\n'
                                                '3. 释放受控 Orca worker，按项目生命周期清理工作区；保留共享工作区和归属不明的文件。\n'
-                                               '4. 将已授权改动交付到目标分支；全部义务结清后输出 `<!-- autopilot: '
+                                               '4. 将已授权改动交付到目标分支；全部义务结清后输出 `<!-- pilot: '
                                                'scene=NONE -->`。\n'
                                                '\n'
                                                '## 回复示例\n'

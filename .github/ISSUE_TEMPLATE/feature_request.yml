@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose an improvement to Turn Autopilot or Orca orchestration governance.
+description: Propose an improvement to Turn Pilot or Orca orchestration governance.
 title: "[Feature]: "
 body:
   - type: textarea

@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .defaults import is_comma_alias, DELIVER_STRATEGIES, is_entry_key, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
+from .defaults import is_comma_alias, DELIVER_STRATEGIES, is_entry_key, LEGACY_PROFILE_SCHEMA, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
 from .project import ProfileError, project_specs
 
 
@@ -35,19 +35,21 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     profile = _copy_mapping(raw, "profile")
     _reject_unknown(
         profile,
-        ("schema", "orchestration", "autopilot", "scenes", "shortcuts"),
+        ("schema", "orchestration", "pilot", "autopilot", "scenes", "shortcuts"),
         "profile",
     )
-    if profile.get("schema", PROFILE_SCHEMA) != PROFILE_SCHEMA:
+    if profile.get("schema", PROFILE_SCHEMA) not in {PROFILE_SCHEMA, LEGACY_PROFILE_SCHEMA}:
         raise ProfileError(
-            f"profile.schema 必须是 {PROFILE_SCHEMA}，实际为 {profile.get('schema')!r}"
+            f"profile.schema 必须是 {PROFILE_SCHEMA}（兼容旧版 {LEGACY_PROFILE_SCHEMA}），"
+            f"实际为 {profile.get('schema')!r}"
         )
+    profile = _normalize_pilot_section(profile)
     orchestration = _require_mapping(profile.get("orchestration"), "orchestration")
-    autopilot = _require_mapping(profile.get("autopilot"), "autopilot")
+    pilot = _require_mapping(profile.get("pilot"), "pilot")
     scenes = _require_mapping(profile.get("scenes"), "scenes")
     shortcuts = _require_mapping(profile.get("shortcuts"), "shortcuts")
     _reject_unknown(orchestration, ("worker_agents", "review_agents"), "orchestration")
-    _reject_unknown(autopilot, ("mode", "max_consecutive_auto_turns"), "autopilot")
+    _reject_unknown(pilot, ("mode", "max_consecutive_auto_turns"), "pilot")
     _reject_unknown(
         scenes,
         ("enabled_scenes", "deliver_strategy", "enable_feedback_email", "guardrails"),
@@ -59,12 +61,12 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         "shortcuts",
     )
 
-    mode = autopilot.get("mode")
+    mode = pilot.get("mode")
     if mode not in MODES:
-        raise ProfileError(f"autopilot.mode 必须是 {MODES} 之一，实际为 {mode!r}")
-    max_turns = autopilot.get("max_consecutive_auto_turns")
+        raise ProfileError(f"pilot.mode 必须是 {MODES} 之一，实际为 {mode!r}")
+    max_turns = pilot.get("max_consecutive_auto_turns")
     if isinstance(max_turns, bool) or not isinstance(max_turns, int) or not 1 <= max_turns <= 50:
-        raise ProfileError("autopilot.max_consecutive_auto_turns 必须是 1..50 的整数")
+        raise ProfileError("pilot.max_consecutive_auto_turns 必须是 1..50 的整数")
 
     strategy = scenes.get("deliver_strategy")
     if strategy not in DELIVER_STRATEGIES:
@@ -133,7 +135,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             "worker_agents": worker_agents,
             "review_agents": review_agents,
         },
-        "autopilot": {"mode": mode, "max_consecutive_auto_turns": max_turns},
+        "pilot": {"mode": mode, "max_consecutive_auto_turns": max_turns},
         "scenes": {
             "enabled_scenes": [item for item in SCENE_ORDER if item in enabled_scenes],
             "deliver_strategy": strategy,
@@ -149,6 +151,21 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             },
         },
     }
+
+
+def _normalize_pilot_section(profile: dict[str, Any]) -> dict[str, Any]:
+    """Accept a legacy ``autopilot`` section once, then emit only ``pilot``.
+
+    A mapping that carries both keys is ambiguous: two owners would decide the
+    same mode and turn cap, so the install fails closed instead of guessing.
+    """
+    has_pilot = "pilot" in profile
+    has_legacy = "autopilot" in profile
+    if has_pilot and has_legacy:
+        raise ProfileError("profile 同时包含 pilot 与旧版 autopilot 段；请只保留 pilot")
+    if has_legacy:
+        profile["pilot"] = profile.pop("autopilot")
+    return profile
 
 
 def _normalize_custom_entries(value: Any, *, project: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:

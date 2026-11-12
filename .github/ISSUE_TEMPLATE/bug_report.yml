@@ -23,7 +23,7 @@ body:
     id: reproduction
     attributes:
       label: Reproduction steps
-      description: Include the exact command or trailing autopilot tag and a minimal, sanitized profile/project overlay example.
+      description: Include the exact command or trailing pilot tag and a minimal, sanitized profile/project overlay example.
     validations:
       required: true
   - type: textarea

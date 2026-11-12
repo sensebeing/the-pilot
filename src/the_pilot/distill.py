@@ -17,7 +17,13 @@ import time
 from typing import Any
 
 from .compiler import split_frontmatter
-from .defaults import DEFAULT_SPECS, PIPELINE_STAGE_CONTRACTS, SCENE_ORDER
+from .defaults import (
+    DEFAULT_SPECS,
+    LEGACY_AUTOPILOT_SUBDIR,
+    PIPELINE_STAGE_CONTRACTS,
+    PILOT_SUBDIR,
+    SCENE_ORDER,
+)
 from .profile import validate_profile
 from .project import ProfileError, project_specs
 
@@ -34,8 +40,8 @@ MAX_PATTERNS = 25
 MAX_SAMPLED_PROMPTS = 30
 MAX_ERRORS_PER_SOURCE = 5
 
-AUTOPILOT_COMMENT_OPEN = "<!--"
-AUTOPILOT_COMMENT_CLOSE = "-->"
+TAG_COMMENT_OPEN = "<!--"
+TAG_COMMENT_CLOSE = "-->"
 
 MACHINE_PREFIXES = (
     "Please carry out this task from my Orca coordinator",
@@ -133,7 +139,7 @@ def distill_chat_history(
         sources[agent] = stats
         all_records.extend(records)
 
-    autopilot_counts: Counter[str] = Counter()
+    pilot_counts: Counter[str] = Counter()
     uncertain_template_counts: Counter[str] = Counter()
     pattern_groups: dict[str, dict[str, Any]] = {}
     manual_records: list[dict[str, Any]] = []
@@ -150,11 +156,11 @@ def distill_chat_history(
         else:
             unknown_role_count += 1
 
-        matched_autopilot = item.get("tag_provenance") or _match_installed_autopilot(
+        matched_pilot = item.get("tag_provenance") or _match_installed_pilot(
             item["text"], installed_shortcuts
         )
-        if matched_autopilot is not None:
-            autopilot_counts[matched_autopilot] += 1
+        if matched_pilot is not None:
+            pilot_counts[matched_pilot] += 1
             continue
 
         uncertain_match = _match_template_similarity(item["text"], installed_shortcuts)
@@ -232,7 +238,7 @@ def distill_chat_history(
         all_records, manual_records, installed_pipeline, stage_contracts
     )
     recommendations = _build_recommendations(
-        recurring_patterns, autopilot_counts, manual_records, config_status, evidence_complete,
+        recurring_patterns, pilot_counts, manual_records, config_status, evidence_complete,
         pipeline_assessment,
     )
     sampled_prompts = _sample_diverse_prompts(manual_records, limit=MAX_SAMPLED_PROMPTS)
@@ -249,11 +255,11 @@ def distill_chat_history(
             "entry_messages": entry_count,
             "followup_messages": followup_count,
             "unknown_role_messages": unknown_role_count,
-            "autopilot_expanded_messages": sum(autopilot_counts.values()),
+            "pilot_expanded_messages": sum(pilot_counts.values()),
             "uncertain_template_messages": sum(uncertain_template_counts.values()),
             "manual_messages": len(manual_records),
         },
-        "autopilot_activity": dict(autopilot_counts.most_common(15)),
+        "pilot_activity": dict(pilot_counts.most_common(15)),
         "uncertain_template_matches": dict(uncertain_template_counts.most_common(15)),
         "recurring_patterns": recurring_patterns,
         "pipeline_assessment": pipeline_assessment,
@@ -347,7 +353,7 @@ def _collect_antigravity(
             if step_type == "PLANNER_RESPONSE":
                 content_text = str(line.get("content") or "").strip()
                 if content_text:
-                    pending_tag = _extract_autopilot_tag(content_text)
+                    pending_tag = _extract_pilot_tag(content_text)
                 continue
             if step_type != "USER_INPUT":
                 continue
@@ -501,7 +507,7 @@ def _parse_claude_session_file(
         if msg_type == "assistant":
             text = _extract_claude_content(line.get("message"))
             if text:
-                pending_tag = _extract_autopilot_tag(text)
+                pending_tag = _extract_pilot_tag(text)
             continue
         if msg_type != "user" or line.get("isMeta"):
             continue
@@ -655,13 +661,13 @@ def _parse_codex_session_file(
             last_user_mirror = None
             assistant_text = _extract_codex_text_blocks(payload.get("content"))
             if assistant_text:
-                pending_tag = _extract_autopilot_tag(assistant_text)
+                pending_tag = _extract_pilot_tag(assistant_text)
             continue
         if item_type == "event_msg" and payload.get("type") == "agent_message":
             last_user_mirror = None
             msg_text = str(payload.get("message") or "").strip()
             if msg_text:
-                pending_tag = _extract_autopilot_tag(msg_text)
+                pending_tag = _extract_pilot_tag(msg_text)
             continue
 
         is_event_user = item_type == "event_msg" and payload.get("type") == "user_message"
@@ -739,7 +745,7 @@ def _collect_cursor(
             text = str(line.get("content") or line.get("text") or "").strip()
             if role in ("assistant", "MODEL", "PLANNER_RESPONSE"):
                 if text:
-                    pending_tag = _extract_autopilot_tag(text)
+                    pending_tag = _extract_pilot_tag(text)
                 continue
             if role not in ("user", "USER_INPUT") or not text:
                 continue
@@ -929,18 +935,21 @@ def _extract_codex_text_blocks(content: Any) -> str:
     return "\n".join(selected).strip()
 
 
-def _extract_autopilot_tag(text: str) -> dict[str, Any] | None:
+def _extract_pilot_tag(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
-    if not stripped.endswith(AUTOPILOT_COMMENT_CLOSE):
+    if not stripped.endswith(TAG_COMMENT_CLOSE):
         return None
-    search_end = len(stripped) - len(AUTOPILOT_COMMENT_CLOSE)
+    search_end = len(stripped) - len(TAG_COMMENT_CLOSE)
     while search_end >= 0:
-        open_idx = stripped.rfind(AUTOPILOT_COMMENT_OPEN, 0, search_end)
+        open_idx = stripped.rfind(TAG_COMMENT_OPEN, 0, search_end)
         if open_idx < 0:
             return None
-        inner = stripped[open_idx + len(AUTOPILOT_COMMENT_OPEN):-len(AUTOPILOT_COMMENT_CLOSE)].strip()
-        if inner.lower().startswith("autopilot:"):
-            payload = inner[len("autopilot:"):].strip()
+        inner = stripped[open_idx + len(TAG_COMMENT_OPEN):-len(TAG_COMMENT_CLOSE)].strip()
+        for name in ("pilot", "autopilot"):
+            prefix = f"{name}:"
+            if not inner.lower().startswith(prefix):
+                continue
+            payload = inner[len(prefix):].strip()
             if payload.startswith("{") and payload.endswith("}"):
                 try:
                     parsed = json.loads(payload)
@@ -1005,13 +1014,22 @@ def _effective_stage_contracts(
     return contracts
 
 
+def _installed_path(gemini_dir: Path, name: str) -> Path:
+    """Read the canonical install path, falling back to a legacy install."""
+    canonical = gemini_dir / PILOT_SUBDIR / name
+    if canonical.exists():
+        return canonical
+    legacy = gemini_dir / LEGACY_AUTOPILOT_SUBDIR / name
+    return legacy if legacy.exists() else canonical
+
+
 def _inspect_installed_pipeline(
     gemini_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Inspect the installed project overlay, profile, and scenes without guessing."""
-    profile_path = gemini_dir / "config/autopilot/profile.json"
-    project_path = gemini_dir / "config/autopilot/project.json"
-    scenes_dir = gemini_dir / "config/autopilot/scenes"
+    profile_path = _installed_path(gemini_dir, "profile.json")
+    project_path = _installed_path(gemini_dir, "project.json")
+    scenes_dir = _installed_path(gemini_dir, "scenes")
     result: dict[str, Any] = {
         "profile_status": "absent" if not profile_path.is_file() else "ok",
         "project_status": "absent" if not project_path.is_file() else "ok",
@@ -1049,12 +1067,12 @@ def _inspect_installed_pipeline(
             result["profile_status"] = "error"
             result["error"] = str(exc)
         else:
-            autopilot = profile["autopilot"]
+            pilot = profile["pilot"]
             scenes = profile["scenes"]
             enabled_scenes = scenes["enabled_scenes"]
             result.update({
-                "mode": autopilot["mode"],
-                "max_consecutive_auto_turns": autopilot["max_consecutive_auto_turns"],
+                "mode": pilot["mode"],
+                "max_consecutive_auto_turns": pilot["max_consecutive_auto_turns"],
                 "deliver_strategy": scenes["deliver_strategy"],
                 "enabled_scenes": list(enabled_scenes),
                 "missing_stages": [stage for stage in SCENE_ORDER if stage not in enabled_scenes],
@@ -1134,7 +1152,7 @@ def _analyze_pipeline_flow(
     stage_contracts: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     stage_activity = {
-        stage: {"autopilot_turns": 0, "manual_turns": 0, "total_turns": 0}
+        stage: {"pilot_turns": 0, "manual_turns": 0, "total_turns": 0}
         for stage in SCENE_ORDER
     }
     session_turns: dict[tuple[str, str], list[tuple[float, str, bool]]] = {}
@@ -1154,7 +1172,7 @@ def _analyze_pipeline_flow(
                 "continue_nudge": "continue_nudge",
             }.get(category, "")
         if stage in stage_activity:
-            key = "autopilot_turns" if is_auto else "manual_turns"
+            key = "pilot_turns" if is_auto else "manual_turns"
             stage_activity[stage][key] += 1
             stage_activity[stage]["total_turns"] += 1
         session_key = (str(item.get("agent") or ""), str(item.get("session_id") or ""))
@@ -1238,14 +1256,14 @@ def _analyze_pipeline_flow(
             "Align the delivery strategy with repeated end-to-end verification demand.")
     if sessions_with_manual_nudges >= 2 or (installed_pipeline.get("profile_status") == "ok" and installed_pipeline.get("mode") == "gate"
             and (installed_pipeline.get("max_consecutive_auto_turns") or 0) < 10 and multi_turn_sessions >= 2 and sessions_with_manual_nudges >= 1):
-        add("manual_pipeline_handoff", "plan-and-orchestrate", "autopilot.max_consecutive_auto_turns", sessions_with_manual_nudges,
+        add("manual_pipeline_handoff", "plan-and-orchestrate", "pilot.max_consecutive_auto_turns", sessions_with_manual_nudges,
             "Raise the automatic turn budget only after confirming the four stage contracts can advance without manual handoffs.")
     return {"stage_contracts": stage_contracts, "installed_pipeline": installed_pipeline,
             "stage_activity": stage_activity, "flow_metrics": flow_metrics, "findings": findings}
 
 
 def _load_installed_shortcuts(gemini_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    config_path = gemini_dir / "config/autopilot/config.json"
+    config_path = _installed_path(gemini_dir, "config.json")
     if not config_path.is_file():
         return {"status": "absent", "path": str(config_path)}, []
     try:
@@ -1352,7 +1370,7 @@ def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
     return ("," + checked if comma else checked), arg
 
 
-def _match_installed_autopilot(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
+def _match_installed_pilot(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
     stripped = text.strip()
     if _named_command(
         stripped, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status"
@@ -1360,8 +1378,8 @@ def _match_installed_autopilot(text: str, shortcuts: list[dict[str, Any]]) -> st
         return "command:,worker"
     if _named_command(stripped, {"mode"}, {"gate", "confirm", "off", "status"}):
         return "command:,mode"
-    if _named_command(stripped, {"autopilot"}, {"recover"}):
-        return "command:,autopilot"
+    if _named_command(stripped, {"pilot", "autopilot"}, {"recover"}):
+        return "command:,pilot"
     candidate, _ = _command_parts(stripped, comma=True)
     if candidate in {"1", "2", "3"}:
         return f"candidate:,{candidate}"
@@ -1476,9 +1494,9 @@ def _classify_pattern(signature: str, turn_role: str, count: int) -> tuple[str, 
     lower = signature.lower()
     if lower in CONTINUE_NUDGES:
         return "continue_nudge", {
-            "target": "autopilot.mode",
+            "target": "pilot.mode",
             "action": "Enable `gate` mode (or raise `max_consecutive_auto_turns`) so routine Class A turns advance without manual nudges.",
-            "profile_patch": {"autopilot": {"mode": "gate"}},
+            "profile_patch": {"pilot": {"mode": "gate"}},
         }
     if any(kw in lower for kw in ("认领", "排查", "报警", "告警", "反馈", "方案", "设计", "子工作区", "orca")):
         target = "shortcuts.custom_entry" if turn_role == "entry" else "scenes.plan-and-orchestrate"
@@ -1521,7 +1539,7 @@ def _classify_pattern(signature: str, turn_role: str, count: int) -> tuple[str, 
 
 def _build_recommendations(
     recurring_patterns: list[dict[str, Any]],
-    autopilot_counts: Counter[str],
+    pilot_counts: Counter[str],
     manual_records: list[dict[str, Any]],
     config_status: dict[str, Any],
     evidence_complete: bool,
@@ -1560,14 +1578,14 @@ def _build_recommendations(
         and pipeline_assessment.get("installed_pipeline", {}).get("profile_status") != "error"
         and pipeline_assessment.get("installed_pipeline", {}).get("project_status") != "error"
         and pipeline_assessment.get("installed_pipeline", {}).get("scenes_status") != "error"
-        and not autopilot_counts
+        and not pilot_counts
         and manual_records
     ):
         recommendations.insert(0, {
             "category": "onboarding",
             "target": "preset.recommended",
             "evidence_count": len(manual_records),
-            "pattern_signature": "(no installed config.json or autopilot tags detected)",
+            "pattern_signature": "(no installed config.json or pilot tags detected)",
             "action": "Install the `recommended` preset (`gate` mode + all 4 scenes) to automate routine review, delivery, and closeout transitions.",
         })
     return recommendations[:12]

@@ -20,8 +20,8 @@ The CLI and runtime have zero external runtime dependencies. Independent archite
 
 Read [AGENTS.md](AGENTS.md) and the [package boundaries](src/the_pilot/README.md) before editing.
 We dogfood `the-guard` engineering quality rules:
-- One owner per decision (`guard.single-source-of-truth`) and unidirectional module imports (`cli -> installer -> compiler -> profile -> project -> defaults`, with `assets/autopilot.py` standalone).
-- Zero regular expressions (`import re` is forbidden across `src/the_pilot/`): trailing autopilot tags are parsed exclusively via `json.loads`.
+- One owner per decision (`guard.single-source-of-truth`) and unidirectional module imports (`cli -> installer -> compiler -> profile -> project -> defaults`, with `assets/runtime.py` standalone).
+- Zero regular expressions (`import re` is forbidden across `src/the_pilot/`): trailing pilot tags are parsed exclusively via `json.loads`.
 - Preserve real safety boundaries: settled-question checks, `fcntl` session locks, turn caps, and explicit `--gemini-dir` test isolation.
 - Keep [README.md](README.md) and [README.zh-CN.md](README.zh-CN.md) aligned when changing public usage.
 

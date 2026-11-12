@@ -39,7 +39,7 @@ class ProjectTest(unittest.TestCase):
         self.base = json.loads((ROOT / "src/the_pilot/assets/profile.default.json").read_text())
         self.project = json.loads((FIXTURES / "alter-service.json").read_text())
         self.env = dict(os.environ, HOME=str(self.root / "home"),
-                        ORCA_AUTOPILOT_GEMINI_DIR=str(self.gemini))
+                        THE_PILOT_GEMINI_DIR=str(self.gemini))
 
     def cli(self, *args, cwd=None, ok=True):
         result = subprocess.run([sys.executable, str(ROOT / "bin/pilot"), *args,
@@ -50,7 +50,7 @@ class ProjectTest(unittest.TestCase):
 
     def test_compiled_contract_and_parallel_project_isolation(self):
         """Compilation preserves the standalone runtime and overlay contracts."""
-        runtime = (ROOT / "src/the_pilot/assets/autopilot.py").read_text()
+        runtime = (ROOT / "src/the_pilot/assets/runtime.py").read_text()
         tree = ast.parse(runtime)
         self.assertFalse(any(isinstance(node, ast.ImportFrom) and node.level for node in ast.walk(tree)))
         for preset in ("recommended", "conservative"):
@@ -68,7 +68,7 @@ class ProjectTest(unittest.TestCase):
                           or DEFAULT_SPECS["entry_specs"][key])["command_id"]
                          for key in expected_entries},
                     )
-                    self.assertEqual(bundle.profile_json["autopilot"]["mode"],
+                    self.assertEqual(bundle.profile_json["pilot"]["mode"],
                                      "confirm" if preset == "conservative" else "gate")
                     self.assertEqual(bundle.profile_json["scenes"]["deliver_strategy"], strategy)
                     self.assertEqual(bundle.profile_json["scenes"]["enable_feedback_email"], feedback)
@@ -80,14 +80,14 @@ class ProjectTest(unittest.TestCase):
                         for name in SCENE_ORDER
                     })
                     self.assertTrue(all("{{" not in text for text in (*bundle.scenes.values(), bundle.gemini_block)))
-                    self.assertTrue(bundle.gemini_block.startswith("<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"))
-                    self.assertIn("<!-- END AUTOPILOT SCENES -->", bundle.gemini_block)
-                    self.assertIn("<!-- autopilot: scene=NONE -->", bundle.gemini_block)
+                    self.assertTrue(bundle.gemini_block.startswith("<!-- BEGIN THE_PILOT_PROFILE -->"))
+                    self.assertIn("<!-- END THE_PILOT_SCENES -->", bundle.gemini_block)
+                    self.assertIn("<!-- pilot: scene=NONE -->", bundle.gemini_block)
                     self.assertTrue(bundle.gemini_block.endswith("\n"))
-                    hooks = merge_hooks_json({"other": {"hooks": []}}, "/pilot/autopilot.py")
+                    hooks = merge_hooks_json({"other": {"hooks": []}}, "/pilot/runtime.py")
                     self.assertEqual(hooks["other"], {"hooks": []})
-                    self.assertIn("orca-agy-autopilot", hooks)
-                    self.assertIn("/pilot/autopilot.py", json.dumps(hooks["orca-agy-autopilot"]))
+                    self.assertIn("the-pilot", hooks)
+                    self.assertIn("/pilot/runtime.py", json.dumps(hooks["the-pilot"]))
         original = copy.deepcopy(self.project)
         def compile_for(project):
             profile = resolve_profile(self.base, project=project)
@@ -97,6 +97,38 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(list(generic), ["r", "rt", "d", "pull"])
         self.assertEqual(list(linked), self.project["entry_order"])
         self.assertEqual(self.project, original)
+
+    def test_legacy_profile_and_project_sections_normalize_once(self):
+        """Failure means an old profile or preset keeps a second owner for mode and turn cap."""
+        legacy = copy.deepcopy(self.base)
+        legacy["schema"] = "orca-autopilot-profile/v1"
+        legacy["autopilot"] = legacy.pop("pilot")
+        normalized = resolve_profile(legacy, preset=None)
+        self.assertEqual(normalized["schema"], "the-pilot-profile/v1")
+        self.assertIn("pilot", normalized)
+        self.assertNotIn("autopilot", normalized)
+
+        project = normalize_project({
+            "schema": "the-pilot-project/v1",
+            "projectId": "legacy-presets",
+            "presets": {"recommended": {"autopilot": {"mode": "gate"}}},
+        })
+        self.assertIn("pilot", project["presets"]["recommended"])
+        self.assertNotIn("autopilot", project["presets"]["recommended"])
+
+        ambiguous = copy.deepcopy(legacy)
+        ambiguous["pilot"] = copy.deepcopy(self.base["pilot"])
+        with self.assertRaises(ProfileError):
+            resolve_profile(ambiguous, preset=None)
+        with self.assertRaises(ProfileError):
+            normalize_project({
+                "schema": "the-pilot-project/v1",
+                "projectId": "dual-owner",
+                "presets": {"recommended": {
+                    "pilot": {"mode": "gate"},
+                    "autopilot": {"mode": "gate"},
+                }},
+            })
 
     def test_universal_and_installed_runtime_commands(self):
         profile = resolve_profile(self.base)
@@ -108,8 +140,8 @@ class ProjectTest(unittest.TestCase):
         self.cli("probe", "--no-project")
         self.cli("apply", "--no-project")
         self.assertEqual(self.cli("status")["drift"], [])
-        installed = self.gemini / "config/autopilot/autopilot.py"
-        self.assertEqual(installed.read_bytes(), (ROOT / "src/the_pilot/assets/autopilot.py").read_bytes())
+        installed = self.gemini / "config/the-pilot/runtime.py"
+        self.assertEqual(installed.read_bytes(), (ROOT / "src/the_pilot/assets/runtime.py").read_bytes())
         for args in (("worker", "status", "--json"), ("mode", "status"), ("sync",), ("log",),
                      ("set", "r", "Review {arg}"), ("hook", "--event", "PreInvocation")):
             result = subprocess.run([sys.executable, str(ROOT / "bin/pilot"), *args],
@@ -123,7 +155,7 @@ class ProjectTest(unittest.TestCase):
         repo = self.root / "repo"
         (repo / ".pilot").mkdir(parents=True)
         self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
-        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile_path = self.gemini / "config/the-pilot/profile.json"
         profile = json.loads(profile_path.read_text())
         profile["shortcuts"]["custom_entry"] = {"prod": "deploy {arg}", "req": "request {arg}"}
         profile_path.write_text(json.dumps(profile))
@@ -170,7 +202,7 @@ class ProjectTest(unittest.TestCase):
         self.assertIn("cq", discovered["recommended_profile"]["shortcuts"]["enabled_entry"])
         self.assertFalse(self.gemini.exists())
         self.cli("apply", cwd=child)
-        link = self.gemini / "config/autopilot/project.json"
+        link = self.gemini / "config/the-pilot/project.json"
         self.assertEqual(json.loads(link.read_text()), self.project)
         # An installed link wins over another cwd's project.
         other = self.root / "other"
@@ -200,7 +232,7 @@ class ProjectTest(unittest.TestCase):
         path = self.root / "bad.json"
         path.write_text('{"schema":"wrong"}')
         self.cli("apply", "--project", str(path), ok=False)
-        self.assertFalse((self.gemini / "config/autopilot/profile.json").exists())
+        self.assertFalse((self.gemini / "config/the-pilot/profile.json").exists())
         self.cli("probe", "--project", str(self.root / "absent"), ok=False)
 
     def test_plugin_and_agent_manifests_match_package_metadata(self):
@@ -234,7 +266,7 @@ class ProjectTest(unittest.TestCase):
         old_iso = datetime.fromtimestamp(now - 10 * 86400, tz=timezone.utc).isoformat()
         old_ts = now - 10 * 86400
 
-        # 1. Antigravity: pre-window opener + in-window followups + assistant autopilot tag provenance
+        # 1. Antigravity: pre-window opener + in-window followups + assistant pilot tag provenance
         agy_recent = self.gemini / "antigravity-cli/brain/s1/.system_generated/logs/transcript.jsonl"
         agy_recent.parent.mkdir(parents=True)
         agy_recent.write_text("\n".join([
@@ -253,7 +285,7 @@ class ProjectTest(unittest.TestCase):
             json.dumps({
                 "type": "PLANNER_RESPONSE",
                 "created_at": recent_iso,
-                "content": 'Done.\n<!-- autopilot: {"scene": "architecture-re-review", "gate": "auto", "1": "Audit whole task architecture"} -->',
+                "content": 'Done.\n<!-- pilot: {"scene": "architecture-re-review", "gate": "auto", "1": "Audit whole task architecture"} -->',
             }),
             json.dumps({
                 "type": "USER_INPUT",
@@ -264,12 +296,12 @@ class ProjectTest(unittest.TestCase):
             json.dumps({
                 "type": "PLANNER_RESPONSE",
                 "created_at": recent_iso,
-                "content": 'Stale suggestion.\n<!-- autopilot: {"scene": "closeout-and-sync", "gate": "auto", "1": "Stale closeout prompt"} -->',
+                "content": 'Stale suggestion.\n<!-- pilot: {"scene": "closeout-and-sync", "gate": "auto", "1": "Stale closeout prompt"} -->',
             }),
             json.dumps({
                 "type": "PLANNER_RESPONSE",
                 "created_at": recent_iso,
-                "content": "Superseded by final response.\n<!-- autopilot: scene=NONE -->",
+                "content": "Superseded by final response.\n<!-- pilot: scene=NONE -->",
             }),
             json.dumps({
                 "type": "USER_INPUT",
@@ -439,9 +471,9 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(report["sources"]["cursor"]["malformed_lines"], 1)
         self.assertEqual(report["sources"]["cursor"]["undated_messages"], 1)
         self.assertEqual(report["sources"]["cursor"]["human_messages"], 1)
-        self.assertEqual(report["autopilot_activity"].get("candidate:,1"), 1)
-        self.assertEqual(report["autopilot_activity"].get("scene:architecture-re-review"), 1)
-        self.assertIsNone(report["autopilot_activity"].get("scene:closeout-and-sync"))
+        self.assertEqual(report["pilot_activity"].get("candidate:,1"), 1)
+        self.assertEqual(report["pilot_activity"].get("scene:architecture-re-review"), 1)
+        self.assertIsNone(report["pilot_activity"].get("scene:closeout-and-sync"))
 
         # Pre-window opener in s1 means the first in-window message of s1 is classified as followup, not entry
         s1_sample = next(item for item in report["sampled_prompts"] if "mid-session followup" in item["preview"])
@@ -473,7 +505,7 @@ class ProjectTest(unittest.TestCase):
         self.assertFalse(capped["evidence_complete"])
 
         # 6. Malformed or corrupt config.json surfaces error status and suppresses false onboarding recommendation
-        cfg_path = self.gemini / "config/autopilot/config.json"
+        cfg_path = self.gemini / "config/the-pilot/config.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         for bad_payload in ("{corrupt", json.dumps({"entry_shortcuts": {"r": {"aliases": 123}}})):
             cfg_path.write_text(bad_payload, encoding="utf-8")
@@ -513,7 +545,7 @@ class ProjectTest(unittest.TestCase):
         ]) + "\n")
         with_shortcuts = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
         self.assertEqual(with_shortcuts["config_status"]["status"], "ok")
-        self.assertEqual(with_shortcuts["autopilot_activity"].get("entry:ti"), 2)
+        self.assertEqual(with_shortcuts["pilot_activity"].get("entry:ti"), 2)
         # Template-similar free-form prompts remain in manual_messages and surface in uncertain_template_matches
         self.assertEqual(with_shortcuts["uncertain_template_matches"].get("entry:ti"), 2)
         cfg_path.unlink()
@@ -547,8 +579,8 @@ class ProjectTest(unittest.TestCase):
                 "message": {"content": "再跑一遍 e2e 验证"},
             }) + "\n")
 
-        autopilot_dir = self.gemini / "config/autopilot"
-        scenes_dir = autopilot_dir / "scenes"
+        pilot_dir = self.gemini / "config/the-pilot"
+        scenes_dir = pilot_dir / "scenes"
         scenes_dir.mkdir(parents=True)
         project = {
             "schema": "the-pilot-project/v1",
@@ -557,11 +589,11 @@ class ProjectTest(unittest.TestCase):
                 "plan-and-orchestrate": {"order": 7, "title": "自定义方案阶段"},
             },
         }
-        (autopilot_dir / "project.json").write_text(json.dumps(project), encoding="utf-8")
+        (pilot_dir / "project.json").write_text(json.dumps(project), encoding="utf-8")
         profile = copy.deepcopy(self.base)
         profile["scenes"]["enabled_scenes"] = ["plan-and-orchestrate", "deliver-and-verify"]
         profile["scenes"]["deliver_strategy"] = "merge_dev_only"
-        (autopilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
+        (pilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
         (scenes_dir / "01-plan-and-orchestrate.md").write_text(
             "---\n"
             "name: plan-and-orchestrate\n"
@@ -633,7 +665,7 @@ class ProjectTest(unittest.TestCase):
         duplicate_guardrail_profile["scenes"]["guardrails"] = [
             DEFAULT_SPECS["scene_specs"]["plan-and-orchestrate"]["required_guardrail"],
         ]
-        (autopilot_dir / "profile.json").write_text(
+        (pilot_dir / "profile.json").write_text(
             json.dumps(duplicate_guardrail_profile), encoding="utf-8"
         )
         guardrail_assessment = distill_chat_history(
@@ -669,7 +701,7 @@ class ProjectTest(unittest.TestCase):
             {finding["code"] for finding in duplicate_name_assessment["findings"]},
         )
         (scenes_dir / "custom-plan.md").unlink()
-        (autopilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
+        (pilot_dir / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
 
         for path in claude_dir.glob("*.jsonl"):
             path.unlink()
@@ -704,7 +736,7 @@ class ProjectTest(unittest.TestCase):
         }
         self.assertEqual(rework_findings["review_gate_bypassed"]["evidence_count"], 1)
 
-        (autopilot_dir / "project.json").write_text('{"schema": "wrong"}', encoding="utf-8")
+        (pilot_dir / "project.json").write_text('{"schema": "wrong"}', encoding="utf-8")
         bad_project = distill_chat_history(
             home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
         )
@@ -715,7 +747,7 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(bad_installed["incomplete_scene_contracts"], [])
         self.assertFalse(bad_project["evidence_complete"])
 
-        (autopilot_dir / "profile.json").unlink()
+        (pilot_dir / "profile.json").unlink()
         missing_profile = distill_chat_history(
             home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
         )
@@ -725,8 +757,8 @@ class ProjectTest(unittest.TestCase):
         self.assertTrue(missing_installed["error"])
         self.assertFalse(missing_profile["evidence_complete"])
 
-        (autopilot_dir / "project.json").unlink()
-        (autopilot_dir / "profile.json").write_text("{corrupt", encoding="utf-8")
+        (pilot_dir / "project.json").unlink()
+        (pilot_dir / "profile.json").write_text("{corrupt", encoding="utf-8")
         corrupt = distill_chat_history(
             home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now
         )
