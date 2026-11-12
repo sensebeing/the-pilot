@@ -420,13 +420,17 @@ class AutoUpdateTest(unittest.TestCase):
             state.mkdir(parents=True)
             metadata = {"last_checked_at": time.time()}
             (state / "auto_update.json").write_text(json.dumps(metadata))
+            args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
+            with mock.patch.object(installer.shutil, "which", return_value=None):
+                unmanaged_report = installer.self_update(args)
+            self.assertIsNone(unmanaged_report["error"])
+            self.assertEqual(unmanaged_report["cli_status"], "skipped_unmanaged")
             (home / ".local/bin").mkdir(parents=True)
             (home / ".local/bin/pilot").write_text("#!/bin/sh\n")
             (home / ".local/bin/pilot").chmod(0o755)
-            args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
             with mock.patch.object(installer.shutil, "which", return_value="/fake/uv"):
                 report = installer.self_update(args)
-            self.assertEqual(report["local_source_status"], "updated")
+            self.assertEqual(report["local_source_status"], "none")
             self.assertIn("local upgrade marker", (gemini / "config/autopilot/autopilot.py").read_text())
             persisted = json.loads((state / "auto_update.json").read_text())
             self.assertIn("runtime_tree_digest", persisted)

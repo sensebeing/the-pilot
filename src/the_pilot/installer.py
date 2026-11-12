@@ -621,6 +621,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             "local_source_status": "none",
             "head_sha": None,
             "synced_skills": [],
+            "cli_status": "none",
             "error": None,
         }
         home_dir = Path(args.home_dir).expanduser()
@@ -672,14 +673,19 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                                     atomic_write_text(state_dir / "auto_update.json", json_text(existing))
                                     try:
                                         subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--local-only", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                                        result["cli_status"] = "spawned_local_sync"
                                     except OSError as exc:
                                         if previous_local_sync is None:
                                             existing.pop("last_local_sync_at", None)
                                         else:
                                             existing["last_local_sync_at"] = previous_local_sync
                                         atomic_write_text(state_dir / "auto_update.json", json_text(existing))
-                            elif package_dir is None:
-                                result["error"] = "uv tool bundle unavailable; installed metadata unchanged"
+                                        result["cli_status"] = "spawn_failed"
+                                        result["error"] = str(exc)
+                                else:
+                                    result["cli_status"] = "cooldown"
+                            else:
+                                result["cli_status"] = "skipped_unmanaged"
             except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
                 result["error"] = str(exc)
         return result
