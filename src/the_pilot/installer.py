@@ -10,6 +10,7 @@ are never touched.
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import json
 import os
@@ -237,6 +238,19 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             raise SetupError("--upgrade 需要已安装的 profile.json；未找到安装配置")
     else:
         base = load_default_profile()
+    installed_project = None
+    if args.upgrade and project is not None:
+        installed_project_path = autopilot_dir / "project.json"
+        if installed_project_path.is_file():
+            installed_project = normalize_project(
+                read_json_object(installed_project_path, "project.json")
+            )
+        base = _migrate_upgraded_project_shortcuts(
+            base,
+            installed_project,
+            project,
+            explicit_entry_override=args.entry_shortcuts is not None,
+        )
     preset = args.preset if args.preset is not None else (None if args.upgrade else "recommended")
     profile = resolve_profile(
         base, preset=preset, overrides=overrides_from_args(args), project=project
@@ -414,6 +428,92 @@ def _find_ancestor_overlay(start: Path) -> Path | None:
     )
 
 
+def _migrate_upgraded_project_shortcuts(
+    base: dict[str, Any],
+    installed_project: dict[str, Any] | None,
+    project: dict[str, Any],
+    *,
+    explicit_entry_override: bool,
+) -> dict[str, Any]:
+    """Migrate user shortcut state when an installed overlay gains entries."""
+    migrated = copy.deepcopy(base)
+    shortcuts = migrated.get("shortcuts")
+    if not isinstance(shortcuts, dict):
+        return migrated
+    custom_entry = shortcuts.get("custom_entry")
+    entry_order = project.get("entry_order", ())
+    if isinstance(custom_entry, dict):
+        for key in list(custom_entry):
+            if key not in entry_order:
+                continue
+            del custom_entry[key]
+            enabled_entry = shortcuts.get("enabled_entry")
+            if (
+                not explicit_entry_override
+                and isinstance(enabled_entry, list)
+                and key not in enabled_entry
+            ):
+                enabled_entry.append(key)
+    enabled_entry = shortcuts.get("enabled_entry")
+    if installed_project is not None and not explicit_entry_override and isinstance(enabled_entry, list):
+        previous_order = set(installed_project.get("entry_order", ()))
+        recommended_enabled = (
+            project.get("presets", {})
+            .get("recommended", {})
+            .get("shortcuts", {})
+            .get("enabled_entry", ())
+        )
+        for key in recommended_enabled:
+            if key in entry_order and key not in previous_order and key not in enabled_entry:
+                enabled_entry.append(key)
+    return migrated
+
+
+def _is_older_committed_overlay(overlay: Path, installed_path: Path) -> bool:
+    """Return whether a clean worktree overlay predates installed content."""
+    repo_root = overlay.parent.parent
+    if not (repo_root / ".git").exists():
+        return False
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return subprocess.CompletedProcess([], 1, "", "")
+
+    status = git("status", "--porcelain", "--", ".pilot/project.json")
+    if status.returncode != 0 or status.stdout.strip():
+        return False
+    overlay_commit = git("log", "-n", "1", "--format=%H", "HEAD", "--", ".pilot/project.json")
+    overlay_sha = overlay_commit.stdout.strip()
+    if overlay_commit.returncode != 0 or not overlay_sha:
+        return False
+    installed_blob_result = git("hash-object", str(installed_path))
+    installed_blob = installed_blob_result.stdout.strip()
+    if installed_blob_result.returncode != 0 or not installed_blob:
+        return False
+    if git("cat-file", "-e", installed_blob).returncode != 0:
+        return False
+    commits = git("log", "--all", "-n", "50", "--format=%H", "--", ".pilot/project.json")
+    if commits.returncode != 0:
+        return False
+    for commit in commits.stdout.splitlines():
+        commit = commit.strip()
+        if not commit or commit == overlay_sha:
+            continue
+        blob = git("rev-parse", f"{commit}:.pilot/project.json")
+        if blob.returncode != 0 or blob.stdout.strip() != installed_blob:
+            continue
+        if git("merge-base", "--is-ancestor", overlay_sha, commit).returncode == 0:
+            return True
+    return False
+
+
 def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, autopilot_dir: Path) -> str:
     if not workspace_arg:
         return "none"
@@ -430,6 +530,8 @@ def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, autopil
             return "skipped_unmatched_project"
         if workspace_project == installed_project:
             return "up_to_date"
+        if _is_older_committed_overlay(overlay, installed_path):
+            return "skipped_older_worktree"
         apply_args = argparse.Namespace(
             command="apply", gemini_dir=str(gemini_dir), project=str(overlay), no_project=False,
             json=False, preset=None, profile=None, upgrade=True, mode=None, max_turns=None,

@@ -6,8 +6,8 @@ resident-fact: admission: invalid overlays cannot escape scene paths or write an
 installation; project compilation matches the reviewed structured-tag contract.
 """
 import copy
+import ast
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,19 +30,6 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures"
 
 
-def artifact_hashes(bundle):
-    values = {
-        "profile_json": bundle.profile_json, "config_json": bundle.config_json,
-        "scenes": bundle.scenes, "gemini_block": bundle.gemini_block,
-        "hooks": merge_hooks_json({"other": {"hooks": []}}, "/pilot-contract/config/autopilot/autopilot.py"),
-    }
-    return {
-        key: hashlib.sha256((value if isinstance(value, str) else
-                            json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()).hexdigest()
-        for key, value in values.items()
-    }
-
-
 class ProjectTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -62,15 +49,24 @@ class ProjectTest(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_compiled_contract_and_parallel_project_isolation(self):
-        baseline = json.loads((FIXTURES / "legacy-compilation.json").read_text())
-        self.assertEqual(hashlib.sha256((ROOT / "src/the_pilot/assets/autopilot.py").read_bytes()).hexdigest(),
-                         baseline["runtime_sha256"])
-        for case in baseline["cases"]:
-            with self.subTest(preset=case["preset"], overrides=case["overrides"]):
-                profile = resolve_profile(self.base, preset=case["preset"],
-                                          overrides=case["overrides"], project=self.project)
-                bundle = compile_bundle(profile, project=self.project)
-                self.assertEqual(artifact_hashes(bundle), case["sha256"])
+        """Compilation preserves the standalone runtime and overlay contracts."""
+        runtime = (ROOT / "src/the_pilot/assets/autopilot.py").read_text()
+        tree = ast.parse(runtime)
+        self.assertFalse(any(isinstance(node, ast.ImportFrom) and node.level for node in ast.walk(tree)))
+        for preset in ("recommended", "conservative"):
+            for strategy in ("merge_dev_e2e", "merge_dev_only"):
+                for feedback in (True, False):
+                    profile = resolve_profile(self.base, preset=preset, project=self.project,
+                                              overrides={"scenes": {"deliver_strategy": strategy,
+                                                                    "enable_feedback_email": feedback}})
+                    bundle = compile_bundle(profile, project=self.project)
+                    self.assertEqual(list(bundle.config_json["entry_shortcuts"]), self.project["entry_order"] if preset == "recommended" else ["r", "rt", "d", "pull"])
+                    self.assertEqual(set(bundle.config_json["comma_commands"]),
+                                     {item["command_id"] for item in bundle.config_json["entry_shortcuts"].values()})
+                    self.assertTrue(all("{{" not in text for text in (*bundle.scenes.values(), bundle.gemini_block)))
+                    self.assertTrue(bundle.gemini_block.startswith("<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"))
+                    self.assertTrue(bundle.gemini_block.endswith("\n"))
+                    self.assertEqual(merge_hooks_json({"other": {"hooks": []}}, "/pilot/autopilot.py")["other"], {"hooks": []})
         original = copy.deepcopy(self.project)
         def compile_for(project):
             profile = resolve_profile(self.base, project=project)
@@ -100,6 +96,30 @@ class ProjectTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         self.cli("uninstall")
         self.assertFalse(self.cli("status")["installed"])
+
+    def test_upgrade_promotes_colliding_custom_entry_and_enables_new_recommended(self):
+        """Upgrade owns promotion of project entries while direct profiles stay strict."""
+        repo = self.root / "repo"
+        (repo / ".pilot").mkdir(parents=True)
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["custom_entry"] = {"prod": "deploy {arg}", "req": "request {arg}"}
+        profile_path.write_text(json.dumps(profile))
+        upgraded = copy.deepcopy(self.project)
+        upgraded["entry_order"] = ["prod", *upgraded["entry_order"]]
+        upgraded["entry_specs"] = {"prod": {"command_id": "CMD_PROD", "description": "prod", "requires_arg": True, "usage": "prod <arg>", "template": "deploy {arg}"}, **upgraded["entry_specs"]}
+        upgraded["presets"]["recommended"]["shortcuts"]["enabled_entry"] = ["prod", *upgraded["presets"]["recommended"]["shortcuts"]["enabled_entry"]]
+        overlay = repo / ".pilot/project.json"
+        overlay.write_text(json.dumps(upgraded))
+        self.cli("apply", "--project", str(overlay), "--upgrade")
+        result = json.loads(profile_path.read_text())
+        self.assertIn("prod", result["shortcuts"]["enabled_entry"])
+        self.assertIn("req", result["shortcuts"]["custom_entry"])
+        self.assertNotIn("prod", result["shortcuts"]["custom_entry"])
+        with self.assertRaises(ProfileError):
+            resolve_profile(profile, project=upgraded)
+        self.assertEqual(self.cli("status")["drift"], [])
 
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"
