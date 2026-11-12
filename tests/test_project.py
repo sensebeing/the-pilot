@@ -60,13 +60,29 @@ class ProjectTest(unittest.TestCase):
                                               overrides={"scenes": {"deliver_strategy": strategy,
                                                                     "enable_feedback_email": feedback}})
                     bundle = compile_bundle(profile, project=self.project)
-                    self.assertEqual(list(bundle.config_json["entry_shortcuts"]), self.project["entry_order"] if preset == "recommended" else ["r", "rt", "d", "pull"])
-                    self.assertEqual(set(bundle.config_json["comma_commands"]),
-                                     {item["command_id"] for item in bundle.config_json["entry_shortcuts"].values()})
+                    expected_entries = self.project["entry_order"] if preset == "recommended" else ["r", "rt", "d", "pull"]
+                    self.assertEqual(list(bundle.config_json["entry_shortcuts"]), expected_entries)
+                    self.assertEqual(
+                        set(bundle.config_json["comma_commands"]),
+                        {((self.project.get("entry_specs") or {}).get(key)
+                          or DEFAULT_SPECS["entry_specs"][key])["command_id"]
+                         for key in expected_entries},
+                    )
+                    self.assertEqual(bundle.profile_json["autopilot"]["mode"],
+                                     "confirm" if preset == "conservative" else "gate")
+                    self.assertEqual(bundle.profile_json["scenes"]["deliver_strategy"], strategy)
+                    self.assertEqual(bundle.profile_json["scenes"]["enable_feedback_email"], feedback)
+                    self.assertEqual(set(bundle.scenes), {
+                        DEFAULT_SPECS["scene_specs"][name]["file"]
+                        for name in SCENE_ORDER
+                    })
                     self.assertTrue(all("{{" not in text for text in (*bundle.scenes.values(), bundle.gemini_block)))
                     self.assertTrue(bundle.gemini_block.startswith("<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"))
                     self.assertTrue(bundle.gemini_block.endswith("\n"))
-                    self.assertEqual(merge_hooks_json({"other": {"hooks": []}}, "/pilot/autopilot.py")["other"], {"hooks": []})
+                    self.assertEqual(
+                        merge_hooks_json({"other": {"hooks": []}}, "/pilot/autopilot.py")["other"],
+                        {"hooks": []},
+                    )
         original = copy.deepcopy(self.project)
         def compile_for(project):
             profile = resolve_profile(self.base, project=project)

@@ -26,7 +26,7 @@ from typing import Any
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .profile import resolve_profile, validate_profile
-from .project import normalize_project
+from .project import normalize_project, project_specs
 from .defaults import DEFAULT_SPECS, MODES, DELIVER_STRATEGIES
 
 
@@ -445,7 +445,8 @@ def _migrate_upgraded_project_shortcuts(
     if not isinstance(shortcuts, dict):
         return migrated
     custom_entry = shortcuts.get("custom_entry")
-    entry_order = project.get("entry_order", ())
+    effective_specs = project_specs(project)
+    entry_order = effective_specs["entry_order"]
     if isinstance(custom_entry, dict):
         for key in list(custom_entry):
             if key not in entry_order:
@@ -461,11 +462,8 @@ def _migrate_upgraded_project_shortcuts(
     enabled_entry = shortcuts.get("enabled_entry")
     if installed_project is not None and not explicit_entry_override and isinstance(enabled_entry, list):
         previous_order = set(installed_project.get("entry_order", ()))
-        recommended_enabled = (
-            project.get("presets", {})
-            .get("recommended", {})
-            .get("shortcuts", {})
-            .get("enabled_entry", ())
+        recommended_enabled = effective_specs["presets"]["recommended"]["shortcuts"].get(
+            "enabled_entry", ()
         )
         for key in recommended_enabled:
             if key in entry_order and key not in previous_order and key not in enabled_entry:
@@ -511,6 +509,7 @@ def _is_older_committed_overlay(
             raise _OverlayHistoryUnknown("无法完整读取 workspace overlay Git 历史")
         commit_list = [item.strip() for item in exhaustive.stdout.splitlines() if item.strip()]
     seen_blobs: dict[str, dict[str, Any] | None] = {}
+    valid_history = False
     for commit in commit_list:
         if not commit or commit == overlay_sha:
             continue
@@ -529,12 +528,16 @@ def _is_older_committed_overlay(
                     parsed = json.loads(content.stdout)
                     seen_blobs[blob_sha] = normalize_project(parsed)
                 except (ValueError, ProfileError):
-                    seen_blobs[blob_sha] = None
+                    raise _OverlayHistoryUnknown("workspace overlay Git 历史包含无效项目配置")
+        valid_history = True
         if seen_blobs[blob_sha] != installed_project:
             continue
-        if git("merge-base", "--is-ancestor", overlay_sha, commit).returncode == 0:
+        ancestry = git("merge-base", "--is-ancestor", overlay_sha, commit)
+        if ancestry.returncode == 0:
             return True
-    if not seen_blobs:
+        if ancestry.returncode != 1:
+            raise _OverlayHistoryUnknown("无法验证 workspace overlay 提交关系")
+    if not valid_history:
         raise _OverlayHistoryUnknown("workspace overlay 没有可验证的 Git 历史")
     return False
 
