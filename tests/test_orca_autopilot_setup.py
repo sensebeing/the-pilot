@@ -456,6 +456,55 @@ class CompilerTest(unittest.TestCase):
             True,
         )
 
+    def test_compiled_guidance_separates_synchronous_and_async_questions(self) -> None:
+        # Failure means the guidance again conflates an in-turn synchronous
+        # question tool call with ending the turn to await an external answer,
+        # or the universal block stops being project-neutral or exceeds the
+        # byte budget the installed GEMINI.md must respect.
+        profile = resolve_profile(self.base, preset="recommended")
+        universal = profile_compiler.render_autopilot_section(
+            resolve_user_profile(self.base, preset="recommended"), 4
+        )
+        self.assertEqual(
+            universal, profile_compiler.render_autopilot_section(profile, 4)
+        )
+        self.assertNotIn("alter", universal.lower())
+        self.assertNotIn("seabass", universal.lower())
+        for clause in (
+            "提问未答",
+            "同步澄清直接调用 `ask_question` 工具",
+            "同一步不写 autopilot 标签",
+            "悬空 `：`",
+            "异步或跨回合等待回复",
+        ):
+            self.assertIn(clause, universal)
+
+        bundle = compile_bundle(profile)
+        plan_scene = bundle.scenes["01-plan-and-orchestrate.md"]
+        self.assertIn("同步 ask_question 直接发起工具调用、不写标签", plan_scene)
+        self.assertIn("提问待答需结束回合时输出 `scene=NONE`", plan_scene)
+        self.assertLess(len(bundle.gemini_block.encode("utf-8")), 20000)
+        for preset in sorted(DEFAULT_SPECS["presets"]):
+            for strategy in DELIVER_STRATEGIES:
+                for feedback in (False, True):
+                    with self.subTest(
+                        preset=preset, strategy=strategy, feedback=feedback
+                    ):
+                        compiled = compile_bundle(
+                            resolve_profile(
+                                self.base,
+                                preset=preset,
+                                overrides={
+                                    "scenes": {
+                                        "deliver_strategy": strategy,
+                                        "enable_feedback_email": feedback,
+                                        "guardrails": ["必须补测试", "不得新增账本"],
+                                    }
+                                },
+                            )
+                        ).gemini_block
+                        self.assertLess(len(compiled.encode("utf-8")), 19600)
+
     def test_gemini_merge_is_non_destructive_and_idempotent(self) -> None:
         block = compile_bundle(
             resolve_profile(self.base)
@@ -943,6 +992,39 @@ class EngineTest(unittest.TestCase):
             ),
             extra_env=extra_env,
         )
+
+    def stop_decision(
+        self,
+        conversation_id: str,
+        steps: list[dict],
+        *,
+        continuation_active: bool | None = None,
+        extra_env: dict | None = None,
+    ) -> dict:
+        """Run Stop on exactly ``steps`` and return the hook decision."""
+        transcript = write_transcript(
+            self.root, f"transcript-{conversation_id}.jsonl", steps
+        )
+        fields = {
+            "transcriptPath": str(transcript),
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": True,
+            "workspacePaths": [str(self.workspace)],
+        }
+        if continuation_active is not None:
+            fields["continuationActive"] = continuation_active
+        result = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(conversation_id, **fields),
+            extra_env=extra_env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout or "{}")
 
     def injection(self, result: subprocess.CompletedProcess) -> str:
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1644,6 +1726,229 @@ class EngineTest(unittest.TestCase):
         )
         self.stop("c-tag-bad-gate", suggestion("继续推进", gate="maybe"))
         self.assertEqual(send_calls(self.root), [])
+
+    def test_unasked_question_lead_in_continues_once_and_settles_after_recovery(self) -> None:
+        # Failure means a long answer that stops on a question lead-in without
+        # the tool call strands the user, or the continuation outlives one user
+        # turn and can loop instead of clearing once the tag is valid again.
+        session = "c-unasked"
+        lead_in = "架构方案已经梳理完毕。\n\n请确认以下 2 个架构与契约边界取舍："
+        first = self.stop_decision(
+            session,
+            [
+                {"type": "USER_INPUT", "content": "请给我完整方案"},
+                {"type": "PLANNER_RESPONSE", "content": lead_in},
+            ],
+        )
+        self.assertEqual(first["decision"], "continue")
+        self.assertIn("ask_question", str(first["reason"]))
+        self.assertEqual(send_calls(self.root), [])
+        state = read_state(self.state, session)
+        continued_turn = state["continued_unasked_turn_id"]
+        self.assertTrue(continued_turn)
+        log_path = self.state / "autopilot.log"
+        continue_event = (
+            f'"event": "stop_continue_unasked_question", "cid": "{session}"'
+        )
+        self.assertIn(continue_event, log_path.read_text(encoding="utf-8"))
+
+        # Replaying the same Stop without AGY's continuation flag is absorbed
+        # by the durable per-user-turn guard and never continues twice.
+        replay = self.stop_decision(
+            session,
+            [
+                {"type": "USER_INPUT", "content": "请给我完整方案"},
+                {"type": "PLANNER_RESPONSE", "content": lead_in},
+            ],
+        )
+        self.assertEqual(replay["decision"], "allow")
+        self.assertEqual(
+            log_path.read_text(encoding="utf-8").count(continue_event), 1
+        )
+
+        # A caller that honors AGY's re-entry flag never continues on it.
+        guarded_session = "c-unasked-active"
+        guarded = self.stop_decision(
+            guarded_session,
+            [
+                {"type": "USER_INPUT", "content": "请给我完整方案"},
+                {"type": "PLANNER_RESPONSE", "content": lead_in},
+            ],
+            continuation_active=True,
+        )
+        self.assertEqual(guarded["decision"], "allow")
+        self.assertNotIn(
+            "continued_unasked_turn_id", read_state(self.state, guarded_session)
+        )
+
+        # The same lead-in shape is recognized with an ASCII colon.
+        ascii_decision = self.stop_decision(
+            "c-unasked-ascii",
+            [
+                {"type": "USER_INPUT", "content": "give me the plan"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "方案已就绪。\nConfirm these 2 contract boundaries:",
+                },
+            ],
+        )
+        self.assertEqual(ascii_decision["decision"], "continue")
+        self.assertEqual(send_calls(self.root), [])
+
+        # The same user turn then answers the question and emits a valid tag:
+        # normal structured prefill/submit resumes despite the old turn guard.
+        recovered = self.stop_decision(
+            session,
+            [
+                {"type": "USER_INPUT", "content": "请给我完整方案"},
+                {"type": "PLANNER_RESPONSE", "content": lead_in},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "先向你确认边界。",
+                    "tool_calls": [{"name": "ask_question", **ask_args(1)}],
+                },
+                {
+                    "type": "TOOL_RESPONSE",
+                    "status": "DONE",
+                    "content": ANSWER_HEADER + "A1: 按方案 A 取舍",
+                },
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": suggestion("按确认的边界推进实施", gate="auto"),
+                },
+            ],
+        )
+        self.assertEqual(recovered["decision"], "allow")
+        sends = send_calls(self.root)
+        self.assertEqual(len(sends), 1)
+        self.assertIn("--enter", sends[0])
+        self.assertEqual(text_argument(sends[0]), "按确认的边界推进实施")
+
+        # A new USER_INPUT is a new user turn: PreInvocation advances the turn
+        # identity, so a later dangling lead-in is protected again.
+        previous_turn = read_state(self.state, session)["continued_unasked_turn_id"]
+        self.pre(session, "再确认一个边界")
+        later = self.stop(
+            session,
+            "",
+            steps=[
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "继续说明。\n\n请确认以下 1 个问题：",
+                }
+            ],
+        )
+        self.assertEqual(later.returncode, 0, later.stderr)
+        self.assertEqual(json.loads(later.stdout)["decision"], "continue")
+        self.assertNotEqual(
+            read_state(self.state, session)["continued_unasked_turn_id"],
+            previous_turn,
+        )
+
+    def test_unasked_question_guard_allows_plain_and_tagged_prose(self) -> None:
+        # Failure means ordinary prose or a valid tagged suggestion is
+        # mistaken for a dangling question lead-in and force-continued.
+        plain = self.stop_decision(
+            "c-plain-prose",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {"type": "PLANNER_RESPONSE", "content": "方案已就绪。"},
+            ],
+        )
+        self.assertEqual(plain["decision"], "allow")
+        self.assertIn(
+            '"event": "stop_invalid_tag", "cid": "c-plain-prose", "reason": "missing_tag"',
+            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+        )
+
+        tagged = self.stop_decision(
+            "c-tagged-colon",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "范围说明：只改本模块。\n\n"
+                    + suggestion("继续推进实施", gate="pause"),
+                },
+            ],
+        )
+        self.assertEqual(tagged["decision"], "allow")
+        sends = send_calls(self.root)
+        self.assertEqual(len(sends), 1)
+        self.assertNotIn("--enter", sends[0])
+        self.assertEqual(text_argument(sends[0]), "继续推进实施")
+        self.assertNotIn(
+            '"event": "stop_continue_unasked_question"',
+            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+        )
+
+    def test_unasked_question_guard_fails_closed_without_complete_content(self) -> None:
+        # Failure means a truncated prefix ending in a colon is guessed into a
+        # continuation instead of failing closed and clearing the suggestion.
+        truncated = self.stop_decision(
+            "c-truncated-lead",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "请确认以下 2 个问题：",
+                    "truncated_fields": ["content"],
+                },
+            ],
+        )
+        self.assertEqual(truncated["decision"], "allow")
+        self.assertNotIn(
+            "continued_unasked_turn_id", read_state(self.state, "c-truncated-lead")
+        )
+        self.assertIn(
+            '"event": "stop_invalid_tag", "cid": "c-truncated-lead", "reason": "missing_tag"',
+            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+        )
+
+    def test_unasked_question_guard_is_silent_for_dispatched_workers(self) -> None:
+        # Failure means a worker turn ending on a colon is force-continued or
+        # writes session state even though workers never run autopilot.
+        steps = [
+            {
+                "type": "USER_INPUT",
+                "content": "Task ID: task_abc123\nDispatch ID: disp_abc123",
+            },
+            {"type": "PLANNER_RESPONSE", "content": "请确认以下 2 个问题："},
+        ]
+        for label, conversation_id, extra_env in (
+            ("preamble", "c-worker-lead", None),
+            ("env", "c-worker-env", {"ORCA_TASK_ID": "task_abc123"}),
+        ):
+            with self.subTest(case=label):
+                decision = self.stop_decision(
+                    conversation_id, steps, extra_env=extra_env
+                )
+                self.assertEqual(decision["decision"], "allow")
+                self.assertFalse(state_path(self.state, conversation_id).exists())
+        log_path = self.state / "autopilot.log"
+        if log_path.is_file():
+            self.assertNotIn(
+                "stop_continue_unasked_question",
+                log_path.read_text(encoding="utf-8"),
+            )
+
+    def test_unasked_question_guard_respects_mode_off(self) -> None:
+        # Failure means switching autopilot off still force-continues a turn.
+        self.pre("c-mode-off-lead", ",mode off")
+        result = self.stop(
+            "c-mode-off-lead",
+            "",
+            steps=[{"type": "PLANNER_RESPONSE", "content": "请确认以下 2 个问题："}],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"decision": "allow"})
+        self.assertNotIn(
+            "continued_unasked_turn_id", read_state(self.state, "c-mode-off-lead")
+        )
+        self.assertNotIn(
+            '"event": "stop_continue_unasked_question", "cid": "c-mode-off-lead"',
+            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+        )
 
     def test_trailing_tag_ignores_markdown_and_earlier_tag_examples(self) -> None:
         # Failure means human formatting or documentation can override execution.

@@ -1497,6 +1497,32 @@ def find_comma_command(config: dict[str, Any], alias: str) -> dict[str, Any] | N
     return None
 
 
+def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
+    """Return whether a final planner reply stops at a question lead-in.
+
+    Long Antigravity answers can end right after `请确认以下 2 个问题：`
+    without ever emitting the question tool call. Only a complete planner
+    response whose last non-code-fence line ends with a colon proves that
+    shape; a truncated prefix ending in a colon is never evidence.
+    """
+    if planner_step.get("type") != "PLANNER_RESPONSE":
+        return False
+    if planner_step.get("tool_calls") or []:
+        return False
+    if "content" in _truncated_fields(planner_step):
+        return False
+    content = planner_step.get("content")
+    if not isinstance(content, str):
+        return False
+    trimmed = content.rstrip()
+    if not trimmed:
+        return False
+    last_line = trimmed.splitlines()[-1].strip()
+    if not last_line or last_line.startswith("```") or last_line.endswith("```"):
+        return False
+    return last_line.endswith(("：", ":"))
+
+
 def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
     termination = str(payload.get("terminationReason") or "")
     fully_idle = payload.get("fullyIdle")
@@ -1561,6 +1587,32 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
 
         parsed = parse_suggestion(str(planners[-1].get("content") or ""))
         if parsed["invalid"]:
+            last_planner = planners[-1]
+            if (
+                parsed["invalid"] == "missing_tag"
+                and current_mode() != "off"
+                and not bool(payload.get("continuationActive"))
+                and state.get("continued_unasked_turn_id") != user_turn
+                and turn_steps[-1] is last_planner
+                and _has_unasked_question_lead_in(last_planner)
+            ):
+                clear_suggestion(state)
+                state["continued_unasked_turn_id"] = user_turn
+                save_state(conversation_id, state)
+                log_event(
+                    "stop_continue_unasked_question",
+                    cid=conversation_id,
+                    turn_id=turn_id,
+                )
+                return {
+                    "decision": "continue",
+                    "reason": (
+                        "上一条回复在冒号引导语处提前结束，既未发出 ask_question 工具调用，"
+                        "也未输出回合结束标签。若需向用户确认问题，请立即直接调用 ask_question "
+                        "工具（不要重复已输出的正文，同一步不写 autopilot 标签）；若无需提问，"
+                        "请补齐收束结论与末尾 <!-- autopilot: ... --> 标签。"
+                    ),
+                }
             clear_suggestion(state)
             save_state(conversation_id, state)
             log_event(
