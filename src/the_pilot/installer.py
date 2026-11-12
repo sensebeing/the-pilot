@@ -432,7 +432,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
-    profile = read_json_object(_installed_path(gemini_dir, "profile.json"), "profile.json")
+    profile = read_json_object(profile_path, "profile.json")
     engine_up_to_date = engine_path.is_file() and (
         engine_path.read_text(encoding="utf-8") == ENGINE_SOURCE_PATH.read_text(encoding="utf-8")
     )
@@ -464,7 +464,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         report["drift"].append("profile.json 缺失")
         return report
 
-    existing_config = read_json_object(_installed_path(gemini_dir, "config.json"), "config.json") or {}
+    existing_config = read_json_object(config_path, "config.json") or {}
     bundle = profile_compiler.compile_bundle(profile, project=project)
     report.update(
         {

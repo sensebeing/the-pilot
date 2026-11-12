@@ -63,6 +63,8 @@ _RUNNING_SCRIPT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 MODES = ("gate", "confirm", "off")
+PROFILE_SCHEMA = "the-pilot-profile/v1"
+LEGACY_PROFILE_SCHEMA = "orca-autopilot-profile/v1"
 RECOVERY_FAILED_MESSAGE = (
     "【Pilot 恢复失败】状态文件未能安全重建，自动投递保持暂停；"
     "请用一句话告知用户，无需执行其他操作。"
@@ -321,13 +323,19 @@ def _pilot_section(profile: dict[str, Any]) -> Any:
     return profile.get("autopilot")
 
 
-def _normalize_pilot_section(profile: dict[str, Any]) -> bool:
-    """Collapse a legacy ``autopilot`` section into canonical ``pilot``."""
+def _prepare_profile_for_write(profile: dict[str, Any]) -> bool:
+    """Normalize a profile to canonical sections before writing it back.
+
+    Two keys in the same profile leave two owners for the same mode and turn
+    cap, so the write fails closed instead of guessing which one wins.
+    """
     if "pilot" in profile and "autopilot" in profile:
         log_event("profile_section_ambiguous")
         return False
     if "autopilot" in profile:
         profile["pilot"] = profile.pop("autopilot")
+    if profile.get("schema") == LEGACY_PROFILE_SCHEMA:
+        profile["schema"] = PROFILE_SCHEMA
     return True
 
 
@@ -460,6 +468,8 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
         profile = load_profile()
         if not profile:
             return False, current_worker_agents(profile), updated
+        if not _prepare_profile_for_write(profile):
+            return False, current_worker_agents(profile), updated
         old_workers = current_worker_agents(profile)
         new_workers = ["codex", "claude"] if primary == "codex" else ["claude", "codex"]
         prepared: list[tuple[Path, str]] = []
@@ -503,7 +513,7 @@ def max_consecutive_turns(profile: dict[str, Any] | None = None) -> int:
 def set_mode(mode: str) -> bool:
     with _file_lock(PILOT_DIR / ".pilot.lock"):
         profile = load_profile()
-        if not profile or not _normalize_pilot_section(profile):
+        if not profile or not _prepare_profile_for_write(profile):
             return False
         pilot = profile.setdefault("pilot", {})
         if not isinstance(pilot, dict):
@@ -1964,6 +1974,12 @@ def command_set(target: str, template: str) -> int:
         if not profile or not config:
             print(
                 "profile.json 或 config.json 不存在；请先运行 pilot apply。",
+                file=sys.stderr,
+            )
+            return 2
+        if not _prepare_profile_for_write(profile):
+            print(
+                "profile.json 同时包含 pilot 与旧版 autopilot 段；请只保留 pilot。",
                 file=sys.stderr,
             )
             return 2

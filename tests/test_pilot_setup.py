@@ -594,6 +594,19 @@ class CompilerTest(unittest.TestCase):
             resolve_profile(
                 self.base, overrides={"shortcuts": {"custom_comma": {"mode": "x"}}}
             )
+        for reserved in ("pilot", "autopilot"):
+            with self.assertRaises(profile_compiler.ProfileError):
+                resolve_profile(
+                    self.base,
+                    overrides={"shortcuts": {"custom_entry": {reserved: "x"}}},
+                )
+            with self.assertRaises(profile_compiler.ProfileError):
+                resolve_profile(
+                    self.base,
+                    overrides={
+                        "shortcuts": {"custom_comma": {reserved: {"template": "x"}}}
+                    },
+                )
         with self.assertRaises(profile_compiler.ProfileError):
             resolve_profile(
                 self.base,
@@ -935,6 +948,43 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(
             json.loads(run_setup(self.root, other, "status").stdout)["drift"], []
         )
+
+    def test_upgrade_mode_override_merges_into_legacy_profile(self) -> None:
+        """Failure means apply --upgrade forks a second mode owner or drops the turn cap.
+
+        resident-fact: settlement: overrides merge into a pre-rename profile
+        after its autopilot section is normalized, so one canonical pilot
+        section carries the new mode and the legacy max_consecutive_auto_turns.
+        """
+        self.seed_legacy_install(self.gemini)
+        apply_profile(self.root, self.gemini, "--upgrade", "--mode", "gate")
+        profile = read_json(self.gemini / PROFILE_REL)
+        self.assertEqual(profile["schema"], "the-pilot-profile/v1")
+        self.assertNotIn("autopilot", profile)
+        self.assertEqual(profile["pilot"]["mode"], "gate")
+        self.assertEqual(profile["pilot"]["max_consecutive_auto_turns"], 5)
+
+    def test_status_requires_canonical_profile_despite_legacy_tree(self) -> None:
+        """Failure means status claims an install the runtime cannot read.
+
+        resident-fact: inspection: status reports installed=false plus the
+        legacy-tree drift when config/the-pilot/runtime.py exists alongside a
+        legacy profile, while the runtime reads only config/the-pilot.
+        """
+        legacy_dir = self.seed_legacy_install(self.gemini)
+        engine = self.gemini / ENGINE_REL
+        engine.parent.mkdir(parents=True, exist_ok=True)
+        engine.write_text("# canonical engine\n", encoding="utf-8")
+
+        report = json.loads(run_setup(self.root, self.gemini, "status").stdout)
+
+        self.assertFalse(report["installed"])
+        self.assertTrue((legacy_dir / "profile.json").is_file())
+        self.assertTrue(
+            any("旧版 config/autopilot" in item for item in report["drift"]),
+            report["drift"],
+        )
+        self.assertIn("profile.json 缺失", report["drift"])
 
     def test_uninstall_removes_only_managed_files(self) -> None:
         self.seed_user_files()
@@ -1702,6 +1752,26 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(len(sends), 1)
         self.assertNotIn("--enter", sends[0])
         self.assertIn("confirm", self.injection(self.pre("c-mode", ",mode status")))
+
+    def test_mode_write_normalizes_a_legacy_profile(self) -> None:
+        """Failure means a runtime write leaves a second section or legacy schema.
+
+        resident-fact: runtime: the mode writer rewrites a pre-rename profile
+        as one canonical pilot section and the-pilot-profile/v1 schema.
+        """
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        profile["schema"] = "orca-autopilot-profile/v1"
+        profile["autopilot"] = profile.pop("pilot")
+        write_json(profile_path, profile)
+
+        message = self.injection(self.pre("c-legacy", ",mode confirm"))
+
+        self.assertIn("confirm", message)
+        updated = read_json(profile_path)
+        self.assertEqual(updated["schema"], "the-pilot-profile/v1")
+        self.assertNotIn("autopilot", updated)
+        self.assertEqual(updated["pilot"]["mode"], "confirm")
 
     def test_scene_none_and_pending_ask_question_clear_without_sending(self) -> None:
         self.stop(

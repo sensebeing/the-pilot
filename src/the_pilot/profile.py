@@ -18,14 +18,16 @@ def resolve_profile(
     """Merge a base profile with one preset and the caller's overrides."""
     specs = project_specs(project)
     presets = specs["presets"]
-    base_copy = _copy_mapping(base, "base profile")
-    merged = base_copy
+    merged = _normalize_pilot_section(_copy_mapping(base, "base profile"))
     if preset is not None:
         if preset not in presets:
             raise ProfileError(f"未知预设 {preset!r}；允许的预设为 {sorted(presets)}")
         merged = _deep_merge(merged, presets[preset])
     if overrides:
-        merged = _deep_merge(merged, _copy_mapping(overrides, "profile overrides"))
+        merged = _deep_merge(
+            merged,
+            _normalize_pilot_section(_copy_mapping(overrides, "profile overrides")),
+        )
     return validate_profile(merged, project=project)
 
 
@@ -292,7 +294,8 @@ def normalize_comma_alias(raw: Any) -> str:
         text = "," + text
     name = text[1:]
     if name in RESERVED_COMMA_ALIASES:
-        raise ProfileError(f"口令 {text} 是保留别名（,1 / ,2 / ,3 / ,mode / ,worker / ,agent）")
+        reserved = " / ".join(f",{item}" for item in sorted(RESERVED_COMMA_ALIASES))
+        raise ProfileError(f"口令 {text} 是保留别名（{reserved}）")
     if not is_comma_alias(name):
         raise ProfileError(f"口令别名 {raw!r} 只能包含小写字母、数字、下划线和横杠")
     return text

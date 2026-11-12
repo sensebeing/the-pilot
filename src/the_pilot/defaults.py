@@ -61,7 +61,7 @@ PIPELINE_STAGE_CONTRACTS = {
 
 DELIVER_STRATEGIES = ("merge_dev_e2e", "merge_dev_only", "local_verify_only")
 
-RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent"})
+RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent", "pilot", "autopilot"})
 
 def is_comma_alias(value: str) -> bool:
     return bool(value) and value[0] in "abcdefghijklmnopqrstuvwxyz0123456789" and all(
