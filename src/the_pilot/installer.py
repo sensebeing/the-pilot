@@ -660,7 +660,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                                     elapsed = time.time() - float(existing.get("last_checked_at") or 0)
                                 except (TypeError, ValueError):
                                     elapsed = 30
-                                if elapsed >= 30:
+                                # Local runtime sync is zero-cooldown; detached remote checks retain the six-hour cadence.
+                                if elapsed >= 6 * 3600:
                                     existing["last_checked_at"] = time.time()
                                     atomic_write_text(state_dir / "auto_update.json", json_text(existing))
                                     try:
