@@ -107,6 +107,16 @@ TAG_FIELDS = frozenset(
         "alt",
     }
 )
+_UNSET = object()
+
+
+class HookExecutionError(RuntimeError):
+    """A hook refused to act because its installed configuration is unusable."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
 
 def _find_all_positions(text: str, marker: str) -> list[int]:
     positions: list[int] = []
@@ -148,16 +158,19 @@ def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
     return ("," + checked if comma else checked), arg
 
 
-def read_payload() -> dict[str, Any]:
+def read_payload() -> tuple[dict[str, Any] | None, str]:
     raw = sys.stdin.read()
     if not raw.strip():
-        return {}
+        return {}, ""
     try:
         payload = json.loads(raw)
     except ValueError as exc:
         log_event("payload_invalid", error=str(exc))
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        return None, f"invalid JSON payload: {exc}"
+    if not isinstance(payload, dict):
+        log_event("payload_invalid", error="not_object")
+        return None, "hook payload must be a JSON object"
+    return payload, ""
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -174,18 +187,23 @@ def log_event(event: str, **fields: Any) -> None:
         return
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """Read one JSON object file, distinguishing absence from corruption.
+
+    ``None`` means the file exists but its content is untrusted; callers must
+    fail closed instead of treating it as empty configuration.
+    """
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return {}, ""
     except (OSError, ValueError) as exc:
         log_event("json_read_failed", path=str(path), error=str(exc))
-        return {}
+        return None, f"{path}: {exc}"
     if not isinstance(value, dict):
         log_event("json_not_object", path=str(path))
-        return {}
-    return value
+        return None, f"{path}: JSON root must be an object"
+    return value, ""
 
 
 def save_text(path: Path, text: str) -> bool:
@@ -269,17 +287,23 @@ def maybe_trigger_auto_update() -> None:
             and _env_value("THE_PILOT_ENABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE") != "1"):
         return
     metadata_path = STATE_DIR / "auto_update.json"
+    metadata, metadata_err = load_json(metadata_path)
+    if metadata is None:
+        log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
+        return
     try:
-        metadata = load_json(metadata_path)
         if time.time() - float(metadata.get("last_checked_at") or 0) < AUTO_UPDATE_INTERVAL_SECONDS:
             return
     except (TypeError, ValueError):
-        metadata = {}
+        pass
     pilot_bin = _pilot_binary()
     if not pilot_bin:
         return
     with _file_lock(STATE_DIR / "auto_update.lock"):
-        metadata = load_json(metadata_path)
+        metadata, metadata_err = load_json(metadata_path)
+        if metadata is None:
+            log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
+            return
         try:
             cooldown = time.time() - float(metadata.get("last_checked_at") or 0)
         except (TypeError, ValueError):
@@ -301,11 +325,15 @@ def maybe_trigger_auto_update() -> None:
         log_event("auto_update_spawned", path=pilot_bin)
 
 
-def load_profile() -> dict[str, Any]:
-    return load_json(PROFILE_PATH)
+def load_profile() -> tuple[dict[str, Any] | None, str]:
+    value, error = load_json(PROFILE_PATH)
+    if value is not None and "pilot" in value and "autopilot" in value:
+        log_event("profile_section_ambiguous")
+        return None, f"{PROFILE_PATH}: profile contains both pilot and autopilot sections"
+    return value, error
 
 
-def load_config() -> dict[str, Any]:
+def load_config() -> tuple[dict[str, Any] | None, str]:
     return load_json(CONFIG_PATH)
 
 
@@ -339,8 +367,10 @@ def _prepare_profile_for_write(profile: dict[str, Any]) -> bool:
     return True
 
 
-def current_mode(profile: dict[str, Any] | None = None) -> str:
-    current = profile if profile is not None else load_profile()
+def current_mode(profile: Any = _UNSET) -> str:
+    current = profile if profile is not _UNSET else load_profile()[0]
+    if not isinstance(current, dict):
+        return "off"
     pilot = _pilot_section(current)
     if isinstance(pilot, dict):
         mode = str(pilot.get("mode") or "").lower()
@@ -349,8 +379,12 @@ def current_mode(profile: dict[str, Any] | None = None) -> str:
     return "off"
 
 
-def _current_agents(profile: dict[str, Any] | None, key: str, defaults: list[str]) -> list[str]:
-    current = profile if profile is not None else load_profile()
+def _current_agents(
+    profile: Any = _UNSET, *, key: str, defaults: list[str]
+) -> list[str]:
+    current = profile if profile is not _UNSET else load_profile()[0]
+    if not isinstance(current, dict):
+        return defaults
     orchestration = current.get("orchestration")
     agents = orchestration.get(key) if isinstance(orchestration, dict) else None
     if (isinstance(agents, list) and agents
@@ -360,8 +394,8 @@ def _current_agents(profile: dict[str, Any] | None, key: str, defaults: list[str
     return defaults
 
 
-def current_worker_agents(profile: dict[str, Any] | None = None) -> list[str]:
-    return _current_agents(profile, "worker_agents", ["claude", "codex"])
+def current_worker_agents(profile: Any = _UNSET) -> list[str]:
+    return _current_agents(profile, key="worker_agents", defaults=["claude", "codex"])
 
 
 def worker_priority(workers: list[str]) -> str:
@@ -465,7 +499,10 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
         return False, current_worker_agents(), []
     updated: list[str] = []
     with _file_lock(PILOT_DIR / ".pilot.lock"):
-        profile = load_profile()
+        profile, profile_err = load_profile()
+        if profile is None:
+            log_event("worker_write_profile_corrupt", error=profile_err)
+            return False, current_worker_agents(), updated
         if not profile:
             return False, current_worker_agents(profile), updated
         if not _prepare_profile_for_write(profile):
@@ -500,8 +537,10 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
     return True, new_workers, updated
 
 
-def max_consecutive_turns(profile: dict[str, Any] | None = None) -> int:
-    current = profile if profile is not None else load_profile()
+def max_consecutive_turns(profile: Any = _UNSET) -> int:
+    current = profile if profile is not _UNSET else load_profile()[0]
+    if not isinstance(current, dict):
+        return 8
     pilot = _pilot_section(current)
     if isinstance(pilot, dict):
         value = pilot.get("max_consecutive_auto_turns")
@@ -512,7 +551,10 @@ def max_consecutive_turns(profile: dict[str, Any] | None = None) -> int:
 
 def set_mode(mode: str) -> bool:
     with _file_lock(PILOT_DIR / ".pilot.lock"):
-        profile = load_profile()
+        profile, profile_err = load_profile()
+        if profile is None:
+            log_event("mode_write_profile_corrupt", error=profile_err)
+            return False
         if not profile or not _prepare_profile_for_write(profile):
             return False
         pilot = profile.setdefault("pilot", {})
@@ -916,21 +958,28 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, text[end + 5 :]
 
 
-def scan_scenes() -> dict[str, dict[str, Any]]:
+def scan_scenes_checked() -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Read every scene file, returning unreadable ones instead of hiding them."""
     scenes: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
     if not SCENES_DIR.is_dir():
-        return scenes
+        return scenes, errors
     for path in sorted(SCENES_DIR.glob("*.md")):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
             log_event("scene_read_failed", path=str(path), error=str(exc))
+            errors.append(f"{path}: {exc}")
             continue
         meta, body = split_frontmatter(text)
         name = str(meta.get("name") or "")
         if name:
             scenes[name] = {"meta": meta, "body": body, "path": path}
-    return scenes
+    return scenes, errors
+
+
+def scan_scenes() -> dict[str, dict[str, Any]]:
+    return scan_scenes_checked()[0]
 
 
 def scene_gate_default(scene: str, scenes: dict[str, dict[str, Any]]) -> str:
@@ -1431,8 +1480,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
-    config = load_config()
-    profile = load_profile()
+    config, config_err = load_config()
+    profile, profile_err = load_profile()
     user_turn = turn_user_identity(steps)
     recovery_requested = bool(_named_command(text, {"pilot", "autopilot"}, {"recover"}))
     with state_lock(conversation_id):
@@ -1460,6 +1509,18 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 "【Pilot 会话状态已恢复】原状态文件已备份留证并重建；"
                 "自动投递恢复正常。请用一句话告知用户，无需执行其他操作。"
             )
+        if profile is None or config is None:
+            # Corrupt preferences cannot be trusted as a source for worker
+            # reload or shortcut expansion; drop transient delivery state and
+            # fail the hook instead of degrading to guesses.
+            state["auto_submitted_text"] = ""
+            state["candidates"] = []
+            state["candidate_turn_id"] = ""
+            if not save_state(conversation_id, state):
+                log_event("pre_state_save_failed", cid=conversation_id)
+            detail = profile_err or config_err
+            log_event("pre_invocation_config_corrupt", cid=conversation_id, error=detail)
+            raise HookExecutionError("config_corrupt", detail)
         worker_reload_msg = ""
         prev_workers = state.get("loaded_worker_agents")
         cur_workers = current_worker_agents(profile)
@@ -1668,6 +1729,17 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         if state is None:
             log_event("stop_state_corrupt", cid=conversation_id)
             return {"decision": "allow"}
+        profile, profile_err = load_profile()
+        scenes, scene_errors = scan_scenes_checked()
+        if profile is None or scene_errors:
+            # Corrupt preferences or scene files cannot be trusted to decide
+            # delivery; clear the transient suggestion and fail the Stop hook
+            # so no continuation or terminal send can happen.
+            clear_suggestion(state)
+            save_state(conversation_id, state)
+            detail = profile_err or "; ".join(scene_errors)
+            log_event("stop_config_corrupt", cid=conversation_id, error=detail)
+            raise HookExecutionError("config_corrupt", detail)
         current_user_turn = str(state.get("current_user_turn_id") or "")
         if current_user_turn and current_user_turn != user_turn:
             log_event(
@@ -1711,7 +1783,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             last_planner = planners[-1]
             if (
                 parsed["invalid"] == "missing_tag"
-                and current_mode() != "off"
+                and current_mode(profile) != "off"
                 and not bool(payload.get("continuationActive"))
                 and state.get("continued_unasked_turn_id") != user_turn
                 and turn_steps[-1] is last_planner
@@ -1749,7 +1821,6 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return {"decision": "allow"}
 
-        scenes = scan_scenes()
         scene = str(parsed["scene"])
         if scene == "NONE" or not parsed["prompt"] or scene not in scenes:
             clear_suggestion(state)
@@ -1757,7 +1828,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             log_event("stop_without_suggestion", cid=conversation_id, scene=scene or "")
             return {"decision": "allow"}
 
-        mode = current_mode()
+        mode = current_mode(profile)
         if mode == "off":
             clear_suggestion(state)
             save_state(conversation_id, state)
@@ -1787,7 +1858,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         auto_eligible = mode == "gate" and gate == "auto"
         auto_submit = auto_eligible and int(
             state.get("consecutive_auto_turns") or 0
-        ) < max_consecutive_turns()
+        ) < max_consecutive_turns(profile)
         if auto_submit:
             handle = resolve_terminal(workspace_path, explicit_handle)
             if not handle:
@@ -1877,11 +1948,19 @@ def command_sync() -> int:
     # Serialize with apply/uninstall and re-read every input under the lock so a
     # sync that started before an uninstall cannot write the managed block back.
     with _file_lock(PILOT_DIR / ".pilot.lock"):
-        if not PROFILE_PATH.is_file():
+        profile, profile_err = load_profile()
+        scenes, scene_errors = scan_scenes_checked()
+        if profile is None:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+            return 2
+        if not profile:
             print(
-                "未安装（缺少 profile.json）；请先运行 pilot apply。",
+                "未安装（缺少或为空的 profile.json）；请先运行 pilot apply。",
                 file=sys.stderr,
             )
+            return 2
+        if scene_errors:
+            print("场景文件不可读：" + "; ".join(scene_errors), file=sys.stderr)
             return 2
         try:
             text = GEMINI_MD_PATH.read_text(encoding="utf-8")
@@ -1893,7 +1972,7 @@ def command_sync() -> int:
             print("GEMINI.md 的场景托管标记缺失、重复或顺序错误。", file=sys.stderr)
             return 2
         begin_marker, end_marker, start, end = bounds
-        inner = f"{begin_marker}\n\n{render_scenes_block(scan_scenes())}\n\n{end_marker}"
+        inner = f"{begin_marker}\n\n{render_scenes_block(scenes)}\n\n{end_marker}"
         merged = text[:start] + inner + text[end + len(end_marker):]
         if not save_text(GEMINI_MD_PATH, merged):
             print("无法写入 GEMINI.md。", file=sys.stderr)
@@ -1904,11 +1983,16 @@ def command_sync() -> int:
 
 
 def command_status(as_json: bool) -> int:
-    profile = load_profile()
-    scenes = scan_scenes()
-    config = load_config()
-    hooks = load_json(GEMINI_DIR / "config" / "hooks.json")
+    profile, profile_err = load_profile()
+    scenes, scene_errors = scan_scenes_checked()
+    config, config_err = load_config()
+    hooks, hooks_err = load_json(GEMINI_DIR / "config" / "hooks.json")
+    errors = [error for error in (profile_err, config_err, hooks_err) if error]
+    errors.extend(scene_errors)
+    config = config or {}
     report = {
+        "ok": not errors,
+        "errors": errors,
         "gemini_dir": str(GEMINI_DIR),
         "mode": current_mode(profile),
         "worker_agents": current_worker_agents(profile),
@@ -1923,18 +2007,20 @@ def command_status(as_json: bool) -> int:
                 for alias in (command.get("aliases") or [])
             }
         ),
-        "hooks_group": "the-pilot" in hooks,
+        "hooks_group": "the-pilot" in (hooks or {}),
         "engine": str(Path(__file__).resolve()),
         "profile": str(PROFILE_PATH),
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
         print(f"mode: {report['mode']}  max_turns: {report['max_consecutive_auto_turns']}")
         print("scenes: " + (", ".join(report["scenes"]) or "（无）"))
         print("entry: " + (", ".join(report["entry_shortcuts"]) or "（无）"))
         print("hooks_group: " + ("yes" if report["hooks_group"] else "no"))
-    return 0
+    return 2 if errors else 0
 
 
 def _command_identity(
@@ -1969,8 +2055,14 @@ def command_set(target: str, template: str) -> int:
         print("模板不能为空。", file=sys.stderr)
         return 2
     with _file_lock(PILOT_DIR / ".pilot.lock"):
-        profile = load_profile()
-        config = load_config()
+        profile, profile_err = load_profile()
+        config, config_err = load_config()
+        if profile is None:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+            return 2
+        if config is None:
+            print(f"config.json 损坏：{config_err}", file=sys.stderr)
+            return 2
         if not profile or not config:
             print(
                 "profile.json 或 config.json 不存在；请先运行 pilot apply。",
@@ -2041,22 +2133,55 @@ def command_log(limit: int) -> int:
     return 0
 
 
+def _hook_failure(event: str, error: str, detail: str) -> int:
+    """Report a refused hook as structured JSON on stderr with exit code 2."""
+    print(
+        json.dumps(
+            {"ok": False, "event": event, "error": error, "detail": detail},
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+    return 2
+
+
 def run_hook(event: str) -> int:
-    payload = read_payload()
+    payload, payload_err = read_payload()
+    if payload is None:
+        return _hook_failure(event, "invalid_payload", payload_err)
     try:
         if event == "PreInvocation":
             result = handle_pre_invocation(payload)
         else:
             result = handle_stop(payload)
+    except HookExecutionError as exc:
+        return _hook_failure(event, exc.code, exc.detail)
     except Exception as exc:
-        log_event("hook_failed", event=event, error=repr(exc))
-        result = {} if event == "PreInvocation" else {"decision": "allow"}
+        log_event("hook_failed", hook_event=event, error=repr(exc))
+        return _hook_failure(event, "internal_error", repr(exc))
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
 def command_worker(target: str, as_json: bool) -> int:
-    success, workers, updated = (True, current_worker_agents(), []) if target == "status" else set_worker_agents(target)
+    profile, profile_err = load_profile()
+    if profile is None:
+        report = {
+            "ok": False,
+            "error": profile_err,
+            "worker_agents": [],
+            "updated_files": [],
+        }
+        if as_json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+        return 2
+    success, workers, updated = (
+        (True, current_worker_agents(profile), [])
+        if target == "status"
+        else set_worker_agents(target)
+    )
     report = {"ok": success, "worker_agents": workers, "updated_files": updated}
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -2070,10 +2195,14 @@ def command_worker(target: str, as_json: bool) -> int:
 
 
 def command_mode(target: str) -> int:
+    profile, profile_err = load_profile()
+    if profile is None:
+        print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+        return 2
     if target != "status" and not set_mode(target):
         print("Mode switch failed: profile.json is missing or unwritable.", file=sys.stderr)
         return 2
-    print(f"Pilot mode: {current_mode()}")
+    print(f"Pilot mode: {current_mode(profile)}")
     return 0
 
 

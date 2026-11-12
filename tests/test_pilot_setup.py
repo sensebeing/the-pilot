@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shlex
@@ -22,7 +23,10 @@ import unittest
 
 
 from functools import partial
+from unittest import mock
+
 from the_pilot import compiler as profile_compiler
+from the_pilot.assets import runtime
 from the_pilot.profile import resolve_profile as resolve_user_profile, normalize_comma_alias
 from the_pilot.defaults import DEFAULT_SPECS, DELIVER_STRATEGIES, HARNESS_ORCHESTRATION_SENTENCE
 from the_pilot.project import ProfileError
@@ -3183,6 +3187,197 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(
             profile["shortcuts"]["template_overrides"]["r"], "升级并发模板 {arg}"
         )
+
+    def test_corrupt_profile_fails_closed_across_commands_and_hooks(self) -> None:
+        """Failure means a corrupt profile degrades into empty preferences.
+
+        resident-fact: fail-closed: a corrupt profile.json makes status, mode,
+        worker, sync and both hooks exit 2 with diagnostics, while the
+        session's loaded worker list stays intact and nothing is sent.
+        """
+        self.pre("c-corrupt-profile", "初始化会话")
+        loaded = read_state(self.state, "c-corrupt-profile")["loaded_worker_agents"]
+        profile_path = self.gemini / PROFILE_REL
+        profile_path.write_bytes(b"{broken")
+        gemini_md = self.gemini / GEMINI_REL
+        gemini_before = gemini_md.read_bytes()
+
+        status = run_engine(self.root, self.gemini, self.state, "status", "--json")
+        self.assertEqual(status.returncode, 2, status.stderr)
+        report = json.loads(status.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("profile.json" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+        mode = run_engine(self.root, self.gemini, self.state, "mode", "status")
+        self.assertEqual(mode.returncode, 2)
+        self.assertIn("profile.json 损坏", mode.stderr)
+
+        worker = run_engine(
+            self.root, self.gemini, self.state, "worker", "status", "--json"
+        )
+        self.assertEqual(worker.returncode, 2)
+        worker_report = json.loads(worker.stdout)
+        self.assertFalse(worker_report["ok"])
+        self.assertEqual(worker_report["worker_agents"], [])
+        self.assertIn("profile.json", worker_report["error"])
+
+        sync = run_engine(self.root, self.gemini, self.state, "sync")
+        self.assertEqual(sync.returncode, 2)
+        self.assertIn("profile.json 损坏", sync.stderr)
+        self.assertEqual(gemini_md.read_bytes(), gemini_before)
+
+        pre = self.pre("c-corrupt-profile", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_corrupt")
+
+        stop = self.stop("c-corrupt-profile", suggestion("继续推进", gate="auto"))
+        self.assertEqual(stop.returncode, 2)
+        self.assertEqual(stop.stdout, "")
+        self.assertEqual(json.loads(stop.stderr)["error"], "config_corrupt")
+
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(
+            read_state(self.state, "c-corrupt-profile")["loaded_worker_agents"],
+            loaded,
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("pre_invocation_config_corrupt", log)
+        self.assertIn("stop_config_corrupt", log)
+
+    def test_corrupt_config_fails_closed_in_status_set_and_pre_invocation(self) -> None:
+        """Failure means a corrupt config degrades into default shortcuts.
+
+        resident-fact: fail-closed: a corrupt config.json makes status, set and
+        PreInvocation exit 2 with diagnostics, leaves the installed config
+        untouched, and preserves the session's loaded worker list.
+        """
+        self.pre("c-corrupt-config", "初始化会话")
+        loaded = read_state(self.state, "c-corrupt-config")["loaded_worker_agents"]
+        config_path = self.gemini / CONFIG_REL
+        config_path.write_bytes(b"{broken")
+
+        status = run_engine(self.root, self.gemini, self.state, "status", "--json")
+        self.assertEqual(status.returncode, 2, status.stderr)
+        report = json.loads(status.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("config.json" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+        set_result = run_engine(
+            self.root, self.gemini, self.state, "set", "r", "新模板 {arg}"
+        )
+        self.assertEqual(set_result.returncode, 2)
+        self.assertIn("config.json 损坏", set_result.stderr)
+        self.assertEqual(config_path.read_bytes(), b"{broken")
+
+        pre = self.pre("c-corrupt-config", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_corrupt")
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(
+            read_state(self.state, "c-corrupt-config")["loaded_worker_agents"],
+            loaded,
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("pre_invocation_config_corrupt", log)
+
+    def test_unreadable_scene_fails_closed_in_status_sync_and_stop(self) -> None:
+        """Failure means an unreadable scene file is silently dropped from routing.
+
+        resident-fact: fail-closed: an unreadable scene file makes status and
+        sync exit 2, and Stop refuses to deliver against an incomplete scene set.
+        """
+        self.pre("c-scene-corrupt", "初始化会话")
+        (self.gemini / SCENES_REL / "99-broken.md").mkdir()
+        gemini_md = self.gemini / GEMINI_REL
+        gemini_before = gemini_md.read_bytes()
+
+        status = run_engine(self.root, self.gemini, self.state, "status", "--json")
+        self.assertEqual(status.returncode, 2, status.stderr)
+        report = json.loads(status.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("99-broken.md" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+        sync = run_engine(self.root, self.gemini, self.state, "sync")
+        self.assertEqual(sync.returncode, 2)
+        self.assertIn("场景文件不可读", sync.stderr)
+        self.assertEqual(gemini_md.read_bytes(), gemini_before)
+
+        stop = self.stop("c-scene-corrupt", suggestion("继续推进", gate="auto"))
+        self.assertEqual(stop.returncode, 2)
+        self.assertEqual(stop.stdout, "")
+        self.assertEqual(json.loads(stop.stderr)["error"], "config_corrupt")
+        self.assertEqual(send_calls(self.root), [])
+
+    def test_hook_rejects_invalid_payload_and_internal_errors(self) -> None:
+        """Failure means a broken hook input or runtime bug exits 0 as a no-op.
+
+        resident-fact: observability: invalid hook payloads and internal
+        exceptions exit 2 with a structured JSON error instead of a fake
+        allow, and both shapes are recorded in the runtime log.
+        """
+        malformed = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "PreInvocation",
+            stdin="{not json",
+        )
+        self.assertEqual(malformed.returncode, 2)
+        self.assertEqual(malformed.stdout, "")
+        failure = json.loads(malformed.stderr)
+        self.assertFalse(failure["ok"])
+        self.assertEqual(failure["event"], "PreInvocation")
+        self.assertEqual(failure["error"], "invalid_payload")
+
+        not_object = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin="[]",
+        )
+        self.assertEqual(not_object.returncode, 2)
+        self.assertEqual(not_object.stdout, "")
+        self.assertEqual(
+            json.loads(not_object.stderr)["detail"],
+            "hook payload must be a JSON object",
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("payload_invalid", log)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stderr = io.StringIO()
+            with mock.patch.object(runtime, "STATE_DIR", root), mock.patch.object(
+                runtime, "LOG_PATH", root / "pilot.log"
+            ), mock.patch.object(
+                runtime.sys, "stdin", io.StringIO(payload("c-internal"))
+            ), mock.patch.object(
+                runtime.sys, "stderr", stderr
+            ), mock.patch.object(
+                runtime, "handle_pre_invocation", side_effect=RuntimeError("boom")
+            ):
+                code = runtime.run_hook("PreInvocation")
+            self.assertEqual(code, 2)
+            internal = json.loads(stderr.getvalue())
+            self.assertEqual(internal["error"], "internal_error")
+            self.assertIn("boom", internal["detail"])
+            self.assertIn("hook_failed", (root / "pilot.log").read_text(encoding="utf-8"))
 
     def test_status_reports_active_mode_scenes_and_hook_group(self) -> None:
         status = run_engine(self.root, self.gemini, self.state, "status", "--json")
