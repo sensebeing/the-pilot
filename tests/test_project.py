@@ -606,6 +606,211 @@ class ProjectTest(unittest.TestCase):
         self.assertIn("template_overrides", error["error"])
         self.assertEqual(profile_path.read_text(), installed)
 
+    def test_command_id_alias_never_shadows_a_canonical_entry_key(self):
+        """A secondary command_id never outranks another shortcut's own key.
+
+        Failure means `template_overrides` keyed `beta` or `,beta` binds to
+        alpha when alpha's command_id literally names beta, so the override
+        follows entry order and silently retargets alpha, and disabling beta
+        hijacks alpha instead of failing closed.
+        """
+
+        def overlay(order, command_id):
+            return {
+                "schema": "the-pilot-project/v1",
+                "projectId": "command-id-collision",
+                "entry_order": [*order, "r", "rt", "d", "pull"],
+                "entry_specs": {
+                    "alpha": {
+                        "command_id": command_id,
+                        "description": "alpha",
+                        "requires_arg": False,
+                        "usage": "alpha",
+                        "template": "alpha",
+                    },
+                    "beta": {
+                        "command_id": "CMD_B",
+                        "description": "beta",
+                        "requires_arg": False,
+                        "usage": "beta",
+                        "template": "beta",
+                    },
+                },
+                "presets": {
+                    "recommended": {
+                        "shortcuts": {
+                            "enabled_entry": [*order, "r", "rt", "d", "pull"]
+                        }
+                    }
+                },
+            }
+
+        for command_id in ("beta", ",BETA"):
+            for order in (["alpha", "beta"], ["beta", "alpha"]):
+                for raw_key in ("beta", ",beta"):
+                    with self.subTest(
+                        command_id=command_id, order=order, raw_key=raw_key
+                    ):
+                        profile = copy.deepcopy(self.base)
+                        profile["shortcuts"]["enabled_entry"] = [
+                            *order,
+                            "r",
+                            "rt",
+                            "d",
+                            "pull",
+                        ]
+                        profile["shortcuts"]["template_overrides"] = {
+                            raw_key: "beta tpl"
+                        }
+                        resolved = resolve_profile(
+                            profile,
+                            preset=None,
+                            project=overlay(order, command_id),
+                        )
+                        self.assertEqual(
+                            resolved["shortcuts"]["template_overrides"],
+                            {"beta": "beta tpl"},
+                        )
+                        bundle = compile_bundle(
+                            resolved, project=overlay(order, command_id)
+                        )
+                        self.assertEqual(
+                            bundle.config_json["entry_shortcuts"]["beta"]["template"],
+                            "beta tpl",
+                        )
+                        self.assertEqual(
+                            bundle.config_json["entry_shortcuts"]["alpha"]["template"],
+                            "alpha",
+                        )
+
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+        config_path = self.gemini / "config/the-pilot/config.json"
+        for command_id in ("beta", ",BETA"):
+            paths = {}
+            for name, order in (
+                ("alpha-first", ["alpha", "beta"]),
+                ("beta-first", ["beta", "alpha"]),
+            ):
+                path = self.root / f"{name}.json"
+                path.write_text(json.dumps(overlay(order, command_id)))
+                paths[name] = path
+
+            for raw_key in ("beta", ",beta"):
+                self.cli("apply", "--project", str(paths["alpha-first"]))
+                profile = json.loads(profile_path.read_text())
+                profile["shortcuts"]["template_overrides"] = {
+                    raw_key: "beta tpl"
+                }
+                profile_path.write_text(json.dumps(profile))
+
+                self.cli("apply", "--project", str(paths["beta-first"]))
+                switched = json.loads(profile_path.read_text())
+                self.assertEqual(
+                    switched["shortcuts"]["template_overrides"],
+                    {"beta": "beta tpl"},
+                )
+                config = json.loads(config_path.read_text())
+                self.assertEqual(
+                    config["entry_shortcuts"]["beta"]["template"], "beta tpl"
+                )
+                self.assertEqual(
+                    config["entry_shortcuts"]["alpha"]["template"], "alpha"
+                )
+
+        disable_path = self.root / "disable.json"
+        disable_path.write_text(json.dumps(overlay(["alpha", "beta"], "beta")))
+        self.cli("apply", "--project", str(disable_path))
+        installed = profile_path.read_text()
+        error = self.cli(
+            "apply",
+            "--project",
+            str(disable_path),
+            "--entry-shortcuts",
+            "alpha",
+            ok=False,
+        )
+        self.assertIn("template_overrides", error["error"])
+        self.assertIn("不存在", error["error"])
+        self.assertIn("'beta'", error["error"])
+        self.assertEqual(profile_path.read_text(), installed)
+
+    def test_conflicting_secondary_command_ids_fail_closed(self):
+        """No two active shortcuts may share one command identity.
+
+        Failure means an overlay entry and a custom shortcut with the same
+        command_id are accepted, so `template_overrides` binds by section
+        order and the compiler either double-registers or drops a command.
+        """
+
+        def overlay(order, command_id):
+            return {
+                "schema": "the-pilot-project/v1",
+                "projectId": "shared-command-id",
+                "entry_order": order,
+                "entry_specs": {
+                    "alpha": {
+                        "command_id": command_id,
+                        "description": "alpha",
+                        "requires_arg": False,
+                        "usage": "alpha",
+                        "template": "alpha",
+                    },
+                },
+                "presets": {
+                    "recommended": {
+                        "shortcuts": {
+                            "enabled_entry": order
+                        }
+                    }
+                },
+            }
+
+        orders = (
+            ["alpha", "r", "rt", "d", "pull"],
+            ["r", "rt", "d", "pull", "alpha"],
+        )
+        sections = (
+            ("custom_entry", "CMD_CUSTOM_ENTRY_REQ"),
+            ("custom_comma", "CMD_CUSTOM_COMMA_REQ"),
+        )
+        for section, command_id in sections:
+            for order in orders:
+                profile = copy.deepcopy(self.base)
+                profile["shortcuts"]["enabled_entry"] = list(order)
+                profile["shortcuts"][section] = {
+                    "req": {"template": "request {arg}"}
+                }
+                profile["shortcuts"]["template_overrides"] = {
+                    command_id: "shared tpl"
+                }
+                with self.subTest(section=section, order=order):
+                    with self.assertRaises(ProfileError) as caught:
+                        resolve_profile(
+                            profile,
+                            preset=None,
+                            project=overlay(order, command_id),
+                        )
+                    self.assertIn(
+                        f"命令身份冲突：{command_id}", str(caught.exception)
+                    )
+
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["custom_entry"] = {"req": {"template": "request {arg}"}}
+        profile["shortcuts"]["template_overrides"] = {
+            "CMD_CUSTOM_ENTRY_REQ": "shared tpl"
+        }
+        profile_path.write_text(json.dumps(profile))
+        installed = profile_path.read_text()
+
+        for index, order in enumerate(orders):
+            path = self.root / f"shared-{index}.json"
+            path.write_text(json.dumps(overlay(order, "CMD_CUSTOM_ENTRY_REQ")))
+            error = self.cli("apply", "--project", str(path), ok=False)
+            self.assertIn("命令身份冲突", error["error"])
+            self.assertEqual(profile_path.read_text(), installed)
+
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"
         (repo / ".pilot").mkdir(parents=True)
