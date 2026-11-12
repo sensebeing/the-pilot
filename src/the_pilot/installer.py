@@ -26,7 +26,7 @@ from typing import Any
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .profile import resolve_profile, validate_profile
-from .project import normalize_project, project_specs
+from .project import ProfileError, normalize_project, project_specs
 from .defaults import DEFAULT_SPECS, MODES, DELIVER_STRATEGIES
 
 
@@ -508,8 +508,9 @@ def _is_older_committed_overlay(
         if exhaustive.returncode != 0:
             raise _OverlayHistoryUnknown("无法完整读取 workspace overlay Git 历史")
         commit_list = [item.strip() for item in exhaustive.stdout.splitlines() if item.strip()]
+    if not commit_list:
+        raise _OverlayHistoryUnknown("workspace overlay 没有可验证的 Git 历史")
     seen_blobs: dict[str, dict[str, Any] | None] = {}
-    valid_history = False
     for commit in commit_list:
         if not commit or commit == overlay_sha:
             continue
@@ -528,8 +529,7 @@ def _is_older_committed_overlay(
                     parsed = json.loads(content.stdout)
                     seen_blobs[blob_sha] = normalize_project(parsed)
                 except (ValueError, ProfileError):
-                    raise _OverlayHistoryUnknown("workspace overlay Git 历史包含无效项目配置")
-        valid_history = True
+                    seen_blobs[blob_sha] = None
         if seen_blobs[blob_sha] != installed_project:
             continue
         ancestry = git("merge-base", "--is-ancestor", overlay_sha, commit)
@@ -537,8 +537,6 @@ def _is_older_committed_overlay(
             return True
         if ancestry.returncode != 1:
             raise _OverlayHistoryUnknown("无法验证 workspace overlay 提交关系")
-    if not valid_history:
-        raise _OverlayHistoryUnknown("workspace overlay 没有可验证的 Git 历史")
     return False
 
 

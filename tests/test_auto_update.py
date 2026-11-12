@@ -26,6 +26,9 @@ class AutoUpdateTest(unittest.TestCase):
             fixture["projectId"] = "overlay-test"
             pilot_dir = repo / ".pilot"
             pilot_dir.mkdir()
+            (pilot_dir / "project.json").write_text("{invalid json\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "ancient-invalid"], check=True, capture_output=True)
             (pilot_dir / "project.json").write_text(json.dumps(fixture))
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-m", "v1"], check=True, capture_output=True)
@@ -63,6 +66,34 @@ class AutoUpdateTest(unittest.TestCase):
                 "--gemini-dir", str(gemini), "--json",
             ])
             self.assertEqual(installer.self_update(newer_args)["project_status"], "updated")
+
+    def test_single_overlay_commit_does_not_block_clean_sync(self):
+        """A clean one-commit overlay remains synchronizable when installed data differs."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            repo = root / "repo"
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
+                subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
+            project = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
+            project["projectId"] = "single-commit"
+            (repo / ".pilot").mkdir()
+            (repo / ".pilot/project.json").write_text(json.dumps(project, separators=(",", ":")))
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "overlay"], check=True, capture_output=True)
+            gemini = root / "gemini"
+            installer.apply(installer.build_parser().parse_args([
+                "apply", "--gemini-dir", str(gemini), "--project", str(repo), "--json",
+            ]))
+            installed = gemini / "config/autopilot/project.json"
+            altered = dict(project, description="manually installed")
+            installed.write_text(json.dumps(altered, indent=2) + "\n")
+            args = installer.build_parser().parse_args([
+                "self-update", "--project-only", "--workspace", str(repo),
+                "--gemini-dir", str(gemini), "--json",
+            ])
+            self.assertEqual(installer.self_update(args)["project_status"], "updated")
+            self.assertEqual(json.loads(installed.read_text())["description"], project["description"])
     def test_workspace_overlay_sync_is_invoked_before_runtime_load(self):
         """Matching project IDs sync the workspace overlay on the same turn."""
         with tempfile.TemporaryDirectory() as root:
