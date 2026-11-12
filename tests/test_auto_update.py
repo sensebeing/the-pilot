@@ -290,6 +290,9 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertIn("V2 hello", json.dumps(result, ensure_ascii=False))
             self.assertEqual(json.loads((gemini / "config/autopilot/profile.json").read_text())["autopilot"]["max_consecutive_auto_turns"], 9)
             self.assertEqual(json.loads((gemini / "config/autopilot/project.json").read_text())["entry_specs"]["cq"]["template"], "V2 {arg}")
+            log_text = (state_dir / "autopilot.log").read_text()
+            self.assertIn("project_auto_synced", log_text)
+            self.assertNotIn("project_auto_sync_failed", log_text)
 
     def test_self_update_pulls_new_commit_syncs_skills_and_preserves_profile(self):
         """A clean main checkout pulls upstream commits, syncs skill symlinks, and preserves profile.json."""
@@ -389,6 +392,12 @@ class AutoUpdateTest(unittest.TestCase):
                 uv_log.write_text("")
                 installer.self_update(args)
                 self.assertEqual(uv_log.read_text(), "")
+                (state / "auto_update.json").write_text(json.dumps({"last_checked_at": 123456.0, "installed_sha": "old", "installed_tree_digest": "old"}))
+                local_args = installer.build_parser().parse_args(["self-update", "--local-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--no-project", "--json"])
+                installer.self_update(local_args)
+                local_report = json.loads((state / "auto_update.json").read_text())
+                self.assertEqual(local_report["last_checked_at"], 123456.0)
+                self.assertEqual(local_report["installed_sha"], sha)
 
     def test_project_only_zero_cooldown_syncs_clean_main_checkout_and_skips_dirty_or_branch(self):
         """Project-only sync updates clean main immediately and ignores dirty or feature branches."""

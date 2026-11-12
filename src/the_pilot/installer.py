@@ -691,9 +691,11 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
     with _file_lock(state_dir / "auto_update.lock"):
         try:
             existing_metadata = _load_json_object(state_dir / "auto_update.json")
-            for key in ("last_updated_at", "installed_sha", "installed_tree_digest", "runtime_tree_digest"):
+            for key in ("last_updated_at", "installed_sha", "installed_tree_digest", "runtime_tree_digest", "last_local_sync_at"):
                 if key in existing_metadata:
                     report[key] = existing_metadata[key]
+            if getattr(args, "local_only", False):
+                report["last_checked_at"] = existing_metadata.get("last_checked_at")
             checkout_digest: str | None = None
             report["project_status"] = _sync_workspace_overlay(
                 getattr(args, "workspace", None), gemini_dir, autopilot_dir
