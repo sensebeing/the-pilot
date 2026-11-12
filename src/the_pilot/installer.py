@@ -647,6 +647,7 @@ def _migrate_project_shortcuts(
     previous_order = set(previous_specs["entry_order"])
     entry_order_set = set(effective_specs["entry_order"])
     retired_overlay_entries = previous_order - entry_order_set
+    previous_aliases = shortcut_override_aliases(shortcuts, previous_specs)
     enabled_entry = shortcuts.get("enabled_entry")
     custom_entry = shortcuts.get("custom_entry")
 
@@ -671,43 +672,6 @@ def _migrate_project_shortcuts(
             key for key in enabled_entry if key not in retired_overlay_entries
         ]
 
-    # Overrides follow the shortcut identity they were written for. A key that
-    # no longer resolves under the effective project is retired with its old
-    # overlay, re-keyed when only the entry's command identity changed, or left
-    # for validate_profile to reject when it is genuinely invalid.
-    template_overrides = shortcuts.get("template_overrides")
-    if isinstance(template_overrides, dict):
-        effective_enabled_entry = (
-            explicit_entries if explicit_entries is not None else enabled_entry
-        )
-        surviving_aliases = shortcut_override_aliases(
-            {**shortcuts, "enabled_entry": effective_enabled_entry}, effective_specs
-        )
-        previous_entry_aliases = shortcut_override_aliases(
-            {"enabled_entry": list(previous_specs["entry_order"])}, previous_specs
-        )
-        for raw_key in list(template_overrides):
-            if resolve_override_alias(raw_key, surviving_aliases) is not None:
-                continue
-            previous_target = resolve_override_alias(raw_key, previous_entry_aliases)
-            if previous_target in retired_overlay_entries:
-                del template_overrides[raw_key]
-                continue
-            previous_command_id = (
-                previous_specs["entry_specs"].get(previous_target, {}).get("command_id")
-            )
-            if (
-                previous_target is not None
-                and isinstance(effective_enabled_entry, list)
-                and previous_target in effective_enabled_entry
-                and raw_key.strip() == previous_command_id
-            ):
-                template = template_overrides[raw_key]
-                existing = template_overrides.get(previous_target)
-                if existing is None or existing == template:
-                    del template_overrides[raw_key]
-                    template_overrides[previous_target] = template
-
     # Recommended entries that a newly attached overlay introduces are adopted;
     # keys the user already had stay exactly as enabled or disabled.
     if not explicit_entry_override and isinstance(enabled_entry, list):
@@ -721,7 +685,93 @@ def _migrate_project_shortcuts(
                 and key not in enabled_entry
             ):
                 enabled_entry.append(key)
+
+    # Overrides follow the shortcut that owned them in the installed profile,
+    # not whichever shortcut happens to reuse their alias next.
+    template_overrides = shortcuts.get("template_overrides")
+    if isinstance(template_overrides, dict):
+        shortcuts["template_overrides"] = _reconcile_template_overrides(
+            template_overrides,
+            shortcuts,
+            previous_aliases,
+            effective_specs,
+            explicit_entries if explicit_entries is not None else enabled_entry,
+            retired_overlay_entries,
+        )
     return migrated
+
+
+def _reconcile_template_overrides(
+    template_overrides: dict[Any, Any],
+    shortcuts: dict[str, Any],
+    previous_aliases: dict[str, str],
+    effective_specs: dict[str, Any],
+    effective_enabled_entry: Any,
+    retired_overlay_entries: set[str],
+) -> dict[Any, Any]:
+    """Rebind installed overrides to the shortcut that owned them before.
+
+    An alias can be reused by a different entry after a project switch, so a
+    raw key is resolved against the installed profile first. Overrides whose
+    previous owner is retired are dropped, overrides whose owner survived are
+    re-keyed when only its identity changed, and genuinely invalid keys are
+    left in place for validate_profile to reject.
+    """
+    surviving_aliases = shortcut_override_aliases(
+        {**shortcuts, "enabled_entry": effective_enabled_entry}, effective_specs
+    )
+    surviving_targets = set(surviving_aliases.values())
+    reconciled: dict[Any, Any] = {}
+
+    def has_conflict(target: str, template: Any) -> bool:
+        for existing_key, existing_template in reconciled.items():
+            if existing_template == template:
+                continue
+            if existing_key == target:
+                return True
+            if not isinstance(existing_key, str):
+                continue
+            try:
+                existing_target = resolve_override_alias(existing_key, surviving_aliases)
+            except ProfileError:
+                continue
+            if existing_target == target:
+                return True
+        return False
+
+    def claim(target: str, template: Any) -> None:
+        if has_conflict(target, template):
+            raise ProfileError(
+                f"template_overrides 的多个键指向同一口令 {target} 且模板不同"
+            )
+        reconciled[target] = template
+
+    for raw_key, template in template_overrides.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            reconciled[raw_key] = template
+            continue
+        try:
+            previous_owner = resolve_override_alias(raw_key, previous_aliases)
+            new_owner = resolve_override_alias(raw_key, surviving_aliases)
+        except ProfileError:
+            reconciled[raw_key] = template
+            continue
+        if previous_owner is None:
+            reconciled[raw_key] = template
+        elif (
+            previous_owner in retired_overlay_entries
+            and previous_owner not in surviving_targets
+        ):
+            continue
+        elif new_owner == previous_owner:
+            if has_conflict(previous_owner, template):
+                raise ProfileError(
+                    f"template_overrides 的多个键指向同一口令 {previous_owner} 且模板不同"
+                )
+            reconciled[raw_key] = template
+        else:
+            claim(previous_owner, template)
+    return reconciled
 
 
 def _is_older_committed_overlay(

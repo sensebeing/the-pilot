@@ -353,6 +353,124 @@ class ProjectTest(unittest.TestCase):
         )
         self.assertEqual(self.cli("status")["drift"], [])
 
+    def test_detach_keeps_uppercase_custom_comma_override(self):
+        """Uppercase custom_comma keys normalize like validation during detach.
+
+        Failure means `pilot apply --no-project` treats a valid hand-edited
+        `{"FB": ...}` custom command as absent, deletes the `fb` override as a
+        retired entry, and silently loses the personal template.
+        """
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["enabled_entry"].remove("fb")
+        profile["shortcuts"]["custom_comma"] = {"FB": {"template": "custom {arg}"}}
+        profile["shortcuts"]["template_overrides"] = {"fb": "personal {arg}"}
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--no-project")
+        detached = json.loads(profile_path.read_text())
+        self.assertEqual(
+            detached["shortcuts"]["template_overrides"], {"fb": "personal {arg}"}
+        )
+        self.assertEqual(
+            detached["shortcuts"]["custom_comma"]["fb"]["template"], "custom {arg}"
+        )
+        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        command = next(
+            item for item in config["comma_commands"].values() if ",fb" in item["aliases"]
+        )
+        self.assertEqual(command["template"], "personal {arg}")
+
+    def test_project_switch_follows_previous_override_ownership(self):
+        """Overrides stay bound to the entry that owned their alias before the switch.
+
+        Failure means swapped command_ids move templates to the wrong shortcut,
+        or a retired entry's command_id hijacks a new entry that reuses it.
+        """
+        alpha = {
+            "schema": "the-pilot-project/v1",
+            "projectId": "alpha",
+            "entry_order": ["alpha", "beta", "r", "rt", "d", "pull"],
+            "entry_specs": {
+                "alpha": {
+                    "command_id": "CMD_1",
+                    "description": "alpha",
+                    "requires_arg": True,
+                    "usage": "alpha <arg>",
+                    "template": "alpha {arg}",
+                },
+                "beta": {
+                    "command_id": "CMD_2",
+                    "description": "beta",
+                    "requires_arg": True,
+                    "usage": "beta <arg>",
+                    "template": "beta {arg}",
+                },
+            },
+            "presets": {
+                "recommended": {
+                    "shortcuts": {
+                        "enabled_entry": ["alpha", "beta", "r", "rt", "d", "pull"]
+                    }
+                }
+            },
+        }
+        swapped = json.loads(json.dumps(alpha))
+        swapped["projectId"] = "swapped"
+        swapped["entry_specs"]["alpha"]["command_id"] = "CMD_2"
+        swapped["entry_specs"]["beta"]["command_id"] = "CMD_1"
+        retired = json.loads(json.dumps(alpha))
+        retired["projectId"] = "retired"
+        retired["entry_order"] = ["gamma", "beta", "r", "rt", "d", "pull"]
+        retired["entry_specs"] = {
+            "gamma": {**retired["entry_specs"]["alpha"], "template": "gamma {arg}"},
+            "beta": retired["entry_specs"]["beta"],
+        }
+        retired["presets"]["recommended"]["shortcuts"]["enabled_entry"] = [
+            "gamma",
+            "beta",
+            "r",
+            "rt",
+            "d",
+            "pull",
+        ]
+        paths = {}
+        for name, overlay in (("alpha", alpha), ("swapped", swapped), ("retired", retired)):
+            path = self.root / f"{name}.json"
+            path.write_text(json.dumps(overlay))
+            paths[name] = path
+        profile_path = self.gemini / "config/autopilot/profile.json"
+
+        self.cli("apply", "--project", str(paths["alpha"]))
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {
+            "CMD_1": "alpha tpl",
+            "CMD_2": "beta tpl",
+        }
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--project", str(paths["swapped"]))
+        self.assertEqual(
+            json.loads(profile_path.read_text())["shortcuts"]["template_overrides"],
+            {"alpha": "alpha tpl", "beta": "beta tpl"},
+        )
+        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        self.assertEqual(config["entry_shortcuts"]["alpha"]["template"], "alpha tpl")
+        self.assertEqual(config["entry_shortcuts"]["beta"]["template"], "beta tpl")
+
+        self.cli("apply", "--project", str(paths["alpha"]))
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {"CMD_1": "alpha tpl"}
+        profile_path.write_text(json.dumps(profile))
+        self.cli("apply", "--project", str(paths["retired"]))
+        self.assertEqual(
+            json.loads(profile_path.read_text())["shortcuts"]["template_overrides"], {}
+        )
+        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        self.assertEqual(config["entry_shortcuts"]["gamma"]["template"], "gamma {arg}")
+        self.assertEqual(self.cli("status")["drift"], [])
+
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"
         (repo / ".pilot").mkdir(parents=True)

@@ -68,22 +68,24 @@ def shortcut_override_aliases(
         for raw_key, spec in custom_comma.items():
             if not isinstance(raw_key, str):
                 continue
-            key = raw_key.strip().lstrip(",")
-            if not key:
+            try:
+                normalized_key = normalize_comma_alias(raw_key)
+            except ProfileError:
                 continue
+            key = normalized_key[1:]
             add(key, key)
-            add(f",{key}", key)
+            add(normalized_key, key)
             add(_custom_comma_command_id(key, spec), key)
             if isinstance(spec, dict):
                 for alias in spec.get("aliases") or ():
-                    if isinstance(alias, str) and alias.strip():
-                        add(_comma_alias(alias), key)
+                    if not isinstance(alias, str):
+                        continue
+                    try:
+                        normalized_alias = normalize_comma_alias(alias)
+                    except ProfileError:
+                        continue
+                    add(normalized_alias, key)
     return aliases
-
-
-def _comma_alias(value: str) -> str:
-    text = value.strip().lower()
-    return text if text.startswith(",") else f",{text}"
 
 
 def _custom_entry_command_id(key: str, spec: Any = None) -> str:
