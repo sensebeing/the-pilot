@@ -6,7 +6,7 @@
 [![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--pilot-black)](https://skills.sh/sensebeing/the-pilot)
 [![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-pilot?style=social)](https://github.com/sensebeing/the-pilot/stargazers)
 
-**Turn Autopilot for coding agents: prefill the next prompt, auto-advance routine steps, pause for product and architecture decisions, and expand short commands.**
+**Turn Pilot for coding agents: prefill the next prompt, auto-advance routine steps, pause for product and architecture decisions, and expand short commands.**
 
 When you work with coding agents, most turns end the same way: you read the summary and type the next transition prompt by hand (*"review the branch"*, *"merge to main and deploy dev"*, *"run E2E"*, *"clean up the worktree and update docs"*). `the-pilot` handles those transitions inside your terminal so your attention stays on product and engineering decisions.
 
@@ -98,14 +98,14 @@ At the end of each Coordinator turn (child worker sessions stay silent), the age
    - At the end of the reply, the agent outputs one HTML comment parsed strictly with `json.loads`:
 
 ```html
-<!-- autopilot: {"scene": "deliver-and-verify", "gate": "auto", "1": "Merge to main, deploy dev, and run targeted E2E", "2": "Merge to main and deploy dev only"} -->
+<!-- pilot: {"scene": "deliver-and-verify", "gate": "auto", "1": "Merge to main, deploy dev, and run targeted E2E", "2": "Merge to main and deploy dev only"} -->
 ```
 
-### Step 3: Hook verification and terminal delivery (`autopilot.py`)
+### Step 3: Hook verification and terminal delivery (`runtime.py`)
 
 ```mermaid
 flowchart TD
-    A["User input or Shortcut (r / d / ,1 / ,2 / ,mode / ,worker)"] --> B["PreInvocation Hook (autopilot.py)"]
+    A["User input or Shortcut (r / d / ,1 / ,2 / ,mode / ,worker)"] --> B["PreInvocation Hook (runtime.py)"]
     B --> C["Expand shortcut, switch candidate, or hot-reload worker priority"]
     C --> D["Coordinator Turn (Dispatched Workers stay silent)"]
     D --> E["Stop Hook: inspect transcript & trailing JSON tag"]
@@ -115,9 +115,9 @@ flowchart TD
     E -->|Valid JSON tag + gate=auto in gate mode under turn cap| I["Verify terminal idle & auto-submit ,1 into Orca terminal"]
 ```
 
-1. **Transcript question check**: On `Stop`, `autopilot.py` inspects the conversation transcript (hydrating truncated lines from `transcript_full.jsonl` when needed) to verify that every `ask_question`, `AskUserQuestion`, or `request_user_input` call in the turn has been answered before allowing any prefill or auto-submit.
-2. **JSON-string-aware tag parser**: Locates the trailing `<!-- autopilot: ... -->` block without regular expressions and parses it via `json.loads`. Missing, duplicate, or malformed tags fail closed.
-3. **Idempotent terminal delivery**: Records a `pending` reservation under an exclusive `fcntl` file lock before calling `orca terminal send`. If terminal delivery times out or returns an ambiguous state, auto-submit freezes until you type a message or run `,autopilot recover`, preventing duplicate submissions.
+1. **Transcript question check**: On `Stop`, `runtime.py` inspects the conversation transcript (hydrating truncated lines from `transcript_full.jsonl` when needed) to verify that every `ask_question`, `AskUserQuestion`, or `request_user_input` call in the turn has been answered before allowing any prefill or auto-submit.
+2. **JSON-string-aware tag parser**: Locates the trailing `<!-- pilot: ... -->` block without regular expressions and parses it via `json.loads`. Missing, duplicate, or malformed tags fail closed.
+3. **Idempotent terminal delivery**: Records a `pending` reservation under an exclusive `fcntl` file lock before calling `orca terminal send`. If terminal delivery times out or returns an ambiguous state, auto-submit freezes until you type a message or run `,pilot recover`, preventing duplicate submissions.
 
 ---
 
@@ -174,18 +174,18 @@ If your repository has a `.pilot/project.json` overlay, pass `--project /path/to
 
 ### Built-in presets
 
-| Preset | Autopilot mode | Max auto turns | Enabled scenes | Delivery strategy | Default shortcuts | Best fit |
+| Preset | Pilot mode | Max auto turns | Enabled scenes | Delivery strategy | Default shortcuts | Best fit |
 | --- | --- | --- | --- | --- | --- | --- |
 | `recommended` | `gate` | `8` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` (+ project overlay) | Default: auto-advances routine stages, pauses on design decisions and prod gates. |
 | `conservative` | `confirm` | `4` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` (+ project overlay) | Prefills the next prompt after every turn and always waits for you to press `Enter`. |
 | `orchestration-only` | `off` | `4` | None (`[]`) | `merge_dev_e2e` | None (`[]`) | Installs Coordinator/Worker orchestration rules only, with no end-of-turn prefill. |
 
-### Four customization dimensions (`orca-autopilot-profile/v1`)
+### Four customization dimensions (`the-pilot-profile/v1`)
 
 | Dimension | Profile keys | Supported values and defaults | What it governs |
 | --- | --- | --- | --- |
 | 1. Orchestration | `worker_agents`<br>`review_agents` | Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Coordinator (design & review) vs. Dispatched Worker (branch implementation) separation, child-worktree isolation, and worker priority. |
-| 2. Autopilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..50` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
+| 2. Pilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..50` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
 | 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | Strategies: `merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
 | 4. Shortcuts | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | Universal entries: `r`, `rt`, `d`, `pull`<br>Plus project entries and custom aliases | Short aliases expanded on `PreInvocation` into full review, design, or workflow prompts. |
 
@@ -220,10 +220,12 @@ pilot apply --no-project --json    # Switches back to universal project-neutral 
 
 Once installed, `the-pilot` stays up to date automatically with two non-blocking mechanisms:
 
-1. **6-hour background self-update**: On `Stop` hook execution, if at least 6 hours have passed since the last check, `autopilot.py` spawns `pilot self-update --quiet` in a detached background process. If `~/the-pilot` exists and is clean on `main`, it runs `git pull --ff-only`, refreshes the `uv` CLI when `HEAD` advances, re-syncs global skill symlinks (`~/.agents/skills`, `~/.claude/skills`, `~/.gemini/config/skills`), and runs `pilot apply --upgrade` while preserving your `profile.json`. Dirty checkouts or non-`main` branches are never modified.
-2. **Active workspace `.pilot/project.json` hot-sync**: When your active workspace updates `.pilot/project.json` (detected by SHA-256 hash change), `autopilot.py` triggers `pilot self-update --project-only --workspace <cwd>` in the background so new project shortcuts or scene rules take effect automatically.
+1. **6-hour background self-update**: On `Stop` hook execution, if at least 6 hours have passed since the last check, `runtime.py` spawns `pilot self-update --quiet` in a detached background process. If `~/the-pilot` exists and is clean on `main`, it runs `git pull --ff-only`, refreshes the `uv` CLI when `HEAD` advances, re-syncs global skill symlinks (`~/.agents/skills`, `~/.claude/skills`, `~/.gemini/config/skills`), and runs `pilot apply --upgrade` while preserving your `profile.json`. Dirty checkouts or non-`main` branches are never modified.
+2. **Active workspace `.pilot/project.json` hot-sync**: When your active workspace updates `.pilot/project.json` (detected by SHA-256 hash change), `runtime.py` triggers `pilot self-update --project-only --workspace <cwd>` in the background so new project shortcuts or scene rules take effect automatically.
 
-Check update status anytime via `pilot status --json` (`auto_update` field) or trigger an immediate update with `pilot self-update --json`. Set `ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE=1` to disable background checks.
+Check update status anytime via `pilot status --json` (`auto_update` field) or trigger an immediate update with `pilot self-update --json`. Set `THE_PILOT_DISABLE_AUTO_UPDATE=1` to disable background checks.
+
+`pilot apply --upgrade` also performs the one-way migration from a pre-rename `config/autopilot` installation: managed files move to `config/the-pilot`, `state/autopilot.log` becomes `state/pilot.log`, the legacy `orca-agy-autopilot` hook group is removed, and custom scenes and state are preserved. Sessions already open with pre-rename `<!-- autopilot: ... -->` tags and `,autopilot recover` continue to work during the transition.
 
 ---
 
@@ -233,15 +235,15 @@ Check update status anytime via `pilot status --json` (`auto_update` field) or t
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | Read-only discovery of installed profile, project overlay, and available agent CLIs (`codex`, `claude`, `agy`). |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | Read-only distillation of recent local agent chat logs (`antigravity`, `claude`, `codex`, `cursor`) into recurring prompt patterns and pipeline health diagnostics. |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `autopilot.py`, `config.json`, `scenes/*.md`, `GEMINI.md` block, and Hook group. |
+| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, and the `the-pilot` Hook group. |
 | `pilot self-update [--project-only] [--workspace <path>] --json` | Pull clean `main`, refresh CLI and global skill symlinks, and run `pilot apply --upgrade` under an exclusive file lock. |
 | `pilot status [--project <repo>] --json` | Verify installation health, active mode, worker priority, `auto_update` status, and byte-level artifact drift (`drift: []`). |
 | `pilot uninstall --json` | Remove managed files, `GEMINI.md` managed block, and Hook entries while preserving unrelated user config. |
-| `pilot mode [status\|gate\|confirm\|off]` | Inspect or switch Turn Autopilot mode (`gate`, `confirm`, `off`). |
+| `pilot mode [status\|gate\|confirm\|off]` | Inspect or switch Turn Pilot mode (`gate`, `confirm`, `off`). |
 | `pilot worker [status\|codex\|claude\|cc]` | Inspect or persist worker priority (`codex > claude` vs. `claude > codex`) and schedule next-turn hot reload. |
 | `pilot sync` | Re-sync the `GEMINI.md` scene block after editing installed `scenes/*.md` files. |
 | `pilot set <shortcut> <template>` | Persist a custom shortcut template override in `profile.json` and recompile `config.json`. |
-| `pilot log [--lines <n>]` | Inspect structured runtime delivery events from `state/autopilot.log`. |
+| `pilot log [--lines <n>]` | Inspect structured runtime delivery events from `state/pilot.log`. |
 | `pilot hook --event <PreInvocation\|Stop>` | Lifecycle Hook entrypoint invoked by the host agent runtime. |
 
 ---

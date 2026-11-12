@@ -29,7 +29,7 @@ To register the skills globally across coding agents, run
    guardrail, and shortcut automations (`custom_entry`, `custom_comma`,
    `deliver_strategy`, or `.pilot/project.json` overlay updates) from that
    evidence. Ask about the four dimensions, keeping an existing profile as the
-   starting point: orchestration worker/review priorities; autopilot mode/turn
+   starting point: orchestration worker/review priorities; pilot mode/turn
    limit; enabled scenes/delivery policy/notification preference/guardrails;
    entry shortcuts/custom commands/template overrides. Present a recommended
    option first. Do not assume permission to send mail or deploy production.
@@ -44,7 +44,7 @@ To register the skills globally across coding agents, run
 `apply` preserves other Hook groups, unmanaged GEMINI.md prose and custom scenes.
 `pilot uninstall` removes owned files, including the installed project link.
 Tests and demonstrations must pass explicit temporary `--gemini-dir` and
-`--home-dir` paths and set `ORCA_AUTOPILOT_GEMINI_DIR` for runtime operations.
+`--home-dir` paths and set `THE_PILOT_GEMINI_DIR` for runtime operations.
 
 ## Automatic updates
 

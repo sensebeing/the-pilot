@@ -2,7 +2,7 @@
 
 Read the engineering policy and [module boundaries](src/the_pilot/README.md)
 before changing code. Keep project-specific policy in overlays, not the universal
-compiler or runtime. Installed `autopilot.py` must remain a standalone standard
+compiler or runtime. Installed `runtime.py` must remain a standalone standard
 library script. Do not add a second runtime implementation.
 
 Run `PYTHONPATH=src python3 -m unittest discover -s tests -v` and

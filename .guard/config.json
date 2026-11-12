@@ -28,7 +28,7 @@
           "the_pilot"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "Installed autopilot.py must remain a standalone standard-library script without importing the_pilot."
+        "message": "Installed runtime.py must remain a standalone standard-library script without importing the_pilot."
       },
       {
         "scope_prefixes": [

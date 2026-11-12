@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-file Turn Autopilot runtime for Antigravity + Orca.
+"""Single-file Turn Pilot runtime for Antigravity + Orca.
 
 The engine is deliberately small and mechanical:
 
@@ -10,7 +10,7 @@ The engine is deliberately small and mechanical:
 * Everything durable lives in `profile.json` (preferences) and a per-session
   JSON file (conversation turn state). No delivery ledger, no install marker.
 
-All settings are read from the installed `config/autopilot` directory; no
+All settings are read from the installed `config/the-pilot` directory; no
 personal paths are hard-coded.
 """
 from __future__ import annotations
@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -29,35 +30,57 @@ import time
 from typing import Any
 
 
+PILOT_SUBDIR = Path("config") / "the-pilot"
+LEGACY_AUTOPILOT_SUBDIR = Path("config") / "autopilot"
+PROFILE_BLOCK_HEADING = "## 个人研发状态机与 Turn Pilot 规范"
+LEGACY_PROFILE_BLOCK_HEADING = "## 个人研发状态机与 Turn Autopilot 规范"
+
+
+def _env_value(primary: str, legacy: str) -> str:
+    """Read the canonical environment variable, then its legacy fallback."""
+    return os.environ.get(primary, "").strip() or os.environ.get(legacy, "").strip()
+
+
 def _gemini_dir() -> Path:
-    override = os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
+    override = _env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
     if override:
         return Path(override).expanduser()
     return Path(__file__).resolve().parents[2]
 
 
 GEMINI_DIR = _gemini_dir()
-AUTOPILOT_DIR = GEMINI_DIR / "config" / "autopilot"
-PROFILE_PATH = AUTOPILOT_DIR / "profile.json"
-CONFIG_PATH = AUTOPILOT_DIR / "config.json"
-SCENES_DIR = AUTOPILOT_DIR / "scenes"
+PILOT_DIR = GEMINI_DIR / PILOT_SUBDIR
+PROFILE_PATH = PILOT_DIR / "profile.json"
+CONFIG_PATH = PILOT_DIR / "config.json"
+SCENES_DIR = PILOT_DIR / "scenes"
 GEMINI_MD_PATH = GEMINI_DIR / "config" / "GEMINI.md"
 STATE_DIR = Path(
-    os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip()
-    or str(AUTOPILOT_DIR / "state")
+    _env_value("THE_PILOT_STATE_DIR", "ORCA_AUTOPILOT_STATE_DIR")
+    or str(PILOT_DIR / "state")
 ).expanduser()
-LOG_PATH = STATE_DIR / "autopilot.log"
+LOG_PATH = STATE_DIR / "pilot.log"
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 3600
+# The installer gives its own ``apply`` child 30 s; this outer deadline must be
+# longer so a legitimate repair always finishes before the hook may kill it.
+PROJECT_SYNC_TIMEOUT_SECONDS = 45
 _RUNNING_SCRIPT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 MODES = ("gate", "confirm", "off")
+PROFILE_SCHEMA = "the-pilot-profile/v1"
+LEGACY_PROFILE_SCHEMA = "orca-autopilot-profile/v1"
 RECOVERY_FAILED_MESSAGE = (
-    "【Autopilot 恢复失败】状态文件未能安全重建，自动投递保持暂停；"
+    "【Pilot 恢复失败】状态文件未能安全重建，自动投递保持暂停；"
     "请用一句话告知用户，无需执行其他操作。"
 )
-SCENES_BEGIN = "<!-- BEGIN AUTOPILOT SCENES -->"
-SCENES_END = "<!-- END AUTOPILOT SCENES -->"
+GEMINI_BEGIN = "<!-- BEGIN THE_PILOT_PROFILE -->"
+GEMINI_END = "<!-- END THE_PILOT_PROFILE -->"
+SCENES_BEGIN = "<!-- BEGIN THE_PILOT_SCENES -->"
+SCENES_END = "<!-- END THE_PILOT_SCENES -->"
+LEGACY_GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
+LEGACY_GEMINI_END = "<!-- END ORCA_AUTOPILOT_PROFILE -->"
+LEGACY_SCENES_BEGIN = "<!-- BEGIN AUTOPILOT SCENES -->"
+LEGACY_SCENES_END = "<!-- END AUTOPILOT SCENES -->"
 SYNC_ASK_QUESTION_TOOLS = frozenset(
     {"ask_question", "AskUserQuestion", "request_user_input"}
 )
@@ -88,6 +111,13 @@ TAG_FIELDS = frozenset(
         "alt",
     }
 )
+class HookExecutionError(RuntimeError):
+    """A hook refused to act because its installed configuration is unusable."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
 
 def _find_all_positions(text: str, marker: str) -> list[int]:
     positions: list[int] = []
@@ -129,16 +159,19 @@ def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
     return ("," + checked if comma else checked), arg
 
 
-def read_payload() -> dict[str, Any]:
+def read_payload() -> tuple[dict[str, Any] | None, str]:
     raw = sys.stdin.read()
     if not raw.strip():
-        return {}
+        return {}, ""
     try:
         payload = json.loads(raw)
     except ValueError as exc:
         log_event("payload_invalid", error=str(exc))
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        return None, f"invalid JSON payload: {exc}"
+    if not isinstance(payload, dict):
+        log_event("payload_invalid", error="not_object")
+        return None, "hook payload must be a JSON object"
+    return payload, ""
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -155,18 +188,24 @@ def log_event(event: str, **fields: Any) -> None:
         return
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json(path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """Read one JSON object file as ``(value, status, detail)``.
+
+    ``status`` is ``"ok"``, ``"missing"`` or ``"corrupt"`` so callers can tell
+    an absent optional file from content that must never be treated as empty
+    configuration.
+    """
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return None, "missing", f"{path}: file does not exist"
     except (OSError, ValueError) as exc:
         log_event("json_read_failed", path=str(path), error=str(exc))
-        return {}
+        return None, "corrupt", f"{path}: {exc}"
     if not isinstance(value, dict):
         log_event("json_not_object", path=str(path))
-        return {}
-    return value
+        return None, "corrupt", f"{path}: JSON root must be an object"
+    return value, "ok", ""
 
 
 def save_text(path: Path, text: str) -> bool:
@@ -187,7 +226,7 @@ def save_json(path: Path, value: dict[str, Any]) -> bool:
 
 
 def _pilot_binary() -> str:
-    override = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN", "").strip()
+    override = _env_value("THE_PILOT_BIN", "ORCA_AUTOPILOT_PILOT_BIN")
     local = Path.home() / "the-pilot/bin/pilot"
     if override:
         candidate = override
@@ -198,69 +237,119 @@ def _pilot_binary() -> str:
     return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else ""
 
 
-def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
+def _run_project_sync(command: list[str]) -> tuple[int, str, str] | None:
+    """Run one project sync and kill the whole process group if it overruns.
+
+    The updater may spawn an ``apply`` child that writes the installation. Its
+    own 30 s budget fits inside this deadline, so a healthy repair finishes; if
+    the updater still overruns, the group is killed so the caller can never
+    leave an orphaned writer behind.
+    """
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        log_event("project_auto_sync_failed", error=str(exc))
+        return None
+    try:
+        stdout, stderr = process.communicate(timeout=PROJECT_SYNC_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        process.kill()
+        process.communicate()
+        log_event("project_auto_sync_timeout")
+        return None
+    return process.returncode, stdout, stderr
+
+
+def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
+    """Sync the project overlay and report whether no repair is outstanding.
+
+    A ``False`` result means a repair was started but did not confirm
+    completion, so callers must not inspect or re-execute the installed engine
+    this turn.
+    """
     workspace_paths = payload.get("workspacePaths")
     if not isinstance(workspace_paths, list):
         workspace_paths = []
-    if (os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
-            and os.environ.get("ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE", "").strip() != "1"
-            and not os.environ.get("ORCA_AUTOPILOT_PILOT_BIN", "").strip()):
-        return
+    if (_env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
+            and _env_value("THE_PILOT_ENABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE") != "1"
+            and not _env_value("THE_PILOT_BIN", "ORCA_AUTOPILOT_PILOT_BIN")):
+        return True
     pilot_bin = _pilot_binary()
     if not pilot_bin:
-        return
+        return True
     workspace = str(workspace_paths[0]) if workspace_paths else ""
     command = [pilot_bin, "self-update", "--project-only"]
     if workspace:
         command.extend(["--workspace", workspace])
     command.extend(["--home-dir", str(Path.home()), "--gemini-dir", str(GEMINI_DIR), "--json"])
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
-        return
-    if result.returncode != 0:
+    completed = _run_project_sync(command)
+    if completed is None:
+        log_event("project_auto_sync_failed", workspace=workspace, error="project_sync_incomplete")
+        return False
+    returncode, stdout, stderr = completed
+    if returncode != 0:
         log_event(
             "project_auto_sync_failed",
             workspace=workspace,
-            returncode=result.returncode,
-            error=(result.stderr or result.stdout).strip()[-300:],
+            returncode=returncode,
+            error=(stderr or stdout).strip()[-300:],
         )
-        return
+        return False
     try:
-        receipt = json.loads(result.stdout)
+        receipt = json.loads(stdout) if stdout.strip() else {}
     except ValueError as exc:
         log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
-        return
-    if isinstance(receipt, dict) and receipt.get("error"):
+        return False
+    if not isinstance(receipt, dict):
+        log_event("project_auto_sync_failed", workspace=workspace, error="receipt_not_object")
+        return False
+    if receipt.get("error"):
         log_event("project_auto_sync_failed", workspace=workspace, error=str(receipt["error"]))
-    elif isinstance(receipt, dict) and (receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated"):
+        return False
+    if receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated":
         log_event("project_auto_synced", workspace=workspace)
+    return True
 
 
 def maybe_trigger_auto_update() -> None:
-    if os.environ.get("ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE", "").strip() == "1":
+    if _env_value("THE_PILOT_DISABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE") == "1":
         return
-    if (os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
-            and os.environ.get("ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE", "").strip() != "1"):
+    if (_env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
+            and _env_value("THE_PILOT_ENABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE") != "1"):
         return
     metadata_path = STATE_DIR / "auto_update.json"
+    metadata, metadata_status, metadata_err = load_json(metadata_path)
+    if metadata_status == "corrupt":
+        log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
+        return
+    if metadata_status == "missing":
+        metadata = {}
     try:
-        metadata = load_json(metadata_path)
         if time.time() - float(metadata.get("last_checked_at") or 0) < AUTO_UPDATE_INTERVAL_SECONDS:
             return
     except (TypeError, ValueError):
-        metadata = {}
+        pass
     pilot_bin = _pilot_binary()
     if not pilot_bin:
         return
     with _file_lock(STATE_DIR / "auto_update.lock"):
-        metadata = load_json(metadata_path)
+        metadata, metadata_status, metadata_err = load_json(metadata_path)
+        if metadata_status == "corrupt":
+            log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
+            return
+        if metadata_status == "missing":
+            metadata = {}
         try:
             cooldown = time.time() - float(metadata.get("last_checked_at") or 0)
         except (TypeError, ValueError):
@@ -282,27 +371,89 @@ def maybe_trigger_auto_update() -> None:
         log_event("auto_update_spawned", path=pilot_bin)
 
 
-def load_profile() -> dict[str, Any]:
-    return load_json(PROFILE_PATH)
+def load_profile() -> tuple[dict[str, Any] | None, str, str]:
+    value, status, detail = load_json(PROFILE_PATH)
+    if status != "ok":
+        return None, status, detail
+    if "pilot" in value and "autopilot" in value:
+        log_event("profile_section_ambiguous")
+        return (
+            None,
+            "corrupt",
+            f"{PROFILE_PATH}: profile contains both pilot and autopilot sections",
+        )
+    return value, "ok", ""
 
 
-def load_config() -> dict[str, Any]:
+def load_config() -> tuple[dict[str, Any] | None, str, str]:
     return load_json(CONFIG_PATH)
 
 
-def current_mode(profile: dict[str, Any] | None = None) -> str:
-    current = profile if profile is not None else load_profile()
-    autopilot = current.get("autopilot")
-    if isinstance(autopilot, dict):
-        mode = str(autopilot.get("mode") or "").lower()
+def _installed_config_failure(
+    profile_status: str,
+    profile_err: str,
+    *,
+    config_status: str = "ok",
+    config_err: str = "",
+    scene_errors: list[str] | tuple[str, ...] = (),
+) -> tuple[str, str] | None:
+    """Return the hook failure code and detail for unusable installed inputs."""
+    corrupt_details = []
+    if profile_status == "corrupt":
+        corrupt_details.append(profile_err)
+    if config_status == "corrupt":
+        corrupt_details.append(config_err)
+    corrupt_details.extend(scene_errors)
+    if corrupt_details:
+        return "config_corrupt", "; ".join(item for item in corrupt_details if item)
+    if profile_status == "missing" or config_status == "missing":
+        return "config_missing", profile_err or config_err
+    return None
+
+
+def _pilot_section(profile: dict[str, Any]) -> Any:
+    """Return the pilot-mode mapping, accepting one legacy ``autopilot`` key.
+
+    Two keys in the same profile mean two owners for the same mode and turn
+    cap, so the runtime fails closed instead of guessing which one wins.
+    """
+    if "pilot" in profile and "autopilot" in profile:
+        log_event("profile_section_ambiguous")
+        return None
+    if "pilot" in profile:
+        return profile.get("pilot")
+    return profile.get("autopilot")
+
+
+def _prepare_profile_for_write(profile: dict[str, Any]) -> bool:
+    """Normalize a profile to canonical sections before writing it back.
+
+    Two keys in the same profile leave two owners for the same mode and turn
+    cap, so the write fails closed instead of guessing which one wins.
+    """
+    if "pilot" in profile and "autopilot" in profile:
+        log_event("profile_section_ambiguous")
+        return False
+    if "autopilot" in profile:
+        profile["pilot"] = profile.pop("autopilot")
+    if profile.get("schema") == LEGACY_PROFILE_SCHEMA:
+        profile["schema"] = PROFILE_SCHEMA
+    return True
+
+
+def current_mode(profile: dict[str, Any]) -> str:
+    pilot = _pilot_section(profile)
+    if isinstance(pilot, dict):
+        mode = str(pilot.get("mode") or "").lower()
         if mode in MODES:
             return mode
     return "off"
 
 
-def _current_agents(profile: dict[str, Any] | None, key: str, defaults: list[str]) -> list[str]:
-    current = profile if profile is not None else load_profile()
-    orchestration = current.get("orchestration")
+def _current_agents(
+    profile: dict[str, Any], *, key: str, defaults: list[str]
+) -> list[str]:
+    orchestration = profile.get("orchestration")
     agents = orchestration.get(key) if isinstance(orchestration, dict) else None
     if (isinstance(agents, list) and agents
             and all(isinstance(agent, str) and agent in defaults for agent in agents)
@@ -311,8 +462,8 @@ def _current_agents(profile: dict[str, Any] | None, key: str, defaults: list[str
     return defaults
 
 
-def current_worker_agents(profile: dict[str, Any] | None = None) -> list[str]:
-    return _current_agents(profile, "worker_agents", ["claude", "codex"])
+def current_worker_agents(profile: dict[str, Any]) -> list[str]:
+    return _current_agents(profile, key="worker_agents", defaults=["claude", "codex"])
 
 
 def worker_priority(workers: list[str]) -> str:
@@ -386,34 +537,61 @@ def replace_worker_guidance(text: str, workers: list[str]) -> str:
     return text
 
 
+def _profile_block_bounds(text: str) -> tuple[int, int] | None:
+    """Return the profile block content bounds, accepting one legacy block."""
+    blocks: list[tuple[int, int]] = []
+    for begin_marker, end_marker, heading in (
+        (GEMINI_BEGIN, GEMINI_END, PROFILE_BLOCK_HEADING),
+        (LEGACY_GEMINI_BEGIN, LEGACY_GEMINI_END, LEGACY_PROFILE_BLOCK_HEADING),
+    ):
+        starts = _find_all_positions(text, begin_marker)
+        if not starts:
+            continue
+        if len(starts) != 1:
+            return None
+        content_start = starts[0] + len(begin_marker)
+        boundaries = [text.find(candidate, content_start) for candidate in (heading, end_marker)]
+        boundaries = [boundary for boundary in boundaries if boundary >= 0]
+        if not boundaries:
+            return None
+        blocks.append((content_start, min(boundaries)))
+    if len(blocks) > 1:
+        log_event("profile_block_ambiguous")
+        return None
+    return blocks[0] if blocks else None
+
+
 def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
     primary = "claude" if target.lower() in {"claude", "claude-code", "cc"} else target.lower()
-    if primary not in {"claude", "codex"}:
-        return False, current_worker_agents(), []
+    new_workers = (
+        ["codex", "claude"]
+        if primary == "codex"
+        else ["claude", "codex"]
+        if primary == "claude"
+        else None
+    )
+    if new_workers is None:
+        return False, [], []
     updated: list[str] = []
-    with _file_lock(AUTOPILOT_DIR / ".autopilot.lock"):
-        profile = load_profile()
-        if not profile:
+    with _file_lock(PILOT_DIR / ".pilot.lock"):
+        profile, profile_status, profile_err = load_profile()
+        if profile_status != "ok" or profile is None:
+            log_event(f"worker_write_profile_{profile_status}", error=profile_err)
+            return False, [], updated
+        if not profile or not _prepare_profile_for_write(profile):
             return False, current_worker_agents(profile), updated
         old_workers = current_worker_agents(profile)
-        new_workers = ["codex", "claude"] if primary == "codex" else ["claude", "codex"]
         prepared: list[tuple[Path, str]] = []
         try:
             if GEMINI_MD_PATH.is_file():
                 text = GEMINI_MD_PATH.read_text(encoding="utf-8")
-                marker = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
-                start = text.find(marker)
-                content_start = start + len(marker)
-                boundaries = [text.find(end, content_start) for end in (
-                    "## 个人研发状态机与 Turn Autopilot 规范", "<!-- END ORCA_AUTOPILOT_PROFILE -->"
-                )]
-                boundaries = [end for end in boundaries if end >= 0]
-                if start < 0 or not boundaries:
+                bounds = _profile_block_bounds(text)
+                if bounds is None:
                     return False, old_workers, updated
-                end = min(boundaries)
+                content_start, end = bounds
                 text = text[:content_start] + replace_worker_guidance(text[content_start:end], new_workers) + text[end:]
                 prepared.append((GEMINI_MD_PATH, text))
-            if (not os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
+            if (not _env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
                     and GEMINI_DIR.resolve() == (Path.home() / ".gemini").resolve()):
                 for path in (Path.home() / ".claude/CLAUDE.md", Path.home() / ".codex/AGENTS.md"):
                     if path.is_file():
@@ -426,27 +604,32 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
         prepared.insert(0, (PROFILE_PATH, json.dumps(profile, ensure_ascii=False, indent=2) + "\n"))
         for path, text in prepared:
             if not save_text(path, text):
-                return False, current_worker_agents(), updated
+                return False, old_workers, updated
             updated.append(str(path))
     return True, new_workers, updated
 
 
-def max_consecutive_turns(profile: dict[str, Any] | None = None) -> int:
-    current = profile if profile is not None else load_profile()
-    autopilot = current.get("autopilot")
-    if isinstance(autopilot, dict):
-        value = autopilot.get("max_consecutive_auto_turns")
+def max_consecutive_turns(profile: dict[str, Any]) -> int:
+    pilot = _pilot_section(profile)
+    if isinstance(pilot, dict):
+        value = pilot.get("max_consecutive_auto_turns")
         if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 50:
             return value
     return 8
 
 
 def set_mode(mode: str) -> bool:
-    with _file_lock(AUTOPILOT_DIR / ".autopilot.lock"):
-        profile = load_profile()
-        if not profile:
+    with _file_lock(PILOT_DIR / ".pilot.lock"):
+        profile, profile_status, profile_err = load_profile()
+        if profile_status != "ok" or profile is None:
+            log_event(f"mode_write_profile_{profile_status}", error=profile_err)
             return False
-        profile.setdefault("autopilot", {})["mode"] = mode
+        if not profile or not _prepare_profile_for_write(profile):
+            return False
+        pilot = profile.setdefault("pilot", {})
+        if not isinstance(pilot, dict):
+            return False
+        pilot["mode"] = mode
         if not save_json(PROFILE_PATH, profile):
             return False
     log_event("mode_changed", mode=mode)
@@ -695,18 +878,30 @@ def _has_unquoted_comment_delimiter(payload: str) -> bool:
 
 
 def _trailing_tag(text: str) -> tuple[str, str] | None:
+    """Return the trailing suggestion tag's prefix and payload.
+
+    Sessions opened before the rename still end with ``<!-- autopilot: ... -->``
+    in their loaded system prompt, so both names stay readable during the
+    transition.
+    """
     trimmed = text.rstrip()
     if not trimmed.endswith("-->"):
         return None
     content = trimmed[:-3]
     for position in _find_all_positions(content, "<!--"):
         body = content[position + 4:].strip()
-        if not body.lower().startswith("autopilot"):
+        payload = ""
+        for name in ("pilot", "autopilot"):
+            lowered = body.lower()
+            if not lowered.startswith(name):
+                continue
+            rest = body[len(name):]
+            if rest and not (rest[0].isspace() or rest[0] == ":"):
+                continue
+            payload = rest.lstrip().removeprefix(":").strip()
+            break
+        else:
             continue
-        rest = body[len("autopilot"):]
-        if rest and not (rest[0].isspace() or rest[0] == ":"):
-            continue
-        payload = rest.lstrip().removeprefix(":").strip()
         if _has_unquoted_comment_delimiter(payload):
             continue
         return content[:position], payload
@@ -832,21 +1027,24 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, text[end + 5 :]
 
 
-def scan_scenes() -> dict[str, dict[str, Any]]:
+def scan_scenes() -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Read every scene file, returning unreadable ones instead of hiding them."""
     scenes: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
     if not SCENES_DIR.is_dir():
-        return scenes
+        return scenes, errors
     for path in sorted(SCENES_DIR.glob("*.md")):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
             log_event("scene_read_failed", path=str(path), error=str(exc))
+            errors.append(f"{path}: {exc}")
             continue
         meta, body = split_frontmatter(text)
         name = str(meta.get("name") or "")
         if name:
             scenes[name] = {"meta": meta, "body": body, "path": path}
-    return scenes
+    return scenes, errors
 
 
 def scene_gate_default(scene: str, scenes: dict[str, dict[str, Any]]) -> str:
@@ -1315,49 +1513,80 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
-    maybe_sync_project_overlay(payload)
-    if os.environ.get("ORCA_AUTOPILOT_REEXEC") != "1":
-        updated_engine = AUTOPILOT_DIR / "autopilot.py"
-        try:
-            changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
-        except OSError:
-            changed = False
-        if changed:
+    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
+        # Exactly one process per turn owns project synchronization. The
+        # re-executed engine runs under a short supervisor timeout, so it must
+        # never start a repair that its supervisor could abandon by killing it.
+        sync_confirmed = maybe_sync_project_overlay(payload)
+        if sync_confirmed:
+            updated_engine = PILOT_DIR / "runtime.py"
             try:
-                result = subprocess.run(
-                    [sys.executable, str(updated_engine), *sys.argv[1:]],
-                    input=json.dumps(payload, ensure_ascii=False),
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    env={**os.environ, "ORCA_AUTOPILOT_REEXEC": "1"},
-                )
-                if result.returncode == 0:
-                    try:
-                        return json.loads(result.stdout) if result.stdout.strip() else {}
-                    except ValueError as exc:
-                        log_event("engine_reexec_failed", error=str(exc))
-                        return {"error": "engine_reexec_invalid_output"}
-                else:
-                    log_event("engine_reexec_failed", returncode=result.returncode, error=(result.stderr or result.stdout).strip()[-300:])
-                    return {"error": "engine_reexec_failed"}
-            except (OSError, subprocess.SubprocessError) as exc:
-                log_event("engine_reexec_failed", error=str(exc))
-                return {"error": "engine_reexec_failed"}
+                changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
+            except OSError:
+                changed = False
+            if changed:
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(updated_engine), *sys.argv[1:]],
+                        input=json.dumps(payload, ensure_ascii=False),
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                        env={**os.environ, "THE_PILOT_REEXEC": "1"},
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log_event("engine_reexec_failed", error=str(exc))
+                    raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()[-300:]
+                    log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
+                    raise HookExecutionError("engine_reexec_failed", detail)
+                try:
+                    output = json.loads(result.stdout) if result.stdout.strip() else {}
+                except ValueError as exc:
+                    log_event("engine_reexec_failed", error=str(exc))
+                    raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
+                if not isinstance(output, dict):
+                    log_event("engine_reexec_failed", error="output_not_object")
+                    raise HookExecutionError(
+                        "engine_reexec_invalid_output", "hook output must be a JSON object"
+                    )
+                return output
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
-    config = load_config()
-    profile = load_profile()
+    config, config_status, config_err = load_config()
+    profile, profile_status, profile_err = load_profile()
+    scenes, scene_errors = scan_scenes()
     user_turn = turn_user_identity(steps)
-    recovery_requested = bool(_named_command(text, {"autopilot"}, {"recover"}))
+    recovery_requested = bool(_named_command(text, {"pilot", "autopilot"}, {"recover"}))
     with state_lock(conversation_id):
         state = load_state(conversation_id)
+        failure = _installed_config_failure(
+            profile_status,
+            profile_err,
+            config_status=config_status,
+            config_err=config_err,
+            scene_errors=scene_errors,
+        )
+        if failure is not None:
+            # Installed inputs must be usable before any recovery or delivery
+            # decision. Only touch an existing readable session; a corrupt or
+            # absent session file stays exactly as it is.
+            code, detail = failure
+            if isinstance(state, dict) and session_path(conversation_id).is_file():
+                state["auto_submitted_text"] = ""
+                state["candidates"] = []
+                state["candidate_turn_id"] = ""
+                if not save_state(conversation_id, state):
+                    log_event("pre_state_save_failed", cid=conversation_id)
+            log_event(f"pre_invocation_{code}", cid=conversation_id, error=detail)
+            raise HookExecutionError(code, detail)
         if state is None:
             # A corrupt file is never rebuilt from an ordinary or auto-continued
             # turn: without the lost state those are indistinguishable. Only an
             # explicit recovery command on a complete transcript proves the user
-            # asked for it; every other input merely pauses autopilot.
+            # asked for it; every other input merely pauses the pilot.
             if not (recovery_requested and complete and user_turn):
                 log_event(
                     "state_recovery_blocked",
@@ -1373,7 +1602,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 return injection(RECOVERY_FAILED_MESSAGE)
             log_event("state_recovered", cid=conversation_id)
             return injection(
-                "【Autopilot 会话状态已恢复】原状态文件已备份留证并重建；"
+                "【Pilot 会话状态已恢复】原状态文件已备份留证并重建；"
                 "自动投递恢复正常。请用一句话告知用户，无需执行其他操作。"
             )
         worker_reload_msg = ""
@@ -1432,21 +1661,21 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             if not save_state(conversation_id, state):
                 log_event("pre_state_save_failed", cid=conversation_id)
             message = "\n\n".join(p for p in (worker_reload_msg, message) if p)
-            return injection(message + " 请仅用一句话回复，并以 <!-- autopilot: scene=NONE --> 结尾。")
+            return injection(message + " 请仅用一句话回复，并以 <!-- pilot: scene=NONE --> 结尾。")
 
         if mode_target:
             target = mode_target
             if target == "status":
-                scene_count = len(scan_scenes())
+                scene_count = len(scenes)
                 message = (
-                    f"【Autopilot 状态】当前模式为 `{current_mode(profile)}`，"
+                    f"【Pilot 状态】当前模式为 `{current_mode(profile)}`，"
                     f"已加载 {scene_count} 个场景文件。{worker_priority(cur_workers)}。请用一句话告知用户，无需调用工具。"
                 )
             elif not set_mode(target):
-                message = "【Autopilot】模式切换失败：profile.json 不可读或不可写。"
+                message = "【Pilot】模式切换失败：profile.json 不可读或不可写。"
             else:
                 message = (
-                    f"【Autopilot 模式已切换】当前模式为 `{target}`。"
+                    f"【Pilot 模式已切换】当前模式为 `{target}`。"
                     "请用一句话简短告知用户，无需执行其他操作。"
                 )
             if not save_state(conversation_id, state):
@@ -1470,7 +1699,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 if expanded:
                     state["last_scene"] = str(chosen.get("scene") or "")
                     message = (
-                        f"【Autopilot 候选指令 #{selected} 展开】用户选择了第 {selected} 条"
+                        f"【Pilot 候选指令 #{selected} 展开】用户选择了第 {selected} 条"
                         f"候选回应，请严格按以下要求执行：\n\n{expanded}"
                     )
                     log_event(
@@ -1490,7 +1719,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                         state["last_scene"] = str(command.get("scene") or "")
                         state["workflow_type"] = str(command.get("workflow_type") or "")
                         message = (
-                            f"【Autopilot 快捷命令 `{alias}` 展开】"
+                            f"【Pilot 快捷命令 `{alias}` 展开】"
                             f"请严格按以下完整要求执行：\n\n{expanded}"
                         )
 
@@ -1505,7 +1734,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                         if expanded:
                             state["workflow_type"] = str(spec.get("workflow_type") or "")
                             message = (
-                                f"【Autopilot 启动口令 `{key}` 展开】"
+                                f"【Pilot 启动口令 `{key}` 展开】"
                                 f"请严格按以下完整要求执行：\n\n{expanded}"
                             )
 
@@ -1581,6 +1810,20 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         return {"decision": "allow"}
     with state_lock(conversation_id):
         state = load_state(conversation_id)
+        profile, profile_status, profile_err = load_profile()
+        scenes, scene_errors = scan_scenes()
+        failure = _installed_config_failure(
+            profile_status, profile_err, scene_errors=scene_errors
+        )
+        if failure is not None:
+            # Never deliver against unusable installed inputs. Only a readable
+            # session can be cleared; a corrupt one is left as evidence.
+            code, detail = failure
+            if isinstance(state, dict) and session_path(conversation_id).is_file():
+                clear_suggestion(state)
+                save_state(conversation_id, state)
+            log_event(f"stop_{code}", cid=conversation_id, error=detail)
+            raise HookExecutionError(code, detail)
         if state is None:
             log_event("stop_state_corrupt", cid=conversation_id)
             return {"decision": "allow"}
@@ -1627,7 +1870,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             last_planner = planners[-1]
             if (
                 parsed["invalid"] == "missing_tag"
-                and current_mode() != "off"
+                and current_mode(profile) != "off"
                 and not bool(payload.get("continuationActive"))
                 and state.get("continued_unasked_turn_id") != user_turn
                 and turn_steps[-1] is last_planner
@@ -1652,8 +1895,8 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                     "reason": (
                         "上一条回复在冒号引导语处提前结束，既未发出 ask_question 工具调用，"
                         "也未输出回合结束标签。若需向用户确认问题，请立即直接调用 ask_question "
-                        "工具（不要重复已输出的正文，同一步不写 autopilot 标签）；若无需提问，"
-                        "请补齐收束结论与末尾 <!-- autopilot: ... --> 标签。"
+                        "工具（不要重复已输出的正文，同一步不写 pilot 标签）；若无需提问，"
+                        "请补齐收束结论与末尾 <!-- pilot: ... --> 标签。"
                     ),
                 }
             clear_suggestion(state)
@@ -1665,7 +1908,6 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return {"decision": "allow"}
 
-        scenes = scan_scenes()
         scene = str(parsed["scene"])
         if scene == "NONE" or not parsed["prompt"] or scene not in scenes:
             clear_suggestion(state)
@@ -1673,7 +1915,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             log_event("stop_without_suggestion", cid=conversation_id, scene=scene or "")
             return {"decision": "allow"}
 
-        mode = current_mode()
+        mode = current_mode(profile)
         if mode == "off":
             clear_suggestion(state)
             save_state(conversation_id, state)
@@ -1703,7 +1945,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         auto_eligible = mode == "gate" and gate == "auto"
         auto_submit = auto_eligible and int(
             state.get("consecutive_auto_turns") or 0
-        ) < max_consecutive_turns()
+        ) < max_consecutive_turns(profile)
         if auto_submit:
             handle = resolve_terminal(workspace_path, explicit_handle)
             if not handle:
@@ -1770,28 +2012,58 @@ def render_scenes_block(scenes: dict[str, dict[str, Any]]) -> str:
     return "\n\n".join(item[2] for item in entries)
 
 
+def _scenes_marker_bounds(text: str) -> tuple[str, str, int, int] | None:
+    """Return one managed scenes marker pair, canonical or legacy."""
+    pairs: list[tuple[str, str, int, int]] = []
+    for begin_marker, end_marker in (
+        (SCENES_BEGIN, SCENES_END),
+        (LEGACY_SCENES_BEGIN, LEGACY_SCENES_END),
+    ):
+        starts = _find_all_positions(text, begin_marker)
+        ends = _find_all_positions(text, end_marker)
+        if not starts and not ends:
+            continue
+        if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+            return None
+        pairs.append((begin_marker, end_marker, starts[0], ends[0]))
+    if len(pairs) != 1:
+        return None
+    return pairs[0]
+
+
 def command_sync() -> int:
     # Serialize with apply/uninstall and re-read every input under the lock so a
     # sync that started before an uninstall cannot write the managed block back.
-    with _file_lock(AUTOPILOT_DIR / ".autopilot.lock"):
-        if not PROFILE_PATH.is_file():
+    with _file_lock(PILOT_DIR / ".pilot.lock"):
+        profile, profile_status, profile_err = load_profile()
+        scenes, scene_errors = scan_scenes()
+        if profile_status == "missing":
             print(
-                "未安装（缺少 profile.json）；请先运行 setup_autopilot.py apply。",
+                "未安装（缺少 profile.json）；请先运行 pilot apply。",
                 file=sys.stderr,
             )
+            return 2
+        if profile_status == "corrupt" or not profile:
+            print(
+                f"profile.json 损坏：{profile_err or 'empty profile object'}",
+                file=sys.stderr,
+            )
+            return 2
+        if scene_errors:
+            print("场景文件不可读：" + "; ".join(scene_errors), file=sys.stderr)
             return 2
         try:
             text = GEMINI_MD_PATH.read_text(encoding="utf-8")
         except OSError as exc:
             print(f"无法读取 GEMINI.md：{exc}", file=sys.stderr)
             return 2
-        starts = _find_all_positions(text, SCENES_BEGIN)
-        ends = _find_all_positions(text, SCENES_END)
-        if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+        bounds = _scenes_marker_bounds(text)
+        if bounds is None:
             print("GEMINI.md 的场景托管标记缺失、重复或顺序错误。", file=sys.stderr)
             return 2
-        inner = f"{SCENES_BEGIN}\n\n{render_scenes_block(scan_scenes())}\n\n{SCENES_END}"
-        merged = text[: starts[0]] + inner + text[ends[0] + len(SCENES_END) :]
+        begin_marker, end_marker, start, end = bounds
+        inner = f"{begin_marker}\n\n{render_scenes_block(scenes)}\n\n{end_marker}"
+        merged = text[:start] + inner + text[end + len(end_marker):]
         if not save_text(GEMINI_MD_PATH, merged):
             print("无法写入 GEMINI.md。", file=sys.stderr)
             return 2
@@ -1801,37 +2073,63 @@ def command_sync() -> int:
 
 
 def command_status(as_json: bool) -> int:
-    profile = load_profile()
-    scenes = scan_scenes()
-    config = load_config()
-    hooks = load_json(GEMINI_DIR / "config" / "hooks.json")
+    profile, profile_status, profile_err = load_profile()
+    scenes, scene_errors = scan_scenes()
+    config, config_status, config_err = load_config()
+    hooks, hooks_status, hooks_err = load_json(GEMINI_DIR / "config" / "hooks.json")
+    errors = []
+    for status, error in (
+        (profile_status, profile_err),
+        (config_status, config_err),
+        (hooks_status, hooks_err),
+    ):
+        if status != "ok":
+            errors.append(error)
+    errors.extend(scene_errors)
+    profile_data = profile or {}
+    config_data = config or {}
     report = {
+        "ok": not errors,
+        "errors": errors,
+        "installed": (
+            profile_status == "ok"
+            and config_status == "ok"
+            and hooks_status == "ok"
+            and "the-pilot" in (hooks or {})
+        ),
+        "profile_status": profile_status,
+        "config_status": config_status,
+        "hooks_status": hooks_status,
         "gemini_dir": str(GEMINI_DIR),
-        "mode": current_mode(profile),
-        "worker_agents": current_worker_agents(profile),
-        "max_consecutive_auto_turns": max_consecutive_turns(profile),
+        "mode": current_mode(profile_data) if profile is not None else None,
+        "worker_agents": current_worker_agents(profile_data) if profile is not None else [],
+        "max_consecutive_auto_turns": (
+            max_consecutive_turns(profile_data) if profile is not None else None
+        ),
         "scenes": sorted(scenes),
-        "entry_shortcuts": sorted((config.get("entry_shortcuts") or {})),
+        "entry_shortcuts": sorted((config_data.get("entry_shortcuts") or {})),
         "comma_commands": sorted(
             {
                 alias
-                for command in (config.get("comma_commands") or {}).values()
+                for command in (config_data.get("comma_commands") or {}).values()
                 if isinstance(command, dict)
                 for alias in (command.get("aliases") or [])
             }
         ),
-        "hooks_group": "orca-agy-autopilot" in hooks,
+        "hooks_group": "the-pilot" in (hooks or {}),
         "engine": str(Path(__file__).resolve()),
         "profile": str(PROFILE_PATH),
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
         print(f"mode: {report['mode']}  max_turns: {report['max_consecutive_auto_turns']}")
         print("scenes: " + (", ".join(report["scenes"]) or "（无）"))
         print("entry: " + (", ".join(report["entry_shortcuts"]) or "（无）"))
         print("hooks_group: " + ("yes" if report["hooks_group"] else "no"))
-    return 0
+    return 2 if errors else 0
 
 
 def _command_identity(
@@ -1865,12 +2163,30 @@ def command_set(target: str, template: str) -> int:
     if not template:
         print("模板不能为空。", file=sys.stderr)
         return 2
-    with _file_lock(AUTOPILOT_DIR / ".autopilot.lock"):
-        profile = load_profile()
-        config = load_config()
+    with _file_lock(PILOT_DIR / ".pilot.lock"):
+        profile, profile_status, profile_err = load_profile()
+        config, config_status, config_err = load_config()
+        if profile_status == "missing" or config_status == "missing":
+            print(
+                "未安装（缺少 profile.json 或 config.json）；请先运行 pilot apply。",
+                file=sys.stderr,
+            )
+            return 2
+        if profile_status == "corrupt" or profile is None:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+            return 2
+        if config_status == "corrupt" or config is None:
+            print(f"config.json 损坏：{config_err}", file=sys.stderr)
+            return 2
         if not profile or not config:
             print(
-                "profile.json 或 config.json 不存在；请先运行 setup_autopilot.py apply。",
+                "profile.json 或 config.json 为空；请先运行 pilot apply。",
+                file=sys.stderr,
+            )
+            return 2
+        if not _prepare_profile_for_write(profile):
+            print(
+                "profile.json 同时包含 pilot 与旧版 autopilot 段；请只保留 pilot。",
                 file=sys.stderr,
             )
             return 2
@@ -1922,7 +2238,7 @@ def command_log(limit: int) -> int:
     try:
         lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        print("（暂无 autopilot 日志）")
+        print("（暂无 pilot 日志）")
         return 0
     except OSError as exc:
         print(f"无法读取日志：{exc}", file=sys.stderr)
@@ -1932,22 +2248,58 @@ def command_log(limit: int) -> int:
     return 0
 
 
+def _hook_failure(event: str, error: str, detail: str) -> int:
+    """Report a refused hook as structured JSON on stderr with exit code 2."""
+    print(
+        json.dumps(
+            {"ok": False, "event": event, "error": error, "detail": detail},
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+    return 2
+
+
 def run_hook(event: str) -> int:
-    payload = read_payload()
+    payload, payload_err = read_payload()
+    if payload is None:
+        return _hook_failure(event, "invalid_payload", payload_err)
     try:
         if event == "PreInvocation":
             result = handle_pre_invocation(payload)
         else:
             result = handle_stop(payload)
+    except HookExecutionError as exc:
+        return _hook_failure(event, exc.code, exc.detail)
     except Exception as exc:
-        log_event("hook_failed", event=event, error=repr(exc))
-        result = {} if event == "PreInvocation" else {"decision": "allow"}
+        log_event("hook_failed", hook_event=event, error=repr(exc))
+        return _hook_failure(event, "internal_error", repr(exc))
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
 def command_worker(target: str, as_json: bool) -> int:
-    success, workers, updated = (True, current_worker_agents(), []) if target == "status" else set_worker_agents(target)
+    profile, profile_status, profile_err = load_profile()
+    if profile_status != "ok" or profile is None:
+        report = {
+            "ok": False,
+            "status": profile_status,
+            "error": profile_err,
+            "worker_agents": [],
+            "updated_files": [],
+        }
+        if as_json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif profile_status == "missing":
+            print(f"未安装（缺少 profile.json）：{profile_err}", file=sys.stderr)
+        else:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+        return 2
+    success, workers, updated = (
+        (True, current_worker_agents(profile), [])
+        if target == "status"
+        else set_worker_agents(target)
+    )
     report = {"ok": success, "worker_agents": workers, "updated_files": updated}
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1961,20 +2313,32 @@ def command_worker(target: str, as_json: bool) -> int:
 
 
 def command_mode(target: str) -> int:
-    if target != "status" and not set_mode(target):
-        print("Mode switch failed: profile.json is missing or unwritable.", file=sys.stderr)
+    profile, profile_status, profile_err = load_profile()
+    if profile_status == "missing":
+        print(f"未安装（缺少 profile.json）：{profile_err}", file=sys.stderr)
         return 2
-    print(f"Autopilot mode: {current_mode()}")
+    if profile_status == "corrupt" or profile is None:
+        print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+        return 2
+    if target != "status":
+        if not set_mode(target):
+            print("Mode switch failed: profile.json is missing or unwritable.", file=sys.stderr)
+            return 2
+        profile, profile_status, profile_err = load_profile()
+        if profile_status != "ok" or profile is None:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+            return 2
+    print(f"Pilot mode: {current_mode(profile)}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="autopilot.py")
+    parser = argparse.ArgumentParser(prog="runtime.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
     worker = subparsers.add_parser("worker", help="切换或查看 Worker 执行器优先级")
     worker.add_argument("target", nargs="?", default="status", choices=("codex", "claude", "claude-code", "cc", "status"))
     worker.add_argument("--json", action="store_true")
-    mode = subparsers.add_parser("mode", help="切换或查看 Autopilot 模式")
+    mode = subparsers.add_parser("mode", help="切换或查看 Pilot 模式")
     mode.add_argument("target", nargs="?", default="status", choices=(*MODES, "status"))
     hook = subparsers.add_parser("hook", help="运行 Antigravity 生命周期 Hook")
     hook.add_argument("--event", required=True, choices=("PreInvocation", "Stop"))

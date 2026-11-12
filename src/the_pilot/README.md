@@ -6,7 +6,7 @@
 - `compiler.py`: pure rendering and managed-document merges; no IO.
 - `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs, plus scene pipeline assessment of the installed profile and scene contracts.
 - `installer.py`: the sole owner of project discovery, workspace overlay synchronization, `self-update`, installation locking and atomic file writes.
-- `assets/autopilot.py`: the single runtime owner, copied unchanged on install; it only forwards `--workspace` to the installer CLI.
+- `assets/runtime.py`: the single runtime owner, copied unchanged on install; it only forwards `--workspace` to the installer CLI.
 - `runtime.py`: subprocess adapter to the installed runtime (no second engine).
 - `cli.py`: installer versus runtime command routing only.
 

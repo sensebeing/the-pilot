@@ -4,7 +4,7 @@ Describe the concrete problem and resulting behavior. Link related issues if app
 
 ## Architecture and scope
 
-Identify the decision owner (`defaults`, `project`, `profile`, `compiler`, `installer`, `cli`, or `assets/autopilot.py`), affected boundaries, and any replaced mechanisms removed.
+Identify the decision owner (`defaults`, `project`, `profile`, `compiler`, `installer`, `cli`, or `assets/runtime.py`), affected boundaries, and any replaced mechanisms removed.
 
 ## Verification
 

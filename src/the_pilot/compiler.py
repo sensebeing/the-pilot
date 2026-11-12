@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
-from .defaults import AGENT_LABELS, GEMINI_BEGIN, GEMINI_END, HARNESS_ORCHESTRATION_SENTENCE, SCENES_BEGIN, SCENES_END, UNMANAGED_SCENES_MARKERS_ERROR
+from .defaults import AGENT_LABELS, GEMINI_BEGIN, GEMINI_END, HARNESS_ORCHESTRATION_SENTENCE, HOOK_GROUP, LEGACY_GEMINI_BEGIN, LEGACY_GEMINI_END, LEGACY_HOOK_GROUP, LEGACY_SCENES_BEGIN, LEGACY_SCENES_END, SCENES_BEGIN, SCENES_END, UNMANAGED_SCENES_MARKERS_ERROR
 from .project import ProfileError, project_specs
 from .profile import _copy_mapping, validate_profile
 
@@ -119,7 +119,7 @@ def render_gemini_block(profile: dict[str, Any], scenes: dict[str, str]) -> str:
     parts = [
         GEMINI_BEGIN,
         render_orchestration_section(profile),
-        render_autopilot_section(profile, len(scenes)),
+        render_pilot_section(profile, len(scenes)),
         SCENES_BEGIN,
         render_scenes_block(scenes),
         SCENES_END,
@@ -155,8 +155,8 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
    - **同终端复用打回与受控释放**：有未达标项时按 `orchestration` 同终端复用机制，用 `worker-show` 取已验证终端句柄，再建整改 Task 并 `worker-start --terminal <agent_terminal_handle>` 派回原终端修改并复审至达标；审查通过则用同终端 follow-up Dispatch 通知「审查通过，可合入 `main` 并推送收尾」，全部结算后 `worker-release` 释放受控 worker（**严禁用 `orca terminal close` 替代 `worker-release`**），结束前用 `worker-list --terminal-state reclaimable` 确认无遗留可回收终端并清理子工作区与已合入分支。"""
 
 
-def render_autopilot_section(profile: dict[str, Any], scene_count: int) -> str:
-    max_turns = profile["autopilot"]["max_consecutive_auto_turns"]
+def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
+    max_turns = profile["pilot"]["max_consecutive_auto_turns"]
     if scene_count:
         routing = (
             f"每个回合结束时，按下方 {scene_count} 个正交场景的触发条件路由"
@@ -166,10 +166,10 @@ def render_autopilot_section(profile: dict[str, Any], scene_count: int) -> str:
         )
     else:
         routing = (
-            "本机未启用场景；回合结束只输出 `<!-- autopilot: scene=NONE -->`，"
+            "本机未启用场景；回合结束只输出 `<!-- pilot: scene=NONE -->`，"
             "不做自动预填。"
         )
-    return f"""## 个人研发状态机与 Turn Autopilot 规范（Agent 单一语义 Owner 三步判断模型）
+    return f"""## 个人研发状态机与 Turn Pilot 规范（Agent 单一语义 Owner 三步判断模型）
 
 仅对**主会话（Coordinator，不含 Orca Task ID / Dispatch ID preamble）**生效，子会话静默忽略。模式以本机 `profile.json` 为唯一真源，可用 `,mode status|gate|confirm|off` 切换；`gate` 连续自动推进上限 {max_turns} 轮。引擎只做机械预填与回车，**意图分类、场景路由与 `gate=auto|pause` 由主会话按三步模型裁决**：
 
@@ -178,15 +178,15 @@ def render_autopilot_section(profile: dict[str, Any], scene_count: int) -> str:
    - **A 类 — 确定性收敛**：正确行为与边界已由产品设计、模块契约、`peq.*`、事实或当前明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界；含单点及跨内部服务根因修复、已授权或合同内冗余清理、工具参数/回执修正、并发/超时治理、批量问题族和质量收敛。直接 `gate=auto`，不重复提问。
    - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按 AGENTS.md 与 `peq.architecture-simplicity` 说明不变量与替代保护，最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；同回合获答后按确认边界收敛，首版完整方案未确认标 `gate=pause`。获准后复审/交付/结案 `gate=auto`，prod 发布、未授权真实 E2E 除外。
    - **简化边界**：历史提交/合同不能豁免最简架构。说明真实不变量、复发成因及唯一 owner 的确定性替代保护；未经授权改变安全门禁、跨模块/内外部合同或状态机边界须先确认，已授权范围内直接推进。
-2. **第二步：场景路由与 Prompt 构造（所见即所填：真源 `~/.gemini/config/autopilot/scenes/*.md`）**：{routing}
+2. **第二步：场景路由与 Prompt 构造（所见即所填：真源 `~/.gemini/config/the-pilot/scenes/*.md`）**：{routing}
 3. **第三步：输出可见建议与唯一隐藏标签**：可见建议行必须打印在正文中（绝不能只藏在 HTML 注释里）；推荐 `**下一步建议：**` 后跟 `- **,1（主推）**：<主推文本>` 与 `- **,2（备选）**：<备选文本>`，对称使用 `,1`/`,2`：
    - 主推行（二选一）：`💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；输 ,2 切备选）**：<主推文本>`；或 `- **,1（主推）**：<主推文本>`。
    - 备选行（可选）：`- **,2（备选）**：<备选文本>`；第三选项用 `- **,3（备选）**：<备选文本>`。
-   - 正文中的 `,1` / `,2` 仅供人类阅读。回复末尾唯一的结构化 JSON 标签是唯一执行真源，由 `json.loads` 解析：`<!-- autopilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（无备选时省略 "2"）。主推必须非空，候选只从标签读取，不解析或交叉校验 Markdown；使用合法 JSON 转义保留文本。
-   - 场景名缺失/未知/多标签、gate 缺失或非法时按暂停处理；标签不合法、重复或字段冲突时清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认实施的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。异步提问未答或结案输出 `<!-- autopilot: {{"scene": "NONE"}} -->`（兼容 `<!-- autopilot: scene=NONE -->`）。
+   - 正文中的 `,1` / `,2` 仅供人类阅读。回复末尾唯一的结构化 JSON 标签是唯一执行真源，由 `json.loads` 解析：`<!-- pilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（无备选时省略 "2"）。主推必须非空，候选只从标签读取，不解析或交叉校验 Markdown；使用合法 JSON 转义保留文本。
+   - 场景名缺失/未知/多标签、gate 缺失或非法时按暂停处理；标签不合法、重复或字段冲突时清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认实施的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。异步提问未答或结案输出 `<!-- pilot: {{"scene": "NONE"}} -->`（兼容 `<!-- pilot: scene=NONE -->`）。
    - 暂停/确认回合中，用户可随时输入 `,1 [补充说明]` 触发主推（与 `,2 [补充说明]` 完全对称）。
 
-场景全文由 `scenes/*.md` 唯一持有；改动后运行 `autopilot.py sync` 刷新本段。"""
+场景全文由 `scenes/*.md` 唯一持有；改动后运行 `pilot sync` 刷新本段。"""
 
 
 def render_scenes_block(scenes: dict[str, str]) -> str:
@@ -216,13 +216,20 @@ def _assert_scenes_markers_managed(
 ) -> None:
     """Reject scene markers the tool did not write.
 
-    Only the managed profile block may own `AUTOPILOT SCENES`: appending a
-    second, managed scenes segment around a legacy manual one leaves two
-    blocks that both the truncating CLI and `autopilot.py sync` treat as one,
-    so the install fails closed and says what to clean up first.
+    Only the managed profile block may own `THE_PILOT_SCENES` (or the legacy
+    `AUTOPILOT SCENES` block): appending a second, managed scenes segment
+    around a legacy manual one leaves two blocks that both the truncating CLI
+    and the runtime `sync` treat as one, so the install fails closed and says
+    what to clean up first.
     """
     outside = text if bounds is None else text[: bounds[0]] + text[bounds[1] :]
-    if SCENES_BEGIN in outside or SCENES_END in outside:
+    markers = (
+        SCENES_BEGIN,
+        SCENES_END,
+        LEGACY_SCENES_BEGIN,
+        LEGACY_SCENES_END,
+    )
+    if any(marker in outside for marker in markers):
         raise ValueError(UNMANAGED_SCENES_MARKERS_ERROR)
 
 
@@ -269,7 +276,11 @@ def strip_gemini_md(existing: str) -> str:
 
 
 def merge_hooks_json(existing: dict[str, Any], engine_path: str) -> dict[str, Any]:
-    """Install our hook group without touching the registry's other groups."""
+    """Install our hook group without touching the registry's other groups.
+
+    The legacy `orca-agy-autopilot` group is removed in the same write: leaving
+    both groups installed would run every hook twice.
+    """
     registry = _copy_mapping(existing, "hooks registry") if existing else {}
     quoted_engine = shlex.quote(str(Path(engine_path).expanduser().resolve()))
     commands = {
@@ -282,13 +293,15 @@ def merge_hooks_json(existing: dict[str, Any], engine_path: str) -> dict[str, An
         ]
         for event in ("PreInvocation", "Stop")
     }
-    registry["orca-agy-autopilot"] = commands
+    registry.pop(LEGACY_HOOK_GROUP, None)
+    registry[HOOK_GROUP] = commands
     return registry
 
 
 def strip_hooks_json(existing: dict[str, Any]) -> dict[str, Any]:
     registry = _copy_mapping(existing, "hooks registry") if existing else {}
-    registry.pop("orca-agy-autopilot", None)
+    registry.pop(HOOK_GROUP, None)
+    registry.pop(LEGACY_HOOK_GROUP, None)
     return registry
 
 
@@ -374,13 +387,28 @@ def _yaml_string(value: Any) -> str:
 
 
 def _block_bounds(text: str) -> tuple[int, int] | None:
-    begins = _find_all_positions(text, GEMINI_BEGIN)
-    ends = _find_all_positions(text, GEMINI_END)
-    if not begins and not ends:
+    """Return the managed profile block, accepting one legacy block in place.
+
+    A file carrying both the canonical and the legacy outer block is ambiguous:
+    replacing only one would leave two profile owners, so it fails closed.
+    """
+    bounds: list[tuple[int, int]] = []
+    for begin_marker, end_marker in (
+        (GEMINI_BEGIN, GEMINI_END),
+        (LEGACY_GEMINI_BEGIN, LEGACY_GEMINI_END),
+    ):
+        begins = _find_all_positions(text, begin_marker)
+        ends = _find_all_positions(text, end_marker)
+        if not begins and not ends:
+            continue
+        if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
+            raise ValueError("GEMINI.md 托管标记必须恰好各出现一次且顺序正确")
+        bounds.append((begins[0], ends[0] + len(end_marker)))
+    if not bounds:
         return None
-    if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
-        raise ValueError("GEMINI.md 托管标记必须恰好各出现一次且顺序正确")
-    return begins[0], ends[0] + len(GEMINI_END)
+    if len(bounds) > 1:
+        raise ValueError("GEMINI.md 同时包含新旧托管块；请先删除旧版 ORCA_AUTOPILOT_PROFILE 段")
+    return bounds[0]
 
 
 def _assert_unique_aliases(commands: dict[str, dict[str, Any]]) -> None:

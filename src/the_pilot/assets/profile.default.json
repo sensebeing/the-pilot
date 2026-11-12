@@ -1,5 +1,5 @@
 {
-  "schema": "orca-autopilot-profile/v1",
+  "schema": "the-pilot-profile/v1",
   "orchestration": {
     "worker_agents": [
       "claude",
@@ -11,7 +11,7 @@
       "agy"
     ]
   },
-  "autopilot": {
+  "pilot": {
     "mode": "gate",
     "max_consecutive_auto_turns": 8
   },

@@ -1,7 +1,7 @@
-"""Sandboxed tests for the Orca Autopilot skill.
+"""Sandboxed tests for The Pilot.
 
 Every test runs inside a ``tempfile.TemporaryDirectory`` and passes an explicit
-``--gemini-dir`` or ``ORCA_AUTOPILOT_GEMINI_DIR``; the real ``~/.gemini`` is
+``--gemini-dir`` or ``THE_PILOT_GEMINI_DIR``; the real ``~/.gemini`` is
 never read or written.
 
 resident-fact: settlement: profile 是唯一安装真源，安装/卸载只改托管项；自动投递只在 gate=auto 且未达轮数上限时回车。
@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shlex
@@ -22,9 +23,13 @@ import unittest
 
 
 from functools import partial
+from unittest import mock
+
 from the_pilot import compiler as profile_compiler
+from the_pilot.assets import runtime
 from the_pilot.profile import resolve_profile as resolve_user_profile, normalize_comma_alias
 from the_pilot.defaults import DEFAULT_SPECS, DELIVER_STRATEGIES, HARNESS_ORCHESTRATION_SENTENCE
+from the_pilot.project import ProfileError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "src/the_pilot"
@@ -34,12 +39,12 @@ PROJECT_PATH = REPO_ROOT / "tests/fixtures/alter-service.json"
 PROJECT = json.loads(PROJECT_PATH.read_text(encoding="utf-8"))
 resolve_profile = partial(resolve_user_profile, project=PROJECT)
 compile_bundle = partial(profile_compiler.compile_bundle, project=PROJECT)
-ENGINE_REL = Path("config/autopilot/autopilot.py")
-SCENES_REL = Path("config/autopilot/scenes")
+ENGINE_REL = Path("config/the-pilot/runtime.py")
+SCENES_REL = Path("config/the-pilot/scenes")
 GEMINI_REL = Path("config/GEMINI.md")
 HOOKS_REL = Path("config/hooks.json")
-PROFILE_REL = Path("config/autopilot/profile.json")
-CONFIG_REL = Path("config/autopilot/config.json")
+PROFILE_REL = Path("config/the-pilot/profile.json")
+CONFIG_REL = Path("config/the-pilot/config.json")
 
 
 FAKE_ORCA = """#!__PYTHON__
@@ -139,8 +144,8 @@ def apply_profile(root: Path, gemini: Path, *args: str) -> dict:
 
 def engine_env(root: Path, gemini: Path, state: Path, extra: dict | None = None) -> dict[str, str]:
     env = base_env(root)
-    env["ORCA_AUTOPILOT_GEMINI_DIR"] = str(gemini)
-    env["ORCA_AUTOPILOT_STATE_DIR"] = str(state)
+    env["THE_PILOT_GEMINI_DIR"] = str(gemini)
+    env["THE_PILOT_STATE_DIR"] = str(state)
     for key, value in (extra or {}).items():
         if value is None:
             env.pop(key, None)
@@ -200,7 +205,7 @@ def suggestion(
     tag = {"scene": scene, "gate": gate, "1": prompt}
     if alt:
         tag["2"] = alt
-    lines.append(f"<!-- autopilot: {json.dumps(tag, ensure_ascii=False)} -->")
+    lines.append(f"<!-- pilot: {json.dumps(tag, ensure_ascii=False)} -->")
     return "\n".join(lines)
 
 
@@ -266,8 +271,8 @@ class CompilerTest(unittest.TestCase):
             {"recommended", "conservative", "orchestration-only"},
         )
         recommended = resolve_profile(self.base, preset="recommended")
-        self.assertEqual(recommended["autopilot"]["mode"], "gate")
-        self.assertEqual(recommended["autopilot"]["max_consecutive_auto_turns"], 8)
+        self.assertEqual(recommended["pilot"]["mode"], "gate")
+        self.assertEqual(recommended["pilot"]["max_consecutive_auto_turns"], 8)
         self.assertEqual(len(recommended["scenes"]["enabled_scenes"]), 4)
         self.assertEqual(len(recommended["shortcuts"]["enabled_entry"]), 7)
         config = compile_bundle(recommended).config_json
@@ -285,18 +290,37 @@ class CompilerTest(unittest.TestCase):
         self.assertIn("部署后默认执行受影响链路的定向 dev E2E", scene)
         self.assertIn("当前环境不具备执行条件", scene)
         self.assertIn("全量/批量套件", scene)
-        self.assertEqual(conservative["autopilot"]["mode"], "confirm")
-        self.assertEqual(conservative["autopilot"]["max_consecutive_auto_turns"], 4)
+        self.assertEqual(conservative["pilot"]["mode"], "confirm")
+        self.assertEqual(conservative["pilot"]["max_consecutive_auto_turns"], 4)
         self.assertEqual(conservative["shortcuts"]["enabled_entry"], ["r", "rt", "d", "pull"])
 
         orchestration = resolve_profile(
             self.base, preset="orchestration-only"
         )
-        self.assertEqual(orchestration["autopilot"]["mode"], "off")
+        self.assertEqual(orchestration["pilot"]["mode"], "off")
         self.assertEqual(orchestration["scenes"]["enabled_scenes"], [])
         self.assertEqual(orchestration["shortcuts"]["enabled_entry"], [])
         bundle = compile_bundle(orchestration)
         self.assertEqual(bundle.scenes, {})
+
+    def test_legacy_profile_section_normalizes_once_and_dual_owners_fail(self) -> None:
+        """Failure means an old profile keeps a second owner for mode and turn cap."""
+        legacy = dict(self.base)
+        legacy["schema"] = "orca-autopilot-profile/v1"
+        legacy["autopilot"] = legacy.pop("pilot")
+        legacy["orchestration"] = dict(self.base["orchestration"])
+        normalized = resolve_profile(legacy, preset=None)
+        self.assertEqual(normalized["schema"], "the-pilot-profile/v1")
+        self.assertIn("pilot", normalized)
+        self.assertNotIn("autopilot", normalized)
+        self.assertEqual(normalized["pilot"], self.base["pilot"])
+
+        ambiguous = dict(legacy)
+        ambiguous["pilot"] = dict(self.base["pilot"])
+        with self.assertRaises(ProfileError) as caught:
+            resolve_profile(ambiguous, preset=None)
+        self.assertIn("pilot", str(caught.exception))
+        self.assertIn("autopilot", str(caught.exception))
 
     def test_four_dimension_profile_compiles_into_config_scenes_and_block(self) -> None:
         profile = resolve_profile(
@@ -304,7 +328,7 @@ class CompilerTest(unittest.TestCase):
             preset="recommended",
             overrides={
                 "orchestration": {"worker_agents": ["codex"], "review_agents": ["agy", "codex"]},
-                "autopilot": {"mode": "confirm", "max_consecutive_auto_turns": 12},
+                "pilot": {"mode": "confirm", "max_consecutive_auto_turns": 12},
                 "scenes": {
                     "enabled_scenes": ["deliver-and-verify", "plan-and-orchestrate"],
                     "deliver_strategy": "merge_dev_e2e",
@@ -332,8 +356,8 @@ class CompilerTest(unittest.TestCase):
         )
         self.assertEqual(profile["orchestration"]["worker_agents"], ["codex"])
         self.assertEqual(profile["orchestration"]["review_agents"], ["agy", "codex"])
-        self.assertEqual(profile["autopilot"]["mode"], "confirm")
-        self.assertEqual(profile["autopilot"]["max_consecutive_auto_turns"], 12)
+        self.assertEqual(profile["pilot"]["mode"], "confirm")
+        self.assertEqual(profile["pilot"]["max_consecutive_auto_turns"], 12)
         self.assertEqual(
             profile["scenes"]["enabled_scenes"],
             ["plan-and-orchestrate", "deliver-and-verify"],
@@ -462,18 +486,18 @@ class CompilerTest(unittest.TestCase):
         # or the universal block stops being project-neutral or exceeds the
         # byte budget the installed GEMINI.md must respect.
         profile = resolve_profile(self.base, preset="recommended")
-        universal = profile_compiler.render_autopilot_section(
+        universal = profile_compiler.render_pilot_section(
             resolve_user_profile(self.base, preset="recommended"), 4
         )
         self.assertEqual(
-            universal, profile_compiler.render_autopilot_section(profile, 4)
+            universal, profile_compiler.render_pilot_section(profile, 4)
         )
         self.assertNotIn("alter", universal.lower())
         self.assertNotIn("seabass", universal.lower())
         for clause in (
             "提问未答",
             "，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；",
-            '异步提问未答或结案输出 `<!-- autopilot: {"scene": "NONE"} -->`',
+            '异步提问未答或结案输出 `<!-- pilot: {"scene": "NONE"} -->`',
         ):
             self.assertIn(clause, universal)
 
@@ -523,7 +547,7 @@ class CompilerTest(unittest.TestCase):
 
     def test_gemini_merge_rejects_scene_markers_outside_the_managed_block(self) -> None:
         # Failure means a legacy manual scenes segment survives next to ours,
-        # growing GEMINI.md past the CLI limit and breaking `autopilot.py sync`.
+        # growing GEMINI.md past the CLI limit and breaking `runtime.py sync`.
         block = compile_bundle(
             resolve_profile(self.base)
         ).gemini_block
@@ -546,11 +570,11 @@ class CompilerTest(unittest.TestCase):
 
     def test_hooks_merge_preserves_other_groups_and_strip_removes_only_ours(self) -> None:
         existing = {"orca-status": {"Stop": [{"type": "command", "command": "true"}]}}
-        merged = profile_compiler.merge_hooks_json(existing, "/tmp/engine/autopilot.py")
+        merged = profile_compiler.merge_hooks_json(existing, "/tmp/engine/runtime.py")
         self.assertEqual(merged["orca-status"], existing["orca-status"])
-        group = merged["orca-agy-autopilot"]
+        group = merged["the-pilot"]
         self.assertEqual(group["PreInvocation"][0]["timeout"], 10)
-        self.assertIn("/tmp/engine/autopilot.py", group["PreInvocation"][0]["command"])
+        self.assertIn("/tmp/engine/runtime.py", group["PreInvocation"][0]["command"])
         self.assertIn("--event PreInvocation", group["PreInvocation"][0]["command"])
         self.assertIn("--event Stop", group["Stop"][0]["command"])
         stripped = profile_compiler.strip_hooks_json(merged)
@@ -564,16 +588,29 @@ class CompilerTest(unittest.TestCase):
     def test_validation_rejects_unknown_fields_and_reserved_aliases(self) -> None:
         with self.assertRaises(profile_compiler.ProfileError):
             resolve_profile(
-                self.base, overrides={"autopilot": {"mode": "bogus"}}
+                self.base, overrides={"pilot": {"mode": "bogus"}}
             )
         with self.assertRaises(profile_compiler.ProfileError):
             resolve_profile(
-                self.base, overrides={"autopilot": {"unknown": 1}}
+                self.base, overrides={"pilot": {"unknown": 1}}
             )
         with self.assertRaises(profile_compiler.ProfileError):
             resolve_profile(
                 self.base, overrides={"shortcuts": {"custom_comma": {"mode": "x"}}}
             )
+        for reserved in ("pilot", "autopilot"):
+            with self.assertRaises(profile_compiler.ProfileError):
+                resolve_profile(
+                    self.base,
+                    overrides={"shortcuts": {"custom_entry": {reserved: "x"}}},
+                )
+            with self.assertRaises(profile_compiler.ProfileError):
+                resolve_profile(
+                    self.base,
+                    overrides={
+                        "shortcuts": {"custom_comma": {reserved: {"template": "x"}}}
+                    },
+                )
         with self.assertRaises(profile_compiler.ProfileError):
             resolve_profile(
                 self.base,
@@ -668,9 +705,9 @@ class CompilerTest(unittest.TestCase):
             )
 
     def test_hook_command_shell_quotes_engine_path(self) -> None:
-        engine = '/tmp/engine $(touch nope) "quoted"/autopilot.py'
+        engine = '/tmp/engine $(touch nope) "quoted"/runtime.py'
         merged = profile_compiler.merge_hooks_json({}, engine)
-        command = merged["orca-agy-autopilot"]["PreInvocation"][0]["command"]
+        command = merged["the-pilot"]["PreInvocation"][0]["command"]
         parts = shlex.split(command)
         self.assertEqual(parts[0], "python3")
         self.assertEqual(Path(parts[1]), Path(engine).expanduser().resolve())
@@ -687,8 +724,8 @@ class SetupTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._temp.cleanup()
 
-    def seed_user_files(self) -> None:
-        config_dir = self.gemini / "config"
+    def seed_user_files(self, gemini: Path | None = None) -> None:
+        config_dir = (gemini or self.gemini) / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "GEMINI.md").write_text(
             "# 用户规则\n\n保留这一段。\n", encoding="utf-8"
@@ -697,6 +734,62 @@ class SetupTest(unittest.TestCase):
             config_dir / "hooks.json",
             {"orca-status": {"Stop": [{"type": "command", "command": "true"}]}},
         )
+
+    def seed_legacy_install(self, gemini: Path, *, unmanaged: bool = False) -> Path:
+        """Create a populated pre-migration ``config/autopilot`` install."""
+        self.seed_user_files(gemini)
+        legacy_dir = gemini / "config" / "autopilot"
+        (legacy_dir / "state").mkdir(parents=True)
+        (legacy_dir / "scenes").mkdir(parents=True)
+        (legacy_dir / "__pycache__").mkdir()
+        profile = load_default_profile()
+        profile["schema"] = "orca-autopilot-profile/v1"
+        profile["autopilot"] = profile.pop("pilot")
+        profile["orchestration"]["worker_agents"] = ["codex"]
+        profile["autopilot"]["mode"] = "confirm"
+        profile["autopilot"]["max_consecutive_auto_turns"] = 5
+        write_json(legacy_dir / "profile.json", profile)
+        write_json(legacy_dir / "config.json", {"entry_shortcuts": {}})
+        write_json(legacy_dir / "project.json", PROJECT)
+        (legacy_dir / "autopilot.py").write_text("# legacy engine\n", encoding="utf-8")
+        (legacy_dir / ".autopilot.lock").write_text("", encoding="utf-8")
+        (legacy_dir / "__pycache__" / "autopilot.cpython-311.pyc").write_text("old", encoding="utf-8")
+        (legacy_dir / "state" / "autopilot.log").write_text(
+            '{"event": "legacy_log"}\n', encoding="utf-8"
+        )
+        (legacy_dir / "state" / "session-abc.json").write_text(
+            '{"conversation_id": "legacy"}\n', encoding="utf-8"
+        )
+        (legacy_dir / "state" / "session-abc.lock").write_text("", encoding="utf-8")
+        (legacy_dir / "scenes" / "01-plan-and-orchestrate.md").write_text(
+            "---\nname: plan-and-orchestrate\n---\nlegacy\n", encoding="utf-8"
+        )
+        (legacy_dir / "scenes" / "05-custom.md").write_text(
+            "---\nname: custom\n---\nkeep custom\n", encoding="utf-8"
+        )
+        gemini_md = gemini / GEMINI_REL
+        gemini_md.write_text(
+            gemini_md.read_text(encoding="utf-8")
+            + "\n"
+            + profile_compiler.LEGACY_GEMINI_BEGIN
+            + "\n## 个人研发状态机与 Turn Autopilot 规范\n\n旧指引\n\n"
+            + profile_compiler.LEGACY_SCENES_BEGIN
+            + "\n旧场景\n"
+            + profile_compiler.LEGACY_SCENES_END
+            + "\n"
+            + profile_compiler.LEGACY_GEMINI_END
+            + "\n",
+            encoding="utf-8",
+        )
+        hooks_path = gemini / HOOKS_REL
+        hooks = read_json(hooks_path)
+        hooks["orca-agy-autopilot"] = {
+            "Stop": [{"type": "command", "command": "python3 old/autopilot.py hook --event Stop"}]
+        }
+        write_json(hooks_path, hooks)
+        if unmanaged:
+            (legacy_dir / "notes.txt").write_text("keep", encoding="utf-8")
+        return legacy_dir
 
     def test_apply_installs_every_artifact_and_preserves_user_files(self) -> None:
         self.seed_user_files()
@@ -707,7 +800,7 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(engine.stat().st_mode & 0o777, 0o755)
         self.assertEqual(len(list((self.gemini / SCENES_REL).glob("*.md"))), 4)
         profile = read_json(self.gemini / PROFILE_REL)
-        self.assertEqual(profile["autopilot"]["mode"], "gate")
+        self.assertEqual(profile["pilot"]["mode"], "gate")
         config = read_json(self.gemini / CONFIG_REL)
         self.assertEqual(
             set(config), {"entry_shortcuts", "comma_commands"}
@@ -717,8 +810,8 @@ class SetupTest(unittest.TestCase):
         self.assertIn(profile_compiler.GEMINI_BEGIN, gemini_text)
         hooks = read_json(self.gemini / HOOKS_REL)
         self.assertIn("orca-status", hooks)
-        self.assertIn("orca-agy-autopilot", hooks)
-        self.assertIn(str(engine), hooks["orca-agy-autopilot"]["Stop"][0]["command"])
+        self.assertIn("the-pilot", hooks)
+        self.assertIn(str(engine), hooks["the-pilot"]["Stop"][0]["command"])
 
         status = run_setup(self.root, self.gemini, "status")
         self.assertEqual(status.returncode, 0, status.stderr)
@@ -728,10 +821,10 @@ class SetupTest(unittest.TestCase):
         self.assertTrue(report["engine"]["up_to_date"])
 
     def test_apply_custom_profile_writes_selected_options(self) -> None:
-        autopilot_dir = self.gemini / "config" / "autopilot"
-        autopilot_dir.mkdir(parents=True, exist_ok=True)
+        pilot_dir = self.gemini / "config" / "the-pilot"
+        pilot_dir.mkdir(parents=True, exist_ok=True)
         write_json(
-            autopilot_dir / "config.json",
+            pilot_dir / "config.json",
             {"extra": 1},
         )
         custom = json.dumps(
@@ -763,8 +856,8 @@ class SetupTest(unittest.TestCase):
         profile = read_json(self.gemini / PROFILE_REL)
         self.assertEqual(profile["orchestration"]["worker_agents"], ["codex"])
         self.assertEqual(profile["orchestration"]["review_agents"], ["agy", "codex"])
-        self.assertEqual(profile["autopilot"]["mode"], "confirm")
-        self.assertEqual(profile["autopilot"]["max_consecutive_auto_turns"], 5)
+        self.assertEqual(profile["pilot"]["mode"], "confirm")
+        self.assertEqual(profile["pilot"]["max_consecutive_auto_turns"], 5)
         self.assertEqual(profile["scenes"]["enabled_scenes"], ["plan-and-orchestrate"])
         self.assertEqual(
             sorted(path.name for path in (self.gemini / SCENES_REL).glob("*.md")),
@@ -779,14 +872,14 @@ class SetupTest(unittest.TestCase):
         profile_path = self.gemini / PROFILE_REL
         profile = read_json(profile_path)
         profile["orchestration"]["worker_agents"] = ["codex"]
-        profile["autopilot"]["mode"] = "confirm"
+        profile["pilot"]["mode"] = "confirm"
         write_json(profile_path, profile)
         engine_before = (self.gemini / ENGINE_REL).read_bytes()
 
         apply_profile(self.root, self.gemini, "--upgrade")
         upgraded = read_json(profile_path)
         self.assertEqual(upgraded["orchestration"]["worker_agents"], ["codex"])
-        self.assertEqual(upgraded["autopilot"]["mode"], "confirm")
+        self.assertEqual(upgraded["pilot"]["mode"], "confirm")
         self.assertEqual((self.gemini / ENGINE_REL).read_bytes(), engine_before)
 
         conflict = run_setup(
@@ -800,6 +893,102 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("profile.json", result.stderr)
         self.assertFalse((self.gemini / ENGINE_REL).is_file())
+
+    def test_upgrade_migrates_legacy_autopilot_install(self) -> None:
+        """Failure means a pre-rename install keeps a second profile, hook group or state tree.
+
+        resident-fact: settlement: one apply --upgrade moves managed legacy
+        artifacts and durable state into config/the-pilot without data loss,
+        and leaves unknown user files in config/autopilot untouched.
+        """
+        legacy_dir = self.seed_legacy_install(self.gemini)
+
+        before = json.loads(run_setup(self.root, self.gemini, "status").stdout)
+        self.assertTrue(
+            any("旧版 config/autopilot" in item for item in before["drift"]),
+            before["drift"],
+        )
+
+        apply_profile(self.root, self.gemini, "--upgrade")
+
+        profile = read_json(self.gemini / PROFILE_REL)
+        self.assertEqual(profile["schema"], "the-pilot-profile/v1")
+        self.assertNotIn("autopilot", profile)
+        self.assertEqual(profile["pilot"]["mode"], "confirm")
+        self.assertEqual(profile["pilot"]["max_consecutive_auto_turns"], 5)
+        self.assertTrue((self.gemini / ENGINE_REL).is_file())
+        self.assertFalse((legacy_dir / "autopilot.py").exists())
+
+        hooks = read_json(self.gemini / HOOKS_REL)
+        self.assertIn("the-pilot", hooks)
+        self.assertNotIn("orca-agy-autopilot", hooks)
+        self.assertIn("orca-status", hooks)
+
+        gemini_text = (self.gemini / GEMINI_REL).read_text(encoding="utf-8")
+        self.assertIn("保留这一段。", gemini_text)
+        self.assertEqual(gemini_text.count(profile_compiler.GEMINI_BEGIN), 1)
+        self.assertNotIn(profile_compiler.LEGACY_GEMINI_BEGIN, gemini_text)
+        self.assertNotIn(profile_compiler.LEGACY_SCENES_BEGIN, gemini_text)
+
+        state_dir = self.gemini / "config/the-pilot/state"
+        self.assertIn("legacy_log", (state_dir / "pilot.log").read_text(encoding="utf-8"))
+        self.assertEqual(
+            read_json(state_dir / "session-abc.json")["conversation_id"], "legacy"
+        )
+        self.assertFalse((legacy_dir / "state").exists())
+        self.assertFalse((legacy_dir / "scenes" / "05-custom.md").exists())
+        self.assertTrue((self.gemini / SCENES_REL / "05-custom.md").is_file())
+        self.assertFalse(legacy_dir.exists())
+
+        report = json.loads(run_setup(self.root, self.gemini, "status").stdout)
+        self.assertEqual(report["drift"], [])
+
+        other = self.root / "gemini-unmanaged"
+        unmanaged_dir = self.seed_legacy_install(other, unmanaged=True)
+        apply_profile(self.root, other, "--upgrade")
+        self.assertEqual((unmanaged_dir / "notes.txt").read_text(encoding="utf-8"), "keep")
+        self.assertFalse((unmanaged_dir / "profile.json").exists())
+        self.assertFalse((unmanaged_dir / "autopilot.py").exists())
+        self.assertEqual(
+            json.loads(run_setup(self.root, other, "status").stdout)["drift"], []
+        )
+
+    def test_upgrade_mode_override_merges_into_legacy_profile(self) -> None:
+        """Failure means apply --upgrade forks a second mode owner or drops the turn cap.
+
+        resident-fact: settlement: overrides merge into a pre-rename profile
+        after its autopilot section is normalized, so one canonical pilot
+        section carries the new mode and the legacy max_consecutive_auto_turns.
+        """
+        self.seed_legacy_install(self.gemini)
+        apply_profile(self.root, self.gemini, "--upgrade", "--mode", "gate")
+        profile = read_json(self.gemini / PROFILE_REL)
+        self.assertEqual(profile["schema"], "the-pilot-profile/v1")
+        self.assertNotIn("autopilot", profile)
+        self.assertEqual(profile["pilot"]["mode"], "gate")
+        self.assertEqual(profile["pilot"]["max_consecutive_auto_turns"], 5)
+
+    def test_status_requires_canonical_profile_despite_legacy_tree(self) -> None:
+        """Failure means status claims an install the runtime cannot read.
+
+        resident-fact: inspection: status reports installed=false plus the
+        legacy-tree drift when config/the-pilot/runtime.py exists alongside a
+        legacy profile, while the runtime reads only config/the-pilot.
+        """
+        legacy_dir = self.seed_legacy_install(self.gemini)
+        engine = self.gemini / ENGINE_REL
+        engine.parent.mkdir(parents=True, exist_ok=True)
+        engine.write_text("# canonical engine\n", encoding="utf-8")
+
+        report = json.loads(run_setup(self.root, self.gemini, "status").stdout)
+
+        self.assertFalse(report["installed"])
+        self.assertTrue((legacy_dir / "profile.json").is_file())
+        self.assertTrue(
+            any("旧版 config/autopilot" in item for item in report["drift"]),
+            report["drift"],
+        )
+        self.assertIn("profile.json 缺失", report["drift"])
 
     def test_uninstall_removes_only_managed_files(self) -> None:
         self.seed_user_files()
@@ -826,7 +1015,7 @@ class SetupTest(unittest.TestCase):
         )
         hooks = read_json(self.gemini / HOOKS_REL)
         self.assertIn("orca-status", hooks)
-        self.assertNotIn("orca-agy-autopilot", hooks)
+        self.assertNotIn("the-pilot", hooks)
 
         again = run_setup(self.root, self.gemini, "uninstall")
         self.assertEqual(again.returncode, 0)
@@ -850,7 +1039,7 @@ class SetupTest(unittest.TestCase):
             self.gemini,
             "apply",
             "--profile",
-            '{"autopilot": {"mode": "bogus"}}',
+            '{"pilot": {"mode": "bogus"}}',
         )
         self.assertEqual(result.returncode, 2)
         self.assertFalse((self.gemini / ENGINE_REL).exists())
@@ -1182,7 +1371,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(
             read_state(self.state, "c-cap-repeat")["consecutive_auto_turns"], 1
         )
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("stop_delivery_frozen", log)
 
     def test_corrupt_or_unreadable_state_requires_explicit_recovery(self) -> None:
@@ -1192,7 +1381,7 @@ class EngineTest(unittest.TestCase):
         self.stop("c-corrupt", suggestion("继续推进", gate="auto"))
         self.assertEqual(send_calls(self.root), [])
         self.assertEqual(path.read_text(encoding="utf-8"), "{not-json")
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("state_corrupt", log)
         self.assertIn("stop_state_corrupt", log)
 
@@ -1201,7 +1390,7 @@ class EngineTest(unittest.TestCase):
         self.stop("c-unreadable", suggestion("继续推进", gate="auto"))
         self.assertEqual(len(send_calls(self.root)), 0)
         self.assertTrue(unreadable.is_dir())
-        failed = self.injection(self.pre("c-unreadable", ",autopilot recover"))
+        failed = self.injection(self.pre("c-unreadable", ",pilot recover"))
         self.assertIn("恢复失败", failed)
         self.assertTrue(unreadable.is_dir())
         self.assertEqual(
@@ -1221,7 +1410,7 @@ class EngineTest(unittest.TestCase):
         partial_transcript = write_transcript(
             self.root,
             "partial-recovery.jsonl",
-            [{"type": "USER_INPUT", "content": ",autopilot recover"}],
+            [{"type": "USER_INPUT", "content": ",pilot recover"}],
         )
         with partial_transcript.open("a", encoding="utf-8") as handle:
             handle.write("not-json\n")
@@ -1234,14 +1423,14 @@ class EngineTest(unittest.TestCase):
             "PreInvocation",
             stdin=payload(
                 "c-partial",
-                lastUserInput=",autopilot recover",
+                lastUserInput=",pilot recover",
                 transcriptPath=str(partial_transcript),
                 workspacePaths=[str(self.workspace)],
             ),
         )
         self.assertEqual(blocked.returncode, 0, blocked.stderr)
         self.assertEqual(partial.read_text(encoding="utf-8"), "{broken")
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("state_recovery_blocked", log)
         self.assertIn("transcript_complete", log)
 
@@ -1256,7 +1445,7 @@ class EngineTest(unittest.TestCase):
         rebuild_transcript = write_transcript(
             self.root,
             "rebuild-failure.jsonl",
-            [{"type": "USER_INPUT", "content": ",autopilot recover"}],
+            [{"type": "USER_INPUT", "content": ",pilot recover"}],
         )
         with lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -1279,7 +1468,7 @@ class EngineTest(unittest.TestCase):
         stdout, stderr = process.communicate(
             payload(
                 rebuild_id,
-                lastUserInput=",autopilot recover",
+                lastUserInput=",pilot recover",
                 transcriptPath=str(rebuild_transcript),
                 workspacePaths=[str(self.workspace)],
             ),
@@ -1297,12 +1486,12 @@ class EngineTest(unittest.TestCase):
         )
         self.assertNotIn(
             '"event": "state_recovered", "cid": "c-rebuild-fail"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+            (self.state / "pilot.log").read_text(encoding="utf-8"),
         )
         self.stop(rebuild_id, suggestion("继续推进", gate="auto"))
         self.assertEqual(len(send_calls(self.root)), 0)
 
-        message = self.injection(self.pre("c-corrupt", ",autopilot recover"))
+        message = self.injection(self.pre("c-corrupt", ",pilot recover"))
         self.assertIn("已恢复", message)
         state = read_json(path)
         self.assertEqual(state["conversation_id"], "c-corrupt")
@@ -1402,13 +1591,14 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(json.loads(status.stdout)["worker_agents"], expected)
         mode = run_engine(self.root, self.gemini, self.state, "mode", "confirm")
         self.assertEqual(mode.returncode, 0, mode.stderr)
-        self.assertEqual(read_json(self.gemini / PROFILE_REL)["autopilot"]["mode"], "confirm")
+        self.assertEqual(mode.stdout.strip(), "Pilot mode: confirm")
+        self.assertEqual(read_json(self.gemini / PROFILE_REL)["pilot"]["mode"], "confirm")
 
     def test_worker_chat_switch_and_reserved_aliases(self) -> None:
         for target in ("codex", "claude"):
             message = self.injection(self.pre("worker-chat", f",worker {target}"))
             self.assertIn(f"--agent {target}", message)
-            self.assertIn("<!-- autopilot: scene=NONE -->", message)
+            self.assertIn("<!-- pilot: scene=NONE -->", message)
             self.assertEqual(json.loads(run_setup(self.root, self.gemini, "status").stdout)["drift"], [])
         self.assertIn("Claude Code > Codex", self.injection(self.pre("worker-chat", ",worker")))
         self.assertIn("Claude Code > Codex", self.injection(self.pre("worker-chat", ",agent status")))
@@ -1476,13 +1666,13 @@ class EngineTest(unittest.TestCase):
         profile_before = (gemini / PROFILE_REL).read_bytes()
         guidance_before = (gemini / GEMINI_REL).read_bytes()
         paths[1].write_bytes(b"\xff")
-        failed = run_engine(self.root, gemini, self.state, "worker", "claude", extra_env={"ORCA_AUTOPILOT_GEMINI_DIR": None})
+        failed = run_engine(self.root, gemini, self.state, "worker", "claude", extra_env={"THE_PILOT_GEMINI_DIR": None})
         self.assertEqual(failed.returncode, 2, failed.stderr)
         self.assertEqual((gemini / PROFILE_REL).read_bytes(), profile_before)
         self.assertEqual((gemini / GEMINI_REL).read_bytes(), guidance_before)
         self.assertEqual(paths[0].read_text(encoding="utf-8"), original)
         paths[1].write_text(original.replace("默认优先使用 ", "默认优先 "), encoding="utf-8")
-        actual = run_engine(self.root, gemini, self.state, "worker", "codex", extra_env={"ORCA_AUTOPILOT_GEMINI_DIR": None})
+        actual = run_engine(self.root, gemini, self.state, "worker", "codex", extra_env={"THE_PILOT_GEMINI_DIR": None})
         self.assertEqual(actual.returncode, 0, actual.stderr)
         for path in paths:
             text = path.read_text(encoding="utf-8")
@@ -1493,7 +1683,7 @@ class EngineTest(unittest.TestCase):
             self.assertIn("保留其他用户规则", text)
 
     def test_worker_reload_reaches_open_and_unversioned_sessions_once(self) -> None:
-        self.stop("worker-open", "<!-- autopilot: scene=NONE -->")
+        self.stop("worker-open", "<!-- pilot: scene=NONE -->")
         legacy = self.state / ("session-" + hashlib.sha256(b"worker-old").hexdigest()[:24] + ".json")
         write_json(legacy, {"last_scene": "kept"})
         corrupt = self.state / "broken.json"
@@ -1518,7 +1708,7 @@ class EngineTest(unittest.TestCase):
         write_json(path, {"last_scene": "kept"})
         result = run_engine(self.root, self.gemini, self.state, "worker", "codex")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.stop(session, "<!-- autopilot: scene=NONE -->")
+        self.stop(session, "<!-- pilot: scene=NONE -->")
         self.assertNotIn("loaded_worker_agents", read_json(path))
         self.assertIn("<orca_worker_agent_hot_reload>", self.injection(self.pre(session, "继续")))
         self.assertEqual(json.loads(self.pre(session, "普通输入").stdout), {})
@@ -1560,7 +1750,7 @@ class EngineTest(unittest.TestCase):
         message = self.injection(self.pre("c-mode", ",mode confirm"))
         self.assertIn("confirm", message)
         self.assertEqual(
-            read_json(self.gemini / PROFILE_REL)["autopilot"]["mode"], "confirm"
+            read_json(self.gemini / PROFILE_REL)["pilot"]["mode"], "confirm"
         )
         self.stop("c-mode", suggestion("继续推进", gate="auto"))
         sends = send_calls(self.root)
@@ -1568,10 +1758,30 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("--enter", sends[0])
         self.assertIn("confirm", self.injection(self.pre("c-mode", ",mode status")))
 
+    def test_mode_write_normalizes_a_legacy_profile(self) -> None:
+        """Failure means a runtime write leaves a second section or legacy schema.
+
+        resident-fact: runtime: the mode writer rewrites a pre-rename profile
+        as one canonical pilot section and the-pilot-profile/v1 schema.
+        """
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        profile["schema"] = "orca-autopilot-profile/v1"
+        profile["autopilot"] = profile.pop("pilot")
+        write_json(profile_path, profile)
+
+        message = self.injection(self.pre("c-legacy", ",mode confirm"))
+
+        self.assertIn("confirm", message)
+        updated = read_json(profile_path)
+        self.assertEqual(updated["schema"], "the-pilot-profile/v1")
+        self.assertNotIn("autopilot", updated)
+        self.assertEqual(updated["pilot"]["mode"], "confirm")
+
     def test_scene_none_and_pending_ask_question_clear_without_sending(self) -> None:
         self.stop(
             "c-none",
-            "已完成。\n<!-- autopilot: scene=NONE -->",
+            "已完成。\n<!-- pilot: scene=NONE -->",
         )
         self.assertEqual(send_calls(self.root), [])
         self.assertEqual(read_state(self.state, "c-none")["candidates"], [])
@@ -1629,7 +1839,7 @@ class EngineTest(unittest.TestCase):
             gemini_md.read_text(encoding="utf-8") + "\n用户规则。\n", encoding="utf-8"
         )
         before_sync = gemini_md.read_text(encoding="utf-8")
-        lock_path = self.gemini / "config" / "autopilot" / ".autopilot.lock"
+        lock_path = self.gemini / "config" / "the-pilot" / ".pilot.lock"
         with lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             process = subprocess.Popen(
@@ -1657,7 +1867,7 @@ class EngineTest(unittest.TestCase):
         # The installed engine is gone after uninstall; any still-running copy
         # (here the skill asset) must refuse rather than rewrite the block.
         sync = subprocess.run(
-            [sys.executable, str(SCRIPTS_DIR / "assets" / "autopilot.py"), "sync"],
+            [sys.executable, str(SCRIPTS_DIR / "assets" / "runtime.py"), "sync"],
             capture_output=True,
             text=True,
             env=engine_env(self.root, self.gemini, self.state),
@@ -1709,20 +1919,20 @@ class EngineTest(unittest.TestCase):
         state = read_state(self.state, "c-fail")
         self.assertEqual(state["consecutive_auto_turns"], 0)
         self.assertEqual(state["auto_submitted_text"], "")
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("auto_submit_rejected", log)
 
     def test_invalid_or_duplicate_tag_never_auto_submits(self) -> None:
         self.stop(
             "c-tag-missing",
             "方案已就绪。\n\n💡 下一步建议：继续推进\n"
-            "<!-- autopilot: scene=plan-and-orchestrate -->",
+            "<!-- pilot: scene=plan-and-orchestrate -->",
         )
         self.stop(
             "c-tag-duplicate",
             "方案已就绪。\n\n💡 下一步建议：继续推进\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=auto -->\n"
-            "<!-- autopilot: scene=plan-and-orchestrate gate=auto -->",
+            "<!-- pilot: scene=plan-and-orchestrate gate=auto -->\n"
+            "<!-- pilot: scene=plan-and-orchestrate gate=auto -->",
         )
         self.stop("c-tag-bad-gate", suggestion("继续推进", gate="maybe"))
         self.assertEqual(send_calls(self.root), [])
@@ -1746,7 +1956,7 @@ class EngineTest(unittest.TestCase):
         state = read_state(self.state, session)
         continued_turn = state["continued_unasked_turn_id"]
         self.assertTrue(continued_turn)
-        log_path = self.state / "autopilot.log"
+        log_path = self.state / "pilot.log"
         continue_event = (
             f'"event": "stop_continue_unasked_question", "cid": "{session}"'
         )
@@ -1858,7 +2068,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(plain["decision"], "allow")
         self.assertIn(
             '"event": "stop_invalid_tag", "cid": "c-plain-prose", "reason": "missing_tag"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+            (self.state / "pilot.log").read_text(encoding="utf-8"),
         )
 
         tagged = self.stop_decision(
@@ -1879,7 +2089,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(text_argument(sends[0]), "继续推进实施")
         self.assertNotIn(
             '"event": "stop_continue_unasked_question"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+            (self.state / "pilot.log").read_text(encoding="utf-8"),
         )
 
         # An unclosed fenced block ending in `:` is code, not a lead-in.
@@ -1899,7 +2109,7 @@ class EngineTest(unittest.TestCase):
         )
         self.assertIn(
             '"event": "stop_invalid_tag", "cid": "c-unclosed-fence", "reason": "missing_tag"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+            (self.state / "pilot.log").read_text(encoding="utf-8"),
         )
 
     def test_unasked_question_guard_fails_closed_when_state_cannot_persist(self) -> None:
@@ -1927,7 +2137,7 @@ class EngineTest(unittest.TestCase):
         )
         self.assertIn(
             f'"event": "stop_continue_state_failed", "cid": "{session}"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+            (self.state / "pilot.log").read_text(encoding="utf-8"),
         )
 
     def test_unasked_question_guard_fails_closed_without_complete_content(self) -> None:
@@ -1973,7 +2183,7 @@ class EngineTest(unittest.TestCase):
                 },
             ),
         )
-        log_path = self.state / "autopilot.log"
+        log_path = self.state / "pilot.log"
         for label, fields in cases:
             with self.subTest(case=label):
                 session = f"c-truncated-{label}"
@@ -1996,7 +2206,7 @@ class EngineTest(unittest.TestCase):
 
     def test_unasked_question_guard_is_silent_for_dispatched_workers(self) -> None:
         # Failure means a worker turn ending on a colon is force-continued or
-        # writes session state even though workers never run autopilot.
+        # writes session state even though workers never run the pilot.
         steps = [
             {
                 "type": "USER_INPUT",
@@ -2014,7 +2224,7 @@ class EngineTest(unittest.TestCase):
                 )
                 self.assertEqual(decision["decision"], "allow")
                 self.assertFalse(state_path(self.state, conversation_id).exists())
-        log_path = self.state / "autopilot.log"
+        log_path = self.state / "pilot.log"
         if log_path.is_file():
             self.assertNotIn(
                 "stop_continue_unasked_question",
@@ -2022,7 +2232,7 @@ class EngineTest(unittest.TestCase):
             )
 
     def test_unasked_question_guard_respects_mode_off(self) -> None:
-        # Failure means switching autopilot off still force-continues a turn.
+        # Failure means switching the pilot off still force-continues a turn.
         self.pre("c-mode-off-lead", ",mode off")
         result = self.stop(
             "c-mode-off-lead",
@@ -2036,15 +2246,15 @@ class EngineTest(unittest.TestCase):
         )
         self.assertNotIn(
             '"event": "stop_continue_unasked_question", "cid": "c-mode-off-lead"',
-            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+            (self.state / "pilot.log").read_text(encoding="utf-8"),
         )
 
     def test_trailing_tag_ignores_markdown_and_earlier_tag_examples(self) -> None:
         # Failure means human formatting or documentation can override execution.
         prompt = "检查 `src/**/*.py`，保留 2**3 与内联 `code`"
         examples = (
-            "正文提及 `<!-- autopilot: scene=NONE -->`。\n",
-            "```html\n<!-- autopilot: scene=NONE -->\n```\n",
+            "正文提及 `<!-- pilot: scene=NONE -->`。\n",
+            "```html\n<!-- pilot: scene=NONE -->\n```\n",
             "**下一步建议：**\n- **,1**：忽略这段展示文本\n- **,2**：展示备选\n",
         )
         for index, prose in enumerate(examples):
@@ -2058,6 +2268,29 @@ class EngineTest(unittest.TestCase):
             self.assertEqual([(item["index"], item["prompt"]) for item in state["candidates"]],
                              [(1, prompt), (2, "暂停确认")])
             self.assertIn("暂停确认", self.injection(self.pre(session, ",2")))
+
+    def test_runtime_accepts_legacy_tags_and_recovery_command(self) -> None:
+        """Failure means a session opened before the rename stalls on its old prompt.
+
+        resident-fact: admission: during the one-way rename, the installed
+        runtime still accepts pre-migration ``autopilot`` suggestion tags and
+        the ``,autopilot recover`` command.
+        """
+        legacy = suggestion("继续推进实施").replace("<!-- pilot:", "<!-- autopilot:")
+        self.stop("c-legacy-tag", legacy)
+        sends = send_calls(self.root)
+        self.assertEqual(len(sends), 1)
+        self.assertIn("--enter", sends[0])
+        self.assertEqual(text_argument(sends[0]), "继续推进实施")
+
+        self.state.mkdir(parents=True, exist_ok=True)
+        for index, command in enumerate((",pilot recover", ",autopilot recover")):
+            conversation = f"c-recover-{index}"
+            path = state_path(self.state, conversation)
+            path.write_text("{broken", encoding="utf-8")
+            message = self.injection(self.pre(conversation, command))
+            self.assertIn("已恢复", message)
+            self.assertEqual(read_json(path)["conversation_id"], conversation)
 
     def test_structured_json_tag_selects_candidates(self) -> None:
         tag = json.dumps(
@@ -2074,7 +2307,7 @@ class EngineTest(unittest.TestCase):
             "方案已就绪。\n\n"
             "- **,1（主推）**：继续推进实施\n"
             "- **,2（备选）**：先暂停确认\n"
-            f"<!-- autopilot: {tag} -->",
+            f"<!-- pilot: {tag} -->",
         )
         sends = send_calls(self.root)
         self.assertEqual(len(sends), 1)
@@ -2091,7 +2324,7 @@ class EngineTest(unittest.TestCase):
         # Legacy key=value candidate tags are rejected; only JSON tags execute candidates.
         self.stop(
             "c-legacy-kv-rejected",
-            "<!-- autopilot: scene=architecture-re-review, gate=auto, 1='继续推进实施：先补边界测试' -->",
+            "<!-- pilot: scene=architecture-re-review, gate=auto, 1='继续推进实施：先补边界测试' -->",
         )
         self.assertEqual(send_calls(self.root), [])
         self.assertEqual(read_state(self.state, "c-legacy-kv-rejected")["candidates"], [])
@@ -2109,7 +2342,7 @@ class EngineTest(unittest.TestCase):
             "复审完成。\n\n"
             "💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；"
             "输 ,2 切备选）**：继续推进实施：先补边界测试\n"
-            f"<!-- autopilot: {tag} -->",
+            f"<!-- pilot: {tag} -->",
         )
         sends = send_calls(self.root)
         self.assertEqual(len(sends), 1)
@@ -2126,7 +2359,7 @@ class EngineTest(unittest.TestCase):
     def test_tag_candidates_are_authoritative_and_aliases_fail_closed(self) -> None:
         # Failure means a conflicting alias or malformed payload becomes executable.
         valid = {"scene": "plan-and-orchestrate", "gate": "pause", "1": "推进", "2": "推进", "3": "暂停"}
-        self.stop("c-tag-only", "<!-- autopilot: " + json.dumps(valid) + " -->")
+        self.stop("c-tag-only", "<!-- pilot: " + json.dumps(valid) + " -->")
         self.assertEqual(text_argument(send_calls(self.root)[0]), "推进")
         self.assertEqual([(item["index"], item["prompt"]) for item in read_state(self.state, "c-tag-only")["candidates"]],
                          [(1, "推进"), (3, "暂停")])
@@ -2142,9 +2375,9 @@ class EngineTest(unittest.TestCase):
         ]
         for index, (fields, reason) in enumerate(cases):
             session = f"c-invalid-fields-{index}"
-            self.stop(session, "<!-- autopilot: " + json.dumps(fields) + " -->")
+            self.stop(session, "<!-- pilot: " + json.dumps(fields) + " -->")
             self.assertEqual(len(send_calls(self.root)), 1)
-            log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+            log = (self.state / "pilot.log").read_text(encoding="utf-8")
             self.assertIn(f'"cid": "{session}", "reason": "{reason}"', log)
         for index, (body, reason) in enumerate((
             ('{"scene":"NONE","SCENE":"NONE"}', "duplicate_field"),
@@ -2153,13 +2386,13 @@ class EngineTest(unittest.TestCase):
             ('scene=plan-and-orchestrate gate=pause 1="推进"', "invalid_json"),
         )):
             session = f"c-malformed-{index}"
-            self.stop(session, "<!-- autopilot: " + body + " -->")
+            self.stop(session, "<!-- pilot: " + body + " -->")
             self.assertEqual(len(send_calls(self.root)), 1)
             self.assertEqual(read_state(self.state, session)["candidates"], [])
-            log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+            log = (self.state / "pilot.log").read_text(encoding="utf-8")
             self.assertIn(f'"cid": "{session}", "reason": "{reason}"', log)
         for index, body in enumerate(('{"scene":"NONE"}', 'scene=NONE')):
-            self.stop(f"c-none-{index}", "<!-- autopilot: " + body + " -->")
+            self.stop(f"c-none-{index}", "<!-- pilot: " + body + " -->")
             self.assertEqual(len(send_calls(self.root)), 1)
 
     def test_prompt_literals_survive_parsing(self) -> None:
@@ -2169,7 +2402,7 @@ class EngineTest(unittest.TestCase):
             "`继续推进`",
             "第一行\n第二行：\"原样\"",
             "Search for <!--secret--> and keep --> literal",
-            '排查 <!-- autopilot: {"scene": "NONE"} --> 标签解析',
+            '排查 <!-- pilot: {"scene": "NONE"} --> 标签解析',
         )
         for index, prompt in enumerate(prompts):
             self.stop(f"c-literal-{index}", suggestion(prompt, alt="备选 <!--alt--> -->", gate="pause") + " \n")
@@ -2182,7 +2415,7 @@ class EngineTest(unittest.TestCase):
                 [(1, prompt), (2, "备选 <!--alt--> -->")],
             )
         self.stop("c-not-trailing", suggestion("不执行") + "\n这是后续正文")
-        self.stop("c-no-tag-prompt", "主推：不执行\n<!-- autopilot: scene=plan-and-orchestrate gate=pause -->")
+        self.stop("c-no-tag-prompt", "主推：不执行\n<!-- pilot: scene=plan-and-orchestrate gate=pause -->")
         self.assertEqual(len(send_calls(self.root)), len(prompts))
 
     def test_earlier_ask_question_blocks_later_suggestion(self) -> None:
@@ -2283,7 +2516,7 @@ class EngineTest(unittest.TestCase):
                         [item["index"] for item in state["candidates"]], [1, 2]
                     )
                     self.assertEqual(state["gate_action"], gate)
-                    log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+                    log = (self.state / "pilot.log").read_text(encoding="utf-8")
                     self.assertNotIn(
                         f'"event": "stop_waiting_ask_question", "cid": "{session}"',
                         log,
@@ -2328,7 +2561,7 @@ class EngineTest(unittest.TestCase):
                     gate="auto",
                 )
                 self.assertEqual(send_calls(self.root), [])
-                log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+                log = (self.state / "pilot.log").read_text(encoding="utf-8")
                 self.assertIn(
                     f'"event": "stop_waiting_ask_question", "cid": "{session}", '
                     '"reason": "invalid_answer_receipt"',
@@ -2391,7 +2624,7 @@ class EngineTest(unittest.TestCase):
                     )
                     self.assertEqual(len(send_calls(self.root)), before)
                     self.assertEqual(read_state(self.state, session)["candidates"], [])
-                    log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+                    log = (self.state / "pilot.log").read_text(encoding="utf-8")
                     self.assertIn(f'"event": "{event}"', log)
                     self.assertIn(
                         f'"event": "stop_waiting_ask_question", "cid": "{session}", '
@@ -2573,7 +2806,7 @@ class EngineTest(unittest.TestCase):
                 self.stop(session, "", steps=steps)
                 self.assertEqual(len(send_calls(self.root)), before)
                 self.assertEqual(read_state(self.state, session)["candidates"], [])
-                log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+                log = (self.state / "pilot.log").read_text(encoding="utf-8")
                 self.assertIn(
                     f'"event": "stop_waiting_ask_question", "cid": "{session}", '
                     f'"reason": "{reason}"',
@@ -2587,7 +2820,7 @@ class EngineTest(unittest.TestCase):
             "c-single-tag",
             "方案已就绪。\n\n"
             "💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送）**：按方案 A 推进\n"
-            '<!-- autopilot: {"scene": "plan-and-orchestrate", "gate": "pause", '
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "pause", '
             '"1": "按方案 A 推进"} -->',
         )
         sends = send_calls(self.root)
@@ -2630,7 +2863,7 @@ class EngineTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("stop_transcript_incomplete", log)
 
     def test_ambiguous_or_mismatched_terminal_never_writes(self) -> None:
@@ -2675,7 +2908,7 @@ class EngineTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("terminal_workspace_missing", log)
 
     def test_duplicate_stop_for_same_turn_submits_once(self) -> None:
@@ -2706,7 +2939,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(len(send_calls(self.root)), 1)
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("stop_delivery_frozen", log)
 
     def test_unknown_delivery_freezes_until_manual_input(self) -> None:
@@ -2734,7 +2967,7 @@ class EngineTest(unittest.TestCase):
         text = (
             "方案已就绪。\n\n💡 下一步建议：主推方案\n"
             "↳ 备选 ,3：第三方案\n"
-            '<!-- autopilot: {"scene":"plan-and-orchestrate","gate":"pause","1":"主推方案","3":"第三方案"} -->'
+            '<!-- pilot: {"scene":"plan-and-orchestrate","gate":"pause","1":"主推方案","3":"第三方案"} -->'
         )
         self.pre("c-cand-missing", "开始")
         self.stop("c-cand-missing", text)
@@ -2828,7 +3061,7 @@ class EngineTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(send_calls(self.root), [])
-        log = (self.state / "autopilot.log").read_text(encoding="utf-8")
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("stop_stale_turn", log)
 
     def test_stop_requires_explicit_idle_evidence(self) -> None:
@@ -2906,7 +3139,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(mode_process.returncode, 0, mode_stderr or mode_stdout)
         self.assertEqual(set_process.returncode, 0, set_stderr or set_stdout)
         profile = read_json(self.gemini / PROFILE_REL)
-        self.assertEqual(profile["autopilot"]["mode"], "confirm")
+        self.assertEqual(profile["pilot"]["mode"], "confirm")
         self.assertEqual(
             profile["shortcuts"]["template_overrides"]["r"], "并发模板 {arg}"
         )
@@ -2955,6 +3188,326 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(
             profile["shortcuts"]["template_overrides"]["r"], "升级并发模板 {arg}"
         )
+
+    def test_corrupt_profile_fails_closed_across_commands_and_hooks(self) -> None:
+        """Verify that corrupt profile.json fails closed with exit code 2 and diagnostics across CLI commands and hooks.
+
+        If this test fails, a corrupt profile may be treated as empty
+        preferences or a hook may act without surfacing the failure.
+        resident-fact: fail-closed: a corrupt profile.json makes status, mode,
+        worker, sync and both hooks exit 2 with diagnostics, while the
+        session's loaded worker list stays intact and nothing is sent.
+        """
+        self.pre("c-corrupt-profile", "初始化会话")
+        loaded = read_state(self.state, "c-corrupt-profile")["loaded_worker_agents"]
+        profile_path = self.gemini / PROFILE_REL
+        profile_path.write_bytes(b"{broken")
+        gemini_md = self.gemini / GEMINI_REL
+        gemini_before = gemini_md.read_bytes()
+
+        status = run_engine(self.root, self.gemini, self.state, "status", "--json")
+        self.assertEqual(status.returncode, 2, status.stderr)
+        report = json.loads(status.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("profile.json" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+        mode = run_engine(self.root, self.gemini, self.state, "mode", "status")
+        self.assertEqual(mode.returncode, 2)
+        self.assertIn("profile.json 损坏", mode.stderr)
+
+        worker = run_engine(
+            self.root, self.gemini, self.state, "worker", "status", "--json"
+        )
+        self.assertEqual(worker.returncode, 2)
+        worker_report = json.loads(worker.stdout)
+        self.assertFalse(worker_report["ok"])
+        self.assertEqual(worker_report["worker_agents"], [])
+        self.assertIn("profile.json", worker_report["error"])
+
+        sync = run_engine(self.root, self.gemini, self.state, "sync")
+        self.assertEqual(sync.returncode, 2)
+        self.assertIn("profile.json 损坏", sync.stderr)
+        self.assertEqual(gemini_md.read_bytes(), gemini_before)
+
+        pre = self.pre("c-corrupt-profile", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_corrupt")
+
+        stop = self.stop("c-corrupt-profile", suggestion("继续推进", gate="auto"))
+        self.assertEqual(stop.returncode, 2)
+        self.assertEqual(stop.stdout, "")
+        self.assertEqual(json.loads(stop.stderr)["error"], "config_corrupt")
+
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(
+            read_state(self.state, "c-corrupt-profile")["loaded_worker_agents"],
+            loaded,
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("pre_invocation_config_corrupt", log)
+        self.assertIn("stop_config_corrupt", log)
+
+    def test_corrupt_config_fails_closed_in_status_set_and_pre_invocation(self) -> None:
+        """Verify that corrupt config.json fails closed with exit code 2 and diagnostics in status, set and PreInvocation.
+
+        If this test fails, a corrupt config may be treated as default
+        shortcuts or a failed write may proceed against unreadable data.
+        resident-fact: fail-closed: a corrupt config.json makes status, set and
+        PreInvocation exit 2 with diagnostics, leaves the installed config
+        untouched, and preserves the session's loaded worker list.
+        """
+        self.pre("c-corrupt-config", "初始化会话")
+        loaded = read_state(self.state, "c-corrupt-config")["loaded_worker_agents"]
+        config_path = self.gemini / CONFIG_REL
+        config_path.write_bytes(b"{broken")
+
+        status = run_engine(self.root, self.gemini, self.state, "status", "--json")
+        self.assertEqual(status.returncode, 2, status.stderr)
+        report = json.loads(status.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("config.json" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+        set_result = run_engine(
+            self.root, self.gemini, self.state, "set", "r", "新模板 {arg}"
+        )
+        self.assertEqual(set_result.returncode, 2)
+        self.assertIn("config.json 损坏", set_result.stderr)
+        self.assertEqual(config_path.read_bytes(), b"{broken")
+
+        pre = self.pre("c-corrupt-config", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_corrupt")
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(
+            read_state(self.state, "c-corrupt-config")["loaded_worker_agents"],
+            loaded,
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("pre_invocation_config_corrupt", log)
+
+    def test_missing_profile_and_config_are_distinct_from_empty_object_and_fail_closed(self) -> None:
+        """Verify that absent profile/config files are reported as missing, not as empty configuration.
+
+        If this test fails, status, mode, worker or the hooks may silently treat
+        absent installed configuration as valid empty defaults.
+        resident-fact: fail-closed: an on-disk {} profile is valid ("ok"), while
+        a missing profile or config reports "missing", exits 2 with null mode,
+        and refuses hooks with config_missing and zero terminal sends.
+        """
+        profile_path = self.gemini / PROFILE_REL
+        config_path = self.gemini / CONFIG_REL
+        valid_profile = profile_path.read_bytes()
+        write_json(profile_path, {})
+
+        empty_profile = run_engine(
+            self.root, self.gemini, self.state, "status", "--json"
+        )
+        self.assertEqual(empty_profile.returncode, 0, empty_profile.stderr)
+        empty_report = json.loads(empty_profile.stdout)
+        self.assertEqual(empty_report["profile_status"], "ok")
+        self.assertTrue(empty_report["ok"])
+
+        profile_path.unlink()
+        missing_profile = run_engine(
+            self.root, self.gemini, self.state, "status", "--json"
+        )
+        self.assertEqual(missing_profile.returncode, 2)
+        report = json.loads(missing_profile.stdout)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["installed"])
+        self.assertEqual(report["profile_status"], "missing")
+        self.assertIsNone(report["mode"])
+        self.assertEqual(report["worker_agents"], [])
+        self.assertIsNone(report["max_consecutive_auto_turns"])
+
+        mode = run_engine(self.root, self.gemini, self.state, "mode", "status")
+        self.assertEqual(mode.returncode, 2)
+        self.assertIn("未安装（缺少 profile.json）", mode.stderr)
+
+        worker = run_engine(
+            self.root, self.gemini, self.state, "worker", "status", "--json"
+        )
+        self.assertEqual(worker.returncode, 2)
+        worker_report = json.loads(worker.stdout)
+        self.assertFalse(worker_report["ok"])
+        self.assertEqual(worker_report["status"], "missing")
+
+        pre = self.pre("c-missing-profile", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_missing")
+        self.assertFalse(state_path(self.state, "c-missing-profile").exists())
+
+        stop = self.stop("c-missing-profile", suggestion("继续推进", gate="auto"))
+        self.assertEqual(stop.returncode, 2)
+        self.assertEqual(stop.stdout, "")
+        self.assertEqual(json.loads(stop.stderr)["error"], "config_missing")
+        self.assertEqual(send_calls(self.root), [])
+
+        profile_path.write_bytes(valid_profile)
+        config_path.unlink()
+        missing_config = run_engine(
+            self.root, self.gemini, self.state, "status", "--json"
+        )
+        self.assertEqual(missing_config.returncode, 2)
+        config_report = json.loads(missing_config.stdout)
+        self.assertFalse(config_report["installed"])
+        self.assertEqual(config_report["config_status"], "missing")
+        self.assertEqual(config_report["entry_shortcuts"], [])
+        self.assertEqual(config_report["comma_commands"], [])
+
+        pre = self.pre("c-missing-config", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_missing")
+        self.assertEqual(send_calls(self.root), [])
+
+    def test_corrupt_session_recovery_requires_valid_installed_configuration(self) -> None:
+        """Verify that ,pilot recover refuses a corrupt session while the installed profile is corrupt.
+
+        If this test fails, recovery may certify automatic delivery against an
+        unreadable profile or overwrite and back up a corrupt session file anyway.
+        resident-fact: fail-closed: config corruption is reported before session
+        recovery, leaves the corrupt session untouched, and recovery succeeds
+        once the profile is valid again.
+        """
+        conversation_id = "c-recover-corrupt"
+        session = state_path(self.state, conversation_id)
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_bytes(b"{broken")
+        profile_path = self.gemini / PROFILE_REL
+        valid_profile = profile_path.read_bytes()
+        profile_path.write_bytes(b"{broken")
+
+        refused = self.pre(conversation_id, ",pilot recover")
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused.stdout, "")
+        self.assertEqual(json.loads(refused.stderr)["error"], "config_corrupt")
+        self.assertEqual(session.read_bytes(), b"{broken")
+        self.assertEqual(
+            list(session.parent.glob(session.name + ".corrupt-*")), []
+        )
+
+        profile_path.write_bytes(valid_profile)
+        recovered = self.pre(conversation_id, ",pilot recover")
+        self.assertIn("状态已恢复", self.injection(recovered))
+        self.assertNotEqual(session.read_bytes(), b"{broken")
+
+    def test_unreadable_scene_fails_closed_across_commands_and_hooks(self) -> None:
+        """Verify that an unreadable scene file fails closed with exit code 2 across CLI commands and hooks.
+
+        If this test fails, routing may proceed with an incomplete scene set or
+        an unreadable scene may be silently omitted from status and sync.
+        resident-fact: fail-closed: an unreadable scene file makes status, sync,
+        PreInvocation (including `,mode status`) and Stop exit 2, and Stop
+        refuses to deliver against an incomplete scene set.
+        """
+        self.pre("c-scene-corrupt", "初始化会话")
+        (self.gemini / SCENES_REL / "99-broken.md").mkdir()
+        gemini_md = self.gemini / GEMINI_REL
+        gemini_before = gemini_md.read_bytes()
+
+        status = run_engine(self.root, self.gemini, self.state, "status", "--json")
+        self.assertEqual(status.returncode, 2, status.stderr)
+        report = json.loads(status.stdout)
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("99-broken.md" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+        sync = run_engine(self.root, self.gemini, self.state, "sync")
+        self.assertEqual(sync.returncode, 2)
+        self.assertIn("场景文件不可读", sync.stderr)
+        self.assertEqual(gemini_md.read_bytes(), gemini_before)
+
+        pre = self.pre("c-scene-corrupt", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_corrupt")
+
+        mode = self.pre("c-scene-corrupt", ",mode status")
+        self.assertEqual(mode.returncode, 2)
+        self.assertEqual(mode.stdout, "")
+        self.assertEqual(json.loads(mode.stderr)["error"], "config_corrupt")
+
+        stop = self.stop("c-scene-corrupt", suggestion("继续推进", gate="auto"))
+        self.assertEqual(stop.returncode, 2)
+        self.assertEqual(stop.stdout, "")
+        self.assertEqual(json.loads(stop.stderr)["error"], "config_corrupt")
+        self.assertEqual(send_calls(self.root), [])
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("pre_invocation_config_corrupt", log)
+        self.assertIn("stop_config_corrupt", log)
+
+    def test_hook_rejects_invalid_payload_and_internal_errors(self) -> None:
+        """Verify that malformed hook payloads and internal failures exit 2 with structured JSON errors.
+
+        If this test fails, a broken hook input or runtime bug may exit 0 as a
+        fake allow/no-op instead of surfacing the failure.
+        resident-fact: observability: invalid hook payloads and internal
+        exceptions exit 2 with a structured JSON error instead of a fake
+        allow, and both shapes are recorded in the runtime log.
+        """
+        malformed = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "PreInvocation",
+            stdin="{not json",
+        )
+        self.assertEqual(malformed.returncode, 2)
+        self.assertEqual(malformed.stdout, "")
+        failure = json.loads(malformed.stderr)
+        self.assertFalse(failure["ok"])
+        self.assertEqual(failure["event"], "PreInvocation")
+        self.assertEqual(failure["error"], "invalid_payload")
+
+        not_object = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin="[]",
+        )
+        self.assertEqual(not_object.returncode, 2)
+        self.assertEqual(not_object.stdout, "")
+        self.assertEqual(
+            json.loads(not_object.stderr)["detail"],
+            "hook payload must be a JSON object",
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("payload_invalid", log)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stderr = io.StringIO()
+            with mock.patch.object(runtime, "STATE_DIR", root), mock.patch.object(
+                runtime, "LOG_PATH", root / "pilot.log"
+            ), mock.patch.object(
+                runtime.sys, "stdin", io.StringIO(payload("c-internal"))
+            ), mock.patch.object(
+                runtime.sys, "stderr", stderr
+            ), mock.patch.object(
+                runtime, "handle_pre_invocation", side_effect=RuntimeError("boom")
+            ):
+                code = runtime.run_hook("PreInvocation")
+            self.assertEqual(code, 2)
+            internal = json.loads(stderr.getvalue())
+            self.assertEqual(internal["error"], "internal_error")
+            self.assertIn("boom", internal["detail"])
+            self.assertIn("hook_failed", (root / "pilot.log").read_text(encoding="utf-8"))
 
     def test_status_reports_active_mode_scenes_and_hook_group(self) -> None:
         status = run_engine(self.root, self.gemini, self.state, "status", "--json")

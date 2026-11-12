@@ -1,6 +1,6 @@
 ---
 name: the-pilot
-description: Operate scene-based Turn Autopilot in Orca, inspect modes, switch worker priority, edit shortcuts, sync scenes and recover ambiguous delivery.
+description: Operate scene-based Turn Pilot in Orca, inspect modes, switch worker priority, edit shortcuts, sync scenes and recover ambiguous delivery.
 ---
 
 # Operate The Pilot
@@ -21,20 +21,22 @@ skill. Inspect `pilot --help` and subcommand help for current argument syntax.
   per-stage deliverables and exit quality bars, transition continuity, and
   whether custom scenes or guardrails add machinery without independent value.
 - `pilot log` inspects recent runtime events.
-- `,autopilot recover` explicitly recovers an ambiguous delivery only after
+- `,pilot recover` explicitly recovers an ambiguous delivery only after
   checking what the previous send actually did. Never blindly replay a send.
+  Pre-rename `,autopilot recover` remains accepted for open sessions.
 
 The model owns scene and intent decisions; the runtime owns mechanical delivery,
 question settlement, turn limits and session locking. Visible `,1` / `,2` lines
 are human display only. The single trailing structured JSON comment is the sole
 execution source, parsed with `json.loads`:
-`<!-- autopilot: {"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"} -->`.
+`<!-- pilot: {"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"} -->`.
 Omit optional alternatives when absent. For no next step, use
-`<!-- autopilot: {"scene": "NONE"} -->` (legacy `<!-- autopilot: scene=NONE -->`
-is also accepted). Earlier prose and code examples are not candidates.
+`<!-- pilot: {"scene": "NONE"} -->` (the `scene=NONE` shorthand and
+pre-rename `<!-- autopilot: ... -->` tags are also accepted). Earlier prose
+and code examples are not candidates.
 Do not invent authorization from a scene or change existing write safety gates.
 
-Runtime commands select the installation with `ORCA_AUTOPILOT_GEMINI_DIR`.
+Runtime commands select the installation with `THE_PILOT_GEMINI_DIR`.
 For tests use a temporary root. Never use real user directories as fixtures.
 Project overlays and long-term preferences are managed by `pilot apply`; use
 `pilot apply --upgrade` to recompile an installation without resetting preferences.
@@ -42,4 +44,4 @@ The Pilot does not dispatch network work or run background Dealer daemons.
 
 ## Automatic updates
 
-The runtime may start `pilot self-update` once per six hour cooldown. It preserves user profile and project preferences and records the result for `pilot status --json`. Set `ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE=1` to disable it.
+The runtime may start `pilot self-update` once per six hour cooldown. It preserves user profile and project preferences and records the result for `pilot status --json`. Set `THE_PILOT_DISABLE_AUTO_UPDATE=1` to disable it.

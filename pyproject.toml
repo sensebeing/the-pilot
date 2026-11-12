@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "the-pilot"
 version = "0.1.0"
-description = "Stop being a human relay for coding agents. Distill 7-day chat history and run a 4-stage Turn Autopilot so you focus on product and architecture."
+description = "Stop being a human relay for coding agents. Distill 7-day chat history and run a 4-stage Turn Pilot so you focus on product and architecture."
 requires-python = ">=3.11"
 license = "MIT"
 readme = "README.md"
 authors = [{name = "SenseBeing"}]
 dependencies = []
-keywords = ["ai-coding", "coding-agents", "orca", "turn-autopilot", "workflow-automation"]
+keywords = ["ai-coding", "coding-agents", "orca", "turn-pilot", "workflow-automation"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install, inspect, upgrade and remove the Orca Autopilot profile.
+"""Install, inspect, upgrade and remove The Pilot profile.
 
 The whole install is compiled in memory first, then every file is replaced
 atomically in the same directory. There is no install manifest and no pending
@@ -28,17 +28,42 @@ from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .profile import resolve_profile, validate_profile
 from .project import ProfileError, normalize_project, project_specs
-from .defaults import DEFAULT_SPECS, MODES, DELIVER_STRATEGIES
+from .defaults import (
+    DEFAULT_SPECS,
+    DELIVER_STRATEGIES,
+    ENGINE_NAME,
+    HOOK_GROUP,
+    LEGACY_AUTOPILOT_SUBDIR,
+    LEGACY_ENGINE_NAME,
+    LEGACY_HOOK_GROUP,
+    LEGACY_LOCK_NAME,
+    LOCK_NAME,
+    MODES,
+    PILOT_SUBDIR,
+)
 
 
-AUTOPILOT_SUBDIR = Path("config") / "autopilot"
 GEMINI_MD_SUBPATH = Path("config") / "GEMINI.md"
 HOOKS_SUBPATH = Path("config") / "hooks.json"
 SCENES_SUBDIR = "scenes"
-ENGINE_NAME = "autopilot.py"
+LOG_NAME = "pilot.log"
+LEGACY_LOG_NAME = "autopilot.log"
 BUILTIN_SCENE_FILES = tuple(
     spec["file"] for spec in DEFAULT_SPECS["scene_specs"].values()
 )
+LEGACY_MANAGED_FILES = (
+    LEGACY_ENGINE_NAME,
+    "profile.json",
+    "config.json",
+    "project.json",
+    LEGACY_LOCK_NAME,
+    "__pycache__",
+)
+
+
+def _env_value(primary: str, legacy: str) -> str:
+    """Read the canonical environment variable, then its legacy fallback."""
+    return os.environ.get(primary, "").strip() or os.environ.get(legacy, "").strip()
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = SCRIPTS_DIR / "assets"
@@ -84,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pilot",
-        description="Install, inspect, upgrade or remove Orca Autopilot in ~/.gemini.",
+        description="Install, inspect, upgrade or remove The Pilot in ~/.gemini.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -150,7 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gemini-dir",
-        default=os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", str(Path.home() / ".gemini")),
+        default=_env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
+        or str(Path.home() / ".gemini"),
         help="Antigravity 配置目录（默认 ~/.gemini）",
     )
     selection = parser.add_mutually_exclusive_group()
@@ -162,16 +188,16 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def probe(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
     project = discover_project(args, gemini_dir)
-    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
-    profile_path = autopilot_dir / "profile.json"
-    engine_path = autopilot_dir / ENGINE_NAME
-    scenes_dir = autopilot_dir / SCENES_SUBDIR
+    pilot_dir = gemini_dir / PILOT_SUBDIR
+    profile_path = _installed_path(gemini_dir, "profile.json")
+    engine_path = pilot_dir / ENGINE_NAME
+    scenes_dir = pilot_dir / SCENES_SUBDIR
     hooks_path = gemini_dir / HOOKS_SUBPATH
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_group = False
     hooks_error = ""
     try:
-        hooks_group = has_autopilot_hook_group(hooks_path)
+        hooks_group = has_pilot_hook_group(hooks_path)
     except SetupError as exc:
         hooks_error = str(exc)
     report: dict[str, Any] = {
@@ -181,7 +207,7 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
             for name in ("orca", "claude", "codex", "agy")
         },
         "installed": {
-            "autopilot_dir": autopilot_dir.is_dir(),
+            "pilot_dir": pilot_dir.is_dir(),
             "profile": profile_path.is_file(),
             "engine": engine_path.is_file(),
             "scenes": sorted(path.name for path in scenes_dir.glob("*.md"))
@@ -228,25 +254,25 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
 def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
     project = discover_project(args, gemini_dir)
-    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
-    profile_path = autopilot_dir / "profile.json"
-    config_path = autopilot_dir / "config.json"
-    scenes_dir = autopilot_dir / SCENES_SUBDIR
-    engine_path = autopilot_dir / ENGINE_NAME
+    pilot_dir = gemini_dir / PILOT_SUBDIR
+    profile_path = pilot_dir / "profile.json"
+    config_path = pilot_dir / "config.json"
+    scenes_dir = pilot_dir / SCENES_SUBDIR
+    engine_path = pilot_dir / ENGINE_NAME
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
     if args.upgrade:
         if args.profile:
             raise SetupError("--upgrade 不能与 --profile 同用；请先完成定制，再单独升级")
-        base = read_json_object(profile_path, "已安装的 profile.json")
+        base = read_json_object(_installed_path(gemini_dir, "profile.json"), "已安装的 profile.json")
         if base is None:
             raise SetupError("--upgrade 需要已安装的 profile.json；未找到安装配置")
     else:
         base = load_default_profile()
     installed_project = None
     if args.upgrade and project is not None:
-        installed_project_path = autopilot_dir / "project.json"
+        installed_project_path = _installed_path(gemini_dir, "project.json")
         if installed_project_path.is_file():
             installed_project = normalize_project(
                 read_json_object(installed_project_path, "project.json")
@@ -275,7 +301,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         if name not in bundle.scenes and (scenes_dir / name).is_file()
     ]
 
-    project_path = autopilot_dir / "project.json"
+    project_path = pilot_dir / "project.json"
     if project is not None:
         atomic_write_text(project_path, json_text(project))
     elif project_path.exists():
@@ -292,11 +318,13 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     for name in stale_scenes:
         (scenes_dir / name).unlink()
 
+    _migrate_legacy_install(gemini_dir)
+
     return {
         "gemini_dir": str(gemini_dir),
         "preset": preset or "installed-profile",
-        "mode": bundle.profile_json["autopilot"]["mode"],
-        "max_consecutive_auto_turns": bundle.profile_json["autopilot"]["max_consecutive_auto_turns"],
+        "mode": bundle.profile_json["pilot"]["mode"],
+        "max_consecutive_auto_turns": bundle.profile_json["pilot"]["max_consecutive_auto_turns"],
         "deliver_strategy": bundle.profile_json["scenes"]["deliver_strategy"],
         "worker_agents": bundle.profile_json["orchestration"]["worker_agents"],
         "review_agents": bundle.profile_json["orchestration"]["review_agents"],
@@ -312,14 +340,95 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _installed_path(gemini_dir: Path, name: str) -> Path:
+    """Prefer the canonical install path, falling back to the legacy one.
+
+    Read-only callers use this before the first post-migration ``apply`` has
+    moved ``config/autopilot`` onto ``config/the-pilot``.
+    """
+    canonical = gemini_dir / PILOT_SUBDIR / name
+    if canonical.exists():
+        return canonical
+    legacy = gemini_dir / LEGACY_AUTOPILOT_SUBDIR / name
+    return legacy if legacy.exists() else canonical
+
+
+def _migrate_legacy_install(gemini_dir: Path) -> None:
+    """Relocate a pre-migration ``config/autopilot`` install.
+
+    The caller has already written every canonical managed file and the
+    canonical hook group, so this only moves durable state and custom scenes,
+    then removes managed legacy files. Unknown user files are left untouched
+    instead of deleting the whole tree.
+    """
+    legacy_dir = gemini_dir / LEGACY_AUTOPILOT_SUBDIR
+    if not legacy_dir.is_dir():
+        return
+    pilot_dir = gemini_dir / PILOT_SUBDIR
+    _migrate_legacy_state(legacy_dir / "state", pilot_dir / "state")
+    _migrate_legacy_scenes(legacy_dir / SCENES_SUBDIR, pilot_dir / SCENES_SUBDIR)
+    for name in LEGACY_MANAGED_FILES:
+        path = legacy_dir / name
+        if name == "__pycache__":
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.is_file():
+            path.unlink()
+    prune_empty_dir(legacy_dir / SCENES_SUBDIR)
+    prune_empty_dir(legacy_dir / "state")
+    prune_empty_dir(legacy_dir)
+
+
+def _migrate_legacy_state(legacy_state: Path, state_dir: Path) -> None:
+    if not legacy_state.is_dir():
+        return
+    for path in sorted(legacy_state.iterdir()):
+        if not path.is_file():
+            continue
+        if path.name.endswith(".lock"):
+            # Lock files carry no durable state and the legacy engine no longer
+            # owns any hook, so remove them instead of moving stale locks.
+            path.unlink(missing_ok=True)
+            continue
+        if path.name == LEGACY_LOG_NAME:
+            _append_log_file(path, state_dir / LOG_NAME)
+            continue
+        target = state_dir / path.name
+        if target.exists():
+            continue
+        state_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(path, target)
+
+
+def _append_log_file(source: Path, target: Path) -> None:
+    """Append the legacy log to the canonical log, then remove the source."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as reader, target.open("ab") as writer:
+        shutil.copyfileobj(reader, writer)
+    source.unlink()
+
+
+def _migrate_legacy_scenes(legacy_scenes: Path, scenes_dir: Path) -> None:
+    if not legacy_scenes.is_dir():
+        return
+    for path in sorted(legacy_scenes.glob("*.md")):
+        if path.name in BUILTIN_SCENE_FILES:
+            path.unlink()
+            continue
+        target = scenes_dir / path.name
+        if target.exists():
+            continue
+        scenes_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(path, target)
+
+
 def status(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
     project = discover_project(args, gemini_dir)
-    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
-    profile_path = autopilot_dir / "profile.json"
-    config_path = autopilot_dir / "config.json"
-    scenes_dir = autopilot_dir / SCENES_SUBDIR
-    engine_path = autopilot_dir / ENGINE_NAME
+    pilot_dir = gemini_dir / PILOT_SUBDIR
+    profile_path = pilot_dir / "profile.json"
+    config_path = pilot_dir / "config.json"
+    scenes_dir = pilot_dir / SCENES_SUBDIR
+    engine_path = pilot_dir / ENGINE_NAME
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
@@ -334,12 +443,17 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         "engine": {"path": str(engine_path), "up_to_date": engine_up_to_date},
         "hooks": {
             "path": str(hooks_path),
-            "group": has_autopilot_hook_group(hooks_path),
+            "group": has_pilot_hook_group(hooks_path),
         },
         "gemini_md": str(gemini_md),
         "drift": [],
     }
-    state_dir = _state_dir_for(autopilot_dir)
+    legacy_dir = gemini_dir / LEGACY_AUTOPILOT_SUBDIR
+    if any((legacy_dir / name).exists() for name in LEGACY_MANAGED_FILES):
+        report["drift"].append(
+            "检测到旧版 config/autopilot 托管残留，请运行 pilot apply --upgrade 完成迁移"
+        )
+    state_dir = _state_dir_for(pilot_dir)
     auto_update_path = state_dir / "auto_update.json"
     if auto_update_path.is_file():
         try:
@@ -354,8 +468,8 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
     bundle = profile_compiler.compile_bundle(profile, project=project)
     report.update(
         {
-            "mode": bundle.profile_json["autopilot"]["mode"],
-            "max_consecutive_auto_turns": bundle.profile_json["autopilot"][
+            "mode": bundle.profile_json["pilot"]["mode"],
+            "max_consecutive_auto_turns": bundle.profile_json["pilot"][
                 "max_consecutive_auto_turns"
             ],
             "scenes": sorted(bundle.scenes),
@@ -392,14 +506,19 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
     hooks = read_json_object(hooks_path, "hooks.json") or {}
     expected_hooks = profile_compiler.merge_hooks_json(hooks, str(engine_path))
     report["hooks"]["up_to_date"] = (
-        hooks.get("orca-agy-autopilot") == expected_hooks.get("orca-agy-autopilot")
+        hooks.get(HOOK_GROUP) == expected_hooks.get(HOOK_GROUP)
+        and LEGACY_HOOK_GROUP not in hooks
     )
     if not hooks_path.is_file():
         report["hooks"]["up_to_date"] = False
-    if not report["hooks"]["up_to_date"]:
-        report["drift"].append("hooks.json 的 orca-agy-autopilot 组缺失或已漂移")
+    if LEGACY_HOOK_GROUP in hooks:
+        report["drift"].append(
+            f"hooks.json 仍包含旧版 {LEGACY_HOOK_GROUP} 组，请运行 pilot apply --upgrade 完成迁移"
+        )
+    if not report["hooks"]["up_to_date"] and LEGACY_HOOK_GROUP not in hooks:
+        report["drift"].append(f"hooks.json 的 {HOOK_GROUP} 组缺失或已漂移")
     if not engine_up_to_date:
-        report["drift"].append("autopilot.py 缺失或与当前技能版本不一致")
+        report["drift"].append("runtime.py 缺失或与当前技能版本不一致")
     return report
 
 
@@ -450,10 +569,10 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _state_dir_for(autopilot_dir: Path) -> Path:
+def _state_dir_for(pilot_dir: Path) -> Path:
     return Path(
-        os.environ.get("ORCA_AUTOPILOT_STATE_DIR", "").strip()
-        or str(autopilot_dir / "state")
+        _env_value("THE_PILOT_STATE_DIR", "ORCA_AUTOPILOT_STATE_DIR")
+        or str(pilot_dir / "state")
     ).expanduser()
 
 
@@ -576,10 +695,10 @@ def _is_older_committed_overlay(
     return False
 
 
-def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, autopilot_dir: Path) -> str:
+def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, pilot_dir: Path) -> str:
     if not workspace_arg:
         return "none"
-    installed_path = autopilot_dir / "project.json"
+    installed_path = _installed_path(gemini_dir, "project.json")
     overlay = _find_ancestor_overlay(Path(workspace_arg).expanduser().resolve())
     if overlay is None:
         return "none"
@@ -610,8 +729,8 @@ def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, autopil
 
 def self_update(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
-    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
-    state_dir = _state_dir_for(autopilot_dir)
+    pilot_dir = gemini_dir / PILOT_SUBDIR
+    state_dir = _state_dir_for(pilot_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     if getattr(args, "project_only", False):
         result = {
@@ -627,24 +746,24 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         home_dir = Path(args.home_dir).expanduser()
         with _file_lock(state_dir / "auto_update.lock"):
             try:
-                project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, autopilot_dir)
+                project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, pilot_dir)
                 result["status"] = result["project_status"] = project_status
                 checkout, _ = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
-                if checkout is not None and (autopilot_dir / "profile.json").is_file():
+                if checkout is not None and _installed_path(gemini_dir, "profile.json").is_file():
                     status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 2)
                     branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 2).strip()
                     if not status.strip() and branch == "main":
                         checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
                         existing = _load_json_object(state_dir / "auto_update.json")
                         sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 2).strip()
-                        source_engine = checkout / "src/the_pilot/assets/autopilot.py"
-                        installed_engine = autopilot_dir / "autopilot.py"
+                        source_engine = checkout / "src/the_pilot/assets" / ENGINE_NAME
+                        installed_engine = pilot_dir / ENGINE_NAME
                         runtime_differs = (
                             existing.get("runtime_tree_digest") != checkout_digest
                             or (source_engine.is_file() and (not installed_engine.is_file() or source_engine.read_bytes() != installed_engine.read_bytes()))
                         )
                         if runtime_differs:
-                            project_path = autopilot_dir / "project.json"
+                            project_path = _installed_path(gemini_dir, "project.json")
                             project_args = ["--project", str(project_path)] if project_path.is_file() else ["--no-project"]
                             apply_command = [sys.executable, str(checkout / "bin/pilot"), "apply", "--upgrade", "--gemini-dir", str(gemini_dir), *project_args, "--json"]
                             subprocess_run(apply_command, 30)
@@ -704,7 +823,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 report["last_checked_at"] = existing_metadata.get("last_checked_at")
             checkout_digest: str | None = None
             report["project_status"] = _sync_workspace_overlay(
-                getattr(args, "workspace", None), gemini_dir, autopilot_dir
+                getattr(args, "workspace", None), gemini_dir, pilot_dir
             )
             home_dir = Path(args.home_dir).expanduser()
             checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
@@ -771,9 +890,9 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                             target.symlink_to(source)
                             report["synced_skills"].append(str(target))
 
-            profile_path = autopilot_dir / "profile.json"
+            profile_path = _installed_path(gemini_dir, "profile.json")
             if profile_path.is_file():
-                project_path = autopilot_dir / "project.json"
+                project_path = _installed_path(gemini_dir, "project.json")
                 apply_args = argparse.Namespace(**vars(args))
                 apply_args.command = "apply"
                 apply_args.upgrade = True
@@ -815,7 +934,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             report["error"] = str(exc)
             report["status"] = "failed"
         atomic_write_text(state_dir / "auto_update.json", json_text(report))
-        log_path = state_dir / "autopilot.log"
+        log_path = state_dir / LOG_NAME
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": "auto_update_failed" if report["status"] == "failed" else "auto_update_completed", **report}, ensure_ascii=False) + "\n")
         if report["status"] == "failed":
@@ -846,20 +965,28 @@ def uninstall(args: argparse.Namespace) -> dict[str, Any]:
 
 def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
-    autopilot_dir = gemini_dir / AUTOPILOT_SUBDIR
-    profile_path = autopilot_dir / "profile.json"
-    config_path = autopilot_dir / "config.json"
-    scenes_dir = autopilot_dir / SCENES_SUBDIR
-    engine_path = autopilot_dir / ENGINE_NAME
+    pilot_dir = gemini_dir / PILOT_SUBDIR
+    legacy_dir = gemini_dir / LEGACY_AUTOPILOT_SUBDIR
+    profile_path = pilot_dir / "profile.json"
+    config_path = pilot_dir / "config.json"
+    scenes_dir = pilot_dir / SCENES_SUBDIR
+    engine_path = pilot_dir / ENGINE_NAME
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
-    installed = profile_path.is_file() or engine_path.is_file()
+    installed = (
+        profile_path.is_file()
+        or engine_path.is_file()
+        or (legacy_dir / "profile.json").is_file()
+        or (legacy_dir / LEGACY_ENGINE_NAME).is_file()
+    )
     removed: list[str] = []
     hooks = read_json_object(hooks_path, "hooks.json")
-    if hooks is not None and "orca-agy-autopilot" in hooks:
+    if hooks is not None and (HOOK_GROUP in hooks or LEGACY_HOOK_GROUP in hooks):
+        for group in (HOOK_GROUP, LEGACY_HOOK_GROUP):
+            if group in hooks:
+                removed.append(f"hooks.json:{group}")
         atomic_write_text(hooks_path, json_text(profile_compiler.strip_hooks_json(hooks)))
-        removed.append("hooks.json:orca-agy-autopilot")
 
     current_gemini = read_text(gemini_md)
     stripped = profile_compiler.strip_gemini_md(current_gemini)
@@ -871,32 +998,48 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         removed.append("GEMINI.md:managed-block")
 
     for path, label in (
-        (engine_path, "autopilot.py"),
+        (engine_path, ENGINE_NAME),
         (profile_path, "profile.json"),
         (config_path, "config.json"),
-        (autopilot_dir / "project.json", "project.json"),
+        (pilot_dir / "project.json", "project.json"),
+        (legacy_dir / LEGACY_ENGINE_NAME, f"legacy/{LEGACY_ENGINE_NAME}"),
+        (legacy_dir / "profile.json", "legacy/profile.json"),
+        (legacy_dir / "config.json", "legacy/config.json"),
+        (legacy_dir / "project.json", "legacy/project.json"),
+        (legacy_dir / LEGACY_LOCK_NAME, f"legacy/{LEGACY_LOCK_NAME}"),
     ):
         if path.is_file():
             path.unlink()
             removed.append(label)
 
-    preserved_scenes = []
-    for path in sorted(scenes_dir.glob("*.md")) if scenes_dir.is_dir() else []:
-        if path.name in BUILTIN_SCENE_FILES:
-            path.unlink()
-            removed.append(f"scenes/{path.name}")
-        else:
-            preserved_scenes.append(path.name)
-
+    preserved_scenes = _uninstall_scenes(scenes_dir, removed, prefix="scenes/")
+    preserved_scenes += _uninstall_scenes(
+        legacy_dir / SCENES_SUBDIR, removed, prefix="legacy/scenes/"
+    )
+    shutil.rmtree(legacy_dir / "__pycache__", ignore_errors=True)
+    prune_empty_dir(legacy_dir / SCENES_SUBDIR)
+    prune_empty_dir(legacy_dir)
     prune_empty_dir(scenes_dir)
-    prune_empty_dir(autopilot_dir)
-    preserved = [f"scenes/{name}" for name in preserved_scenes]
+    prune_empty_dir(pilot_dir)
     return {
         "gemini_dir": str(gemini_dir),
         "installed": installed,
         "removed": removed,
-        "preserved": preserved,
+        "preserved": preserved_scenes,
     }
+
+
+def _uninstall_scenes(
+    scenes_dir: Path, removed: list[str], *, prefix: str
+) -> list[str]:
+    preserved: list[str] = []
+    for path in sorted(scenes_dir.glob("*.md")) if scenes_dir.is_dir() else []:
+        if path.name in BUILTIN_SCENE_FILES:
+            path.unlink()
+            removed.append(f"{prefix}{path.name}")
+        else:
+            preserved.append(f"{prefix}{path.name}")
+    return preserved
 
 
 def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -904,9 +1047,9 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.profile:
         overrides = read_profile_argument(args.profile)
     if args.mode:
-        overrides.setdefault("autopilot", {})["mode"] = args.mode
+        overrides.setdefault("pilot", {})["mode"] = args.mode
     if args.max_turns is not None:
-        overrides.setdefault("autopilot", {})["max_consecutive_auto_turns"] = args.max_turns
+        overrides.setdefault("pilot", {})["max_consecutive_auto_turns"] = args.max_turns
     if args.worker_agents is not None:
         overrides.setdefault("orchestration", {})["worker_agents"] = split_list(args.worker_agents)
     if args.review_agents is not None:
@@ -968,7 +1111,7 @@ def discover_project(args: argparse.Namespace, gemini_dir: Path) -> dict[str, An
         if not path.is_file():
             raise SetupError(f"Project overlay not found: {path}")
     else:
-        path = gemini_dir / AUTOPILOT_SUBDIR / "project.json"
+        path = _installed_path(gemini_dir, "project.json")
         if not path.is_file():
             path = _find_ancestor_overlay(Path.cwd())
             if path is None:
@@ -982,7 +1125,7 @@ def gemini_dir_for(args: argparse.Namespace) -> Path:
 
 @contextmanager
 def profile_lock(gemini_dir: Path):
-    with _file_lock(gemini_dir / AUTOPILOT_SUBDIR / ".autopilot.lock"):
+    with _file_lock(gemini_dir / PILOT_SUBDIR / LOCK_NAME):
         yield
 
 
@@ -1031,9 +1174,9 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
                 pass
 
 
-def has_autopilot_hook_group(hooks_path: Path) -> bool:
+def has_pilot_hook_group(hooks_path: Path) -> bool:
     hooks = read_json_object(hooks_path, "hooks.json") or {}
-    return "orca-agy-autopilot" in hooks
+    return HOOK_GROUP in hooks
 
 
 def missing_cli_warnings(profile: dict[str, Any]) -> list[str]:

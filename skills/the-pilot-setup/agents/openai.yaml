@@ -1,4 +1,4 @@
 interface:
   display_name: "The Pilot Setup"
   short_description: "Install, distill 7-day agent chat patterns, customize, or upgrade The Pilot"
-  default_prompt: "Use $the-pilot-setup to distill my recent agent chat history and configure The Pilot across orchestration, autopilot, scenes, and shortcuts."
+  default_prompt: "Use $the-pilot-setup to distill my recent agent chat history and configure The Pilot across orchestration, pilot, scenes, and shortcuts."
