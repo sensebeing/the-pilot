@@ -674,17 +674,17 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
                 result["error"] = str(exc)
         return result
-    existing_metadata = _load_json_object(state_dir / "auto_update.json")
     report: dict[str, Any] = {
         "last_checked_at": time.time(), "last_updated_at": None,
         "status": "failed", "source_status": "failed", "project_status": "none",
         "head_sha": None, "synced_skills": [], "error": None,
     }
-    for key in ("last_updated_at", "installed_sha", "installed_tree_digest", "runtime_tree_digest"):
-        if key in existing_metadata:
-            report[key] = existing_metadata[key]
     with _file_lock(state_dir / "auto_update.lock"):
         try:
+            existing_metadata = _load_json_object(state_dir / "auto_update.json")
+            for key in ("last_updated_at", "installed_sha", "installed_tree_digest", "runtime_tree_digest"):
+                if key in existing_metadata:
+                    report[key] = existing_metadata[key]
             checkout_digest: str | None = None
             report["project_status"] = _sync_workspace_overlay(
                 getattr(args, "workspace", None), gemini_dir, autopilot_dir
