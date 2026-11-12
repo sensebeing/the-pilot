@@ -479,9 +479,12 @@ class AutoUpdateTest(unittest.TestCase):
             engine.write_bytes(source.read_bytes())
             installer.apply(installer.build_parser().parse_args(["apply", "--gemini-dir", str(gemini), "--no-project", "--json"]))
             shim = root / "pilot-shim.py"
+            sync_count = root / "sync-count.txt"
             shim.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, sys\n"
+                "counter = pathlib.Path(os.environ['SYNC_COUNT_FILE'])\n"
+                "counter.write_text(counter.read_text() + '1\\n' if counter.exists() else '1\\n')\n"
                 "if sys.argv[1:3] == ['self-update', '--project-only']:\n"
                 "    d = pathlib.Path(os.environ['THE_PILOT_GEMINI_DIR']) / 'config/the-pilot'\n"
                 "    (d / 'runtime.py').write_text((d / 'runtime.py').read_text() + '\\n# upgraded\\n')\n"
@@ -500,6 +503,7 @@ class AutoUpdateTest(unittest.TestCase):
                 "THE_PILOT_GEMINI_DIR": str(gemini),
                 "THE_PILOT_BIN": str(shim),
                 "THE_PILOT_DISABLE_AUTO_UPDATE": "1",
+                "SYNC_COUNT_FILE": str(sync_count),
             }
             result = subprocess.run(
                 [sys.executable, str(engine), "hook", "--event", "PreInvocation"],
@@ -507,6 +511,7 @@ class AutoUpdateTest(unittest.TestCase):
             )
             receipt = json.loads(result.stdout)
             self.assertIn("upgraded shortcut body", json.dumps(receipt, ensure_ascii=False))
+            self.assertEqual(sync_count.read_text().count("1"), 1)
 
     def test_pilot_reexec_failure_is_reported_as_hook_failure(self):
         """A failing or malformed upgraded engine fails the hook instead of faking success."""

@@ -1513,41 +1513,45 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
-    sync_confirmed = maybe_sync_project_overlay(payload)
-    if sync_confirmed and _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
-        updated_engine = PILOT_DIR / "runtime.py"
-        try:
-            changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
-        except OSError:
-            changed = False
-        if changed:
+    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
+        # Exactly one process per turn owns project synchronization. The
+        # re-executed engine runs under a short supervisor timeout, so it must
+        # never start a repair that its supervisor could abandon by killing it.
+        sync_confirmed = maybe_sync_project_overlay(payload)
+        if sync_confirmed:
+            updated_engine = PILOT_DIR / "runtime.py"
             try:
-                result = subprocess.run(
-                    [sys.executable, str(updated_engine), *sys.argv[1:]],
-                    input=json.dumps(payload, ensure_ascii=False),
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    env={**os.environ, "THE_PILOT_REEXEC": "1"},
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                log_event("engine_reexec_failed", error=str(exc))
-                raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout).strip()[-300:]
-                log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
-                raise HookExecutionError("engine_reexec_failed", detail)
-            try:
-                output = json.loads(result.stdout) if result.stdout.strip() else {}
-            except ValueError as exc:
-                log_event("engine_reexec_failed", error=str(exc))
-                raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
-            if not isinstance(output, dict):
-                log_event("engine_reexec_failed", error="output_not_object")
-                raise HookExecutionError(
-                    "engine_reexec_invalid_output", "hook output must be a JSON object"
-                )
-            return output
+                changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
+            except OSError:
+                changed = False
+            if changed:
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(updated_engine), *sys.argv[1:]],
+                        input=json.dumps(payload, ensure_ascii=False),
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                        env={**os.environ, "THE_PILOT_REEXEC": "1"},
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log_event("engine_reexec_failed", error=str(exc))
+                    raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()[-300:]
+                    log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
+                    raise HookExecutionError("engine_reexec_failed", detail)
+                try:
+                    output = json.loads(result.stdout) if result.stdout.strip() else {}
+                except ValueError as exc:
+                    log_event("engine_reexec_failed", error=str(exc))
+                    raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
+                if not isinstance(output, dict):
+                    log_event("engine_reexec_failed", error="output_not_object")
+                    raise HookExecutionError(
+                        "engine_reexec_invalid_output", "hook output must be a JSON object"
+                    )
+                return output
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
