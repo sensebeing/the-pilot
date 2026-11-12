@@ -678,8 +678,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                                             existing["last_local_sync_at"] = previous_local_sync
                                         atomic_write_text(state_dir / "auto_update.json", json_text(existing))
                             elif package_dir is None:
-                                existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
-                                atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+                                result["error"] = "uv tool bundle unavailable; installed metadata unchanged"
             except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
                 result["error"] = str(exc)
         return result
@@ -735,8 +734,6 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     installed_ok = not uv_needs_reinstall
                     if manages_uv_tool and uv_needs_reinstall:
                         subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
-                        installed_ok = True
-                    elif not manages_uv_tool and not explicit and _installed_uv_package_dir(home_dir) is None:
                         installed_ok = True
                     if installed_ok:
                         report["installed_sha"] = after_sha
