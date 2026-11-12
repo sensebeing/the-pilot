@@ -411,10 +411,17 @@ class AutoUpdateTest(unittest.TestCase):
             state.mkdir(parents=True)
             metadata = {"last_checked_at": time.time()}
             (state / "auto_update.json").write_text(json.dumps(metadata))
+            (home / ".local/bin").mkdir(parents=True)
+            (home / ".local/bin/pilot").write_text("#!/bin/sh\n")
+            (home / ".local/bin/pilot").chmod(0o755)
             args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
-            report = installer.self_update(args)
+            with mock.patch.object(installer.shutil, "which", return_value="/fake/uv"):
+                report = installer.self_update(args)
             self.assertEqual(report["local_source_status"], "updated")
             self.assertIn("local upgrade marker", (gemini / "config/autopilot/autopilot.py").read_text())
+            persisted = json.loads((state / "auto_update.json").read_text())
+            self.assertIn("runtime_tree_digest", persisted)
+            self.assertNotIn("installed_tree_digest", persisted)
             engine.write_text(engine.read_text() + "\n# dirty\n")
             before = (gemini / "config/autopilot/autopilot.py").read_bytes()
             self.assertEqual(installer.self_update(args)["local_source_status"], "none")
