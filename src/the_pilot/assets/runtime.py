@@ -958,7 +958,7 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, text[end + 5 :]
 
 
-def scan_scenes_checked() -> tuple[dict[str, dict[str, Any]], list[str]]:
+def scan_scenes() -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Read every scene file, returning unreadable ones instead of hiding them."""
     scenes: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
@@ -976,10 +976,6 @@ def scan_scenes_checked() -> tuple[dict[str, dict[str, Any]], list[str]]:
         if name:
             scenes[name] = {"meta": meta, "body": body, "path": path}
     return scenes, errors
-
-
-def scan_scenes() -> dict[str, dict[str, Any]]:
-    return scan_scenes_checked()[0]
 
 
 def scene_gate_default(scene: str, scenes: dict[str, dict[str, Any]]) -> str:
@@ -1482,6 +1478,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
     config, config_err = load_config()
     profile, profile_err = load_profile()
+    scenes, scene_errors = scan_scenes()
     user_turn = turn_user_identity(steps)
     recovery_requested = bool(_named_command(text, {"pilot", "autopilot"}, {"recover"}))
     with state_lock(conversation_id):
@@ -1509,16 +1506,16 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 "【Pilot 会话状态已恢复】原状态文件已备份留证并重建；"
                 "自动投递恢复正常。请用一句话告知用户，无需执行其他操作。"
             )
-        if profile is None or config is None:
-            # Corrupt preferences cannot be trusted as a source for worker
-            # reload or shortcut expansion; drop transient delivery state and
-            # fail the hook instead of degrading to guesses.
+        if profile is None or config is None or scene_errors:
+            # Corrupt preferences or scene files cannot be trusted as a source
+            # for worker reload or shortcut expansion; drop transient delivery
+            # state and fail the hook instead of degrading to guesses.
             state["auto_submitted_text"] = ""
             state["candidates"] = []
             state["candidate_turn_id"] = ""
             if not save_state(conversation_id, state):
                 log_event("pre_state_save_failed", cid=conversation_id)
-            detail = profile_err or config_err
+            detail = profile_err or config_err or "; ".join(scene_errors)
             log_event("pre_invocation_config_corrupt", cid=conversation_id, error=detail)
             raise HookExecutionError("config_corrupt", detail)
         worker_reload_msg = ""
@@ -1582,7 +1579,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         if mode_target:
             target = mode_target
             if target == "status":
-                scene_count = len(scan_scenes())
+                scene_count = len(scenes)
                 message = (
                     f"【Pilot 状态】当前模式为 `{current_mode(profile)}`，"
                     f"已加载 {scene_count} 个场景文件。{worker_priority(cur_workers)}。请用一句话告知用户，无需调用工具。"
@@ -1730,7 +1727,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             log_event("stop_state_corrupt", cid=conversation_id)
             return {"decision": "allow"}
         profile, profile_err = load_profile()
-        scenes, scene_errors = scan_scenes_checked()
+        scenes, scene_errors = scan_scenes()
         if profile is None or scene_errors:
             # Corrupt preferences or scene files cannot be trusted to decide
             # delivery; clear the transient suggestion and fail the Stop hook
@@ -1949,7 +1946,7 @@ def command_sync() -> int:
     # sync that started before an uninstall cannot write the managed block back.
     with _file_lock(PILOT_DIR / ".pilot.lock"):
         profile, profile_err = load_profile()
-        scenes, scene_errors = scan_scenes_checked()
+        scenes, scene_errors = scan_scenes()
         if profile is None:
             print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
             return 2
@@ -1984,7 +1981,7 @@ def command_sync() -> int:
 
 def command_status(as_json: bool) -> int:
     profile, profile_err = load_profile()
-    scenes, scene_errors = scan_scenes_checked()
+    scenes, scene_errors = scan_scenes()
     config, config_err = load_config()
     hooks, hooks_err = load_json(GEMINI_DIR / "config" / "hooks.json")
     errors = [error for error in (profile_err, config_err, hooks_err) if error]
@@ -2199,9 +2196,14 @@ def command_mode(target: str) -> int:
     if profile is None:
         print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
         return 2
-    if target != "status" and not set_mode(target):
-        print("Mode switch failed: profile.json is missing or unwritable.", file=sys.stderr)
-        return 2
+    if target != "status":
+        if not set_mode(target):
+            print("Mode switch failed: profile.json is missing or unwritable.", file=sys.stderr)
+            return 2
+        profile, profile_err = load_profile()
+        if profile is None:
+            print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
+            return 2
     print(f"Pilot mode: {current_mode(profile)}")
     return 0
 

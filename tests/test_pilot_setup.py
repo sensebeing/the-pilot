@@ -1591,6 +1591,7 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(json.loads(status.stdout)["worker_agents"], expected)
         mode = run_engine(self.root, self.gemini, self.state, "mode", "confirm")
         self.assertEqual(mode.returncode, 0, mode.stderr)
+        self.assertEqual(mode.stdout.strip(), "Pilot mode: confirm")
         self.assertEqual(read_json(self.gemini / PROFILE_REL)["pilot"]["mode"], "confirm")
 
     def test_worker_chat_switch_and_reserved_aliases(self) -> None:
@@ -3288,11 +3289,12 @@ class EngineTest(unittest.TestCase):
         log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("pre_invocation_config_corrupt", log)
 
-    def test_unreadable_scene_fails_closed_in_status_sync_and_stop(self) -> None:
+    def test_unreadable_scene_fails_closed_across_commands_and_hooks(self) -> None:
         """Failure means an unreadable scene file is silently dropped from routing.
 
-        resident-fact: fail-closed: an unreadable scene file makes status and
-        sync exit 2, and Stop refuses to deliver against an incomplete scene set.
+        resident-fact: fail-closed: an unreadable scene file makes status, sync,
+        PreInvocation (including `,mode status`) and Stop exit 2, and Stop
+        refuses to deliver against an incomplete scene set.
         """
         self.pre("c-scene-corrupt", "初始化会话")
         (self.gemini / SCENES_REL / "99-broken.md").mkdir()
@@ -3313,11 +3315,24 @@ class EngineTest(unittest.TestCase):
         self.assertIn("场景文件不可读", sync.stderr)
         self.assertEqual(gemini_md.read_bytes(), gemini_before)
 
+        pre = self.pre("c-scene-corrupt", "继续任务")
+        self.assertEqual(pre.returncode, 2)
+        self.assertEqual(pre.stdout, "")
+        self.assertEqual(json.loads(pre.stderr)["error"], "config_corrupt")
+
+        mode = self.pre("c-scene-corrupt", ",mode status")
+        self.assertEqual(mode.returncode, 2)
+        self.assertEqual(mode.stdout, "")
+        self.assertEqual(json.loads(mode.stderr)["error"], "config_corrupt")
+
         stop = self.stop("c-scene-corrupt", suggestion("继续推进", gate="auto"))
         self.assertEqual(stop.returncode, 2)
         self.assertEqual(stop.stdout, "")
         self.assertEqual(json.loads(stop.stderr)["error"], "config_corrupt")
         self.assertEqual(send_calls(self.root), [])
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("pre_invocation_config_corrupt", log)
+        self.assertIn("stop_config_corrupt", log)
 
     def test_hook_rejects_invalid_payload_and_internal_errors(self) -> None:
         """Failure means a broken hook input or runtime bug exits 0 as a no-op.
