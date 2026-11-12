@@ -278,7 +278,7 @@ class ProjectTest(unittest.TestCase):
         fails instead of dropping that project-only customization.
         """
         self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
-        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile_path = self.gemini / "config/the-pilot/profile.json"
         profile = json.loads(profile_path.read_text())
         profile["shortcuts"]["template_overrides"] = {
             ",FB ": "手写反馈模板 {arg}",
@@ -337,7 +337,7 @@ class ProjectTest(unittest.TestCase):
         beta_path.write_text(json.dumps(beta))
 
         self.cli("apply", "--project", str(alpha_path))
-        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile_path = self.gemini / "config/the-pilot/profile.json"
         profile = json.loads(profile_path.read_text())
         profile["shortcuts"]["template_overrides"] = {"CMD_A_DEPLOY": "我的部署 {arg}"}
         profile_path.write_text(json.dumps(profile))
@@ -347,7 +347,7 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(
             migrated["shortcuts"]["template_overrides"], {"deploy": "我的部署 {arg}"}
         )
-        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
         self.assertEqual(
             config["entry_shortcuts"]["deploy"]["template"], "我的部署 {arg}"
         )
@@ -361,7 +361,7 @@ class ProjectTest(unittest.TestCase):
         retired entry, and silently loses the personal template.
         """
         self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
-        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile_path = self.gemini / "config/the-pilot/profile.json"
         profile = json.loads(profile_path.read_text())
         profile["shortcuts"]["enabled_entry"].remove("fb")
         profile["shortcuts"]["custom_comma"] = {"FB": {"template": "custom {arg}"}}
@@ -376,7 +376,7 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(
             detached["shortcuts"]["custom_comma"]["fb"]["template"], "custom {arg}"
         )
-        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
         command = next(
             item for item in config["comma_commands"].values() if ",fb" in item["aliases"]
         )
@@ -440,7 +440,7 @@ class ProjectTest(unittest.TestCase):
             path = self.root / f"{name}.json"
             path.write_text(json.dumps(overlay))
             paths[name] = path
-        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile_path = self.gemini / "config/the-pilot/profile.json"
 
         self.cli("apply", "--project", str(paths["alpha"]))
         profile = json.loads(profile_path.read_text())
@@ -455,7 +455,7 @@ class ProjectTest(unittest.TestCase):
             json.loads(profile_path.read_text())["shortcuts"]["template_overrides"],
             {"alpha": "alpha tpl", "beta": "beta tpl"},
         )
-        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
         self.assertEqual(config["entry_shortcuts"]["alpha"]["template"], "alpha tpl")
         self.assertEqual(config["entry_shortcuts"]["beta"]["template"], "beta tpl")
 
@@ -467,9 +467,144 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(
             json.loads(profile_path.read_text())["shortcuts"]["template_overrides"], {}
         )
-        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
         self.assertEqual(config["entry_shortcuts"]["gamma"]["template"], "gamma {arg}")
         self.assertEqual(self.cli("status")["drift"], [])
+
+    def test_equivalent_override_aliases_normalize_on_reapply_and_switch(self):
+        """Aliases for one shortcut normalize to one whitespace-stripped template.
+
+        Failure means re-applying an unchanged project or switching projects
+        rejects an installed profile whose `template_overrides` carries the
+        same template under `r` and `,r` with surrounding whitespace, instead
+        of sharing validation's single normalization rule.
+        """
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+        equivalent = {"r": "Review {arg}", ",r": " Review {arg} "}
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = equivalent
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        unchanged = json.loads(profile_path.read_text())
+        self.assertEqual(
+            unchanged["shortcuts"]["template_overrides"], {"r": "Review {arg}"}
+        )
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
+        self.assertEqual(config["entry_shortcuts"]["r"]["template"], "Review {arg}")
+
+        unchanged["shortcuts"]["template_overrides"] = equivalent
+        profile_path.write_text(json.dumps(unchanged))
+        self.cli("apply", "--no-project")
+        switched = json.loads(profile_path.read_text())
+        self.assertEqual(
+            switched["shortcuts"]["template_overrides"], {"r": "Review {arg}"}
+        )
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
+        self.assertEqual(config["entry_shortcuts"]["r"]["template"], "Review {arg}")
+
+    def test_conflicting_override_templates_fail_closed(self):
+        """Distinct templates for one shortcut are never silently collapsed.
+
+        Failure means `pilot apply` keeps whichever alias it reads last and
+        overwrites the other, losing an installed customization instead of
+        reporting the ambiguous `template_overrides`.
+        """
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {
+            "r": "Review A {arg}",
+            ",r": "Review B {arg}",
+        }
+        profile_path.write_text(json.dumps(profile))
+        installed = profile_path.read_text()
+
+        error = self.cli(
+            "apply", "--project", str(FIXTURES / "alter-service.json"), ok=False
+        )
+        self.assertIn("template_overrides", error["error"])
+        self.assertEqual(profile_path.read_text(), installed)
+
+        profile["shortcuts"]["template_overrides"] = {
+            "r": "Review A {arg}",
+            "CMD_MOD_REVIEW": "Review B {arg}",
+        }
+        profile_path.write_text(json.dumps(profile))
+        error = self.cli("apply", "--no-project", ok=False)
+        self.assertIn("template_overrides", error["error"])
+        self.assertEqual(profile_path.read_text(), json.dumps(profile))
+
+    def test_swapped_command_id_conflicts_fail_closed_across_projects(self):
+        """A swapped command identity cannot silently overwrite another owner.
+
+        Failure means switching to an overlay that swaps `CMD_1`/`CMD_2`
+        lets an alias pair resolving to the same installed shortcut carry two
+        different templates through validation and pick one arbitrarily.
+        """
+        alpha = {
+            "schema": "the-pilot-project/v1",
+            "projectId": "alpha",
+            "entry_order": ["alpha", "beta", "r", "rt", "d", "pull"],
+            "entry_specs": {
+                "alpha": {
+                    "command_id": "CMD_1",
+                    "description": "alpha",
+                    "requires_arg": True,
+                    "usage": "alpha <arg>",
+                    "template": "alpha {arg}",
+                },
+                "beta": {
+                    "command_id": "CMD_2",
+                    "description": "beta",
+                    "requires_arg": True,
+                    "usage": "beta <arg>",
+                    "template": "beta {arg}",
+                },
+            },
+            "presets": {
+                "recommended": {
+                    "shortcuts": {
+                        "enabled_entry": ["alpha", "beta", "r", "rt", "d", "pull"]
+                    }
+                }
+            },
+        }
+        swapped = json.loads(json.dumps(alpha))
+        swapped["projectId"] = "swapped"
+        swapped["entry_specs"]["alpha"]["command_id"] = "CMD_2"
+        swapped["entry_specs"]["beta"]["command_id"] = "CMD_1"
+        alpha_path = self.root / "alpha.json"
+        swapped_path = self.root / "swapped.json"
+        alpha_path.write_text(json.dumps(alpha))
+        swapped_path.write_text(json.dumps(swapped))
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+
+        self.cli("apply", "--project", str(alpha_path))
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {
+            "CMD_1": "alpha tpl",
+            "CMD_2": "beta tpl",
+        }
+        profile_path.write_text(json.dumps(profile))
+        self.cli("apply", "--project", str(swapped_path))
+        self.assertEqual(
+            json.loads(profile_path.read_text())["shortcuts"]["template_overrides"],
+            {"alpha": "alpha tpl", "beta": "beta tpl"},
+        )
+
+        self.cli("apply", "--project", str(alpha_path))
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {
+            "CMD_1": "alpha tpl",
+            "alpha": "different tpl",
+        }
+        profile_path.write_text(json.dumps(profile))
+        installed = profile_path.read_text()
+        error = self.cli("apply", "--project", str(swapped_path), ok=False)
+        self.assertIn("template_overrides", error["error"])
+        self.assertEqual(profile_path.read_text(), installed)
 
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"

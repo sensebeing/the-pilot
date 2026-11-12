@@ -895,7 +895,7 @@ class SetupTest(unittest.TestCase):
         self.assertIn("--upgrade", preset_conflict.stderr)
         unchanged = read_json(profile_path)
         self.assertEqual(unchanged["orchestration"]["worker_agents"], ["codex"])
-        self.assertEqual(unchanged["autopilot"]["mode"], "confirm")
+        self.assertEqual(unchanged["pilot"]["mode"], "confirm")
 
     def test_upgrade_without_installed_profile_fails(self) -> None:
         result = run_setup(self.root, self.gemini, "apply", "--upgrade")
@@ -1065,6 +1065,80 @@ class SetupTest(unittest.TestCase):
             if ",ts" in item["aliases"]
         )
         self.assertEqual(command["aliases"], [",ts", ",t1"])
+
+    def test_reapply_preserves_legacy_autopilot_profile(self) -> None:
+        """A pre-rename install keeps its preferences through one bare apply.
+
+        resident-fact: settlement: bare `pilot apply` reads the legacy
+        config/autopilot/profile.json before the one-way migration, so the
+        canonical install keeps the installed mode, turn cap and worker order
+        instead of resetting them to the recommended preset.
+        """
+        self.seed_legacy_install(self.gemini)
+
+        result = apply_profile(self.root, self.gemini)
+        profile = read_json(self.gemini / PROFILE_REL)
+        self.assertEqual(result["preset"], "installed-profile")
+        self.assertEqual(result["worker_agents"], ["codex"])
+        self.assertEqual(result["mode"], "confirm")
+        self.assertEqual(result["max_consecutive_auto_turns"], 5)
+        self.assertEqual(profile["pilot"]["mode"], "confirm")
+        self.assertEqual(profile["pilot"]["max_consecutive_auto_turns"], 5)
+        self.assertEqual(profile["orchestration"]["worker_agents"], ["codex"])
+        self.assertFalse((self.gemini / "config/autopilot").exists())
+        self.assertEqual(json.loads(run_setup(self.root, self.gemini, "status").stdout)["drift"], [])
+
+    def test_explicit_profile_replaces_installed_preferences(self) -> None:
+        """`--profile` is the documented replacement path for installed preferences.
+
+        Failure means an explicit profile is merged onto stale installed state,
+        so a replacement cannot remove worker agents, scenes or shortcuts the
+        user previously chose.
+        """
+        apply_profile(self.root, self.gemini, "--preset", "recommended")
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        profile["orchestration"]["worker_agents"] = ["codex", "claude"]
+        profile["pilot"] = {"mode": "off", "max_consecutive_auto_turns": 12}
+        profile["scenes"]["enable_feedback_email"] = True
+        profile["shortcuts"]["enabled_entry"] = [
+            "cq",
+            "fb",
+            "al",
+            "r",
+            "rt",
+            "d",
+            "pull",
+        ]
+        write_json(profile_path, profile)
+
+        replacement = {
+            "orchestration": {"worker_agents": ["claude"]},
+            "pilot": {"mode": "confirm", "max_consecutive_auto_turns": 3},
+            "scenes": {
+                "enabled_scenes": ["plan-and-orchestrate"],
+                "deliver_strategy": "local_verify_only",
+                "enable_feedback_email": False,
+                "guardrails": [],
+            },
+            "shortcuts": {"enabled_entry": ["r"]},
+        }
+        replacement_path = self.root / "replacement.json"
+        replacement_path.write_text(json.dumps(replacement), encoding="utf-8")
+        result = apply_profile(
+            self.root, self.gemini, "--profile", str(replacement_path)
+        )
+        replaced = read_json(profile_path)
+        self.assertEqual(result["preset"], "recommended")
+        self.assertEqual(result["worker_agents"], ["claude"])
+        self.assertEqual(replaced["orchestration"]["worker_agents"], ["claude"])
+        self.assertEqual(
+            replaced["pilot"], {"mode": "confirm", "max_consecutive_auto_turns": 3}
+        )
+        self.assertEqual(replaced["scenes"]["enabled_scenes"], ["plan-and-orchestrate"])
+        self.assertEqual(replaced["scenes"]["deliver_strategy"], "local_verify_only")
+        self.assertFalse(replaced["scenes"]["enable_feedback_email"])
+        self.assertEqual(replaced["shortcuts"]["enabled_entry"], ["r"])
 
     def test_reapply_fails_closed_on_corrupt_installed_profile(self) -> None:
         """A corrupt installed profile is never treated as absent and overwritten.

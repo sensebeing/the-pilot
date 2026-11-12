@@ -2,7 +2,7 @@
 
 - `defaults.py`: universal vocabulary, `PIPELINE_STAGE_CONTRACTS`, and project-neutral templates only.
 - `project.py`: pure overlay validation and composition; no filesystem access.
-- `profile.py`: durable user preference normalization and preset resolution.
+- `profile.py`: durable user preference normalization, project-switch shortcut migration, and preset resolution.
 - `compiler.py`: pure rendering and managed-document merges; no IO.
 - `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs, plus scene pipeline assessment of the installed profile and scene contracts.
 - `installer.py`: the sole owner of project discovery, workspace overlay synchronization, `self-update`, installation locking and atomic file writes.

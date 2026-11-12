@@ -10,7 +10,6 @@ are never touched.
 from __future__ import annotations
 
 import argparse
-import copy
 import fcntl
 import hashlib
 import json
@@ -26,13 +25,8 @@ from typing import Any
 
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
-from .profile import (
-    resolve_override_alias,
-    resolve_profile,
-    shortcut_override_aliases,
-    validate_profile,
-)
-from .project import ProfileError, normalize_project, project_specs
+from .profile import migrate_project_shortcuts, resolve_profile, validate_profile
+from .project import ProfileError, normalize_project
 from .defaults import (
     DEFAULT_SPECS,
     DELIVER_STRATEGIES,
@@ -280,17 +274,18 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
+    installed_profile_path = _installed_path(gemini_dir, "profile.json")
     if args.upgrade:
         if args.preset is not None or args.profile:
             raise SetupError(
                 "--upgrade 不能与 --preset 或 --profile 同用；重置预设或替换配置时请直接运行 pilot apply"
             )
-        base = read_json_object(_installed_path(gemini_dir, "profile.json"), "已安装的 profile.json")
+        base = read_json_object(installed_profile_path, "已安装的 profile.json")
         if base is None:
             raise SetupError("--upgrade 需要已安装的 profile.json；未找到安装配置")
         reusing_installed = True
-    elif args.preset is None and not args.profile and profile_path.is_file():
-        base = read_json_object(profile_path, "已安装的 profile.json")
+    elif args.preset is None and not args.profile and installed_profile_path.is_file():
+        base = read_json_object(installed_profile_path, "已安装的 profile.json")
         if base is None:
             raise SetupError(
                 "已安装的 profile.json 读取失败；请检查该文件或显式使用 --preset/--profile"
@@ -306,7 +301,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             installed_project = normalize_project(
                 read_json_object(installed_project_path, "project.json")
             )
-        base = _migrate_project_shortcuts(
+        base = migrate_project_shortcuts(
             base,
             installed_project,
             project,
@@ -620,158 +615,6 @@ def _find_ancestor_overlay(start: Path) -> Path | None:
         ),
         None,
     )
-
-
-def _migrate_project_shortcuts(
-    base: dict[str, Any],
-    installed_project: dict[str, Any] | None,
-    project: dict[str, Any] | None,
-    *,
-    explicit_entries: list[str] | None,
-) -> dict[str, Any]:
-    """Keep installed shortcut state valid when the effective project changes.
-
-    Reusing an installed profile must preserve every personal preference while
-    the project tier adds, removes, renames or rebinds shortcut entries. Custom
-    shortcuts that a new overlay now owns become built-in entries, entries the
-    user already decided about keep their decision, and template overrides
-    follow the shortcut identity they were written for.
-    """
-    migrated = copy.deepcopy(base)
-    shortcuts = migrated.get("shortcuts")
-    if not isinstance(shortcuts, dict):
-        return migrated
-    explicit_entry_override = explicit_entries is not None
-    previous_specs = project_specs(installed_project)
-    effective_specs = project_specs(project)
-    previous_order = set(previous_specs["entry_order"])
-    entry_order_set = set(effective_specs["entry_order"])
-    retired_overlay_entries = previous_order - entry_order_set
-    previous_aliases = shortcut_override_aliases(shortcuts, previous_specs)
-    enabled_entry = shortcuts.get("enabled_entry")
-    custom_entry = shortcuts.get("custom_entry")
-
-    # A custom shortcut whose key now names a built-in entry is promoted, so
-    # the user keeps using the same word for the overlay-provided workflow.
-    if isinstance(custom_entry, dict):
-        for key in list(custom_entry):
-            if key not in entry_order_set:
-                continue
-            del custom_entry[key]
-            if (
-                not explicit_entry_override
-                and isinstance(enabled_entry, list)
-                and key not in enabled_entry
-            ):
-                enabled_entry.append(key)
-
-    if retired_overlay_entries and not explicit_entry_override and isinstance(
-        enabled_entry, list
-    ):
-        enabled_entry[:] = [
-            key for key in enabled_entry if key not in retired_overlay_entries
-        ]
-
-    # Recommended entries that a newly attached overlay introduces are adopted;
-    # keys the user already had stay exactly as enabled or disabled.
-    if not explicit_entry_override and isinstance(enabled_entry, list):
-        recommended_enabled = effective_specs["presets"]["recommended"]["shortcuts"].get(
-            "enabled_entry", ()
-        )
-        for key in recommended_enabled:
-            if (
-                key in entry_order_set
-                and key not in previous_order
-                and key not in enabled_entry
-            ):
-                enabled_entry.append(key)
-
-    # Overrides follow the shortcut that owned them in the installed profile,
-    # not whichever shortcut happens to reuse their alias next.
-    template_overrides = shortcuts.get("template_overrides")
-    if isinstance(template_overrides, dict):
-        shortcuts["template_overrides"] = _reconcile_template_overrides(
-            template_overrides,
-            shortcuts,
-            previous_aliases,
-            effective_specs,
-            explicit_entries if explicit_entries is not None else enabled_entry,
-            retired_overlay_entries,
-        )
-    return migrated
-
-
-def _reconcile_template_overrides(
-    template_overrides: dict[Any, Any],
-    shortcuts: dict[str, Any],
-    previous_aliases: dict[str, str],
-    effective_specs: dict[str, Any],
-    effective_enabled_entry: Any,
-    retired_overlay_entries: set[str],
-) -> dict[Any, Any]:
-    """Rebind installed overrides to the shortcut that owned them before.
-
-    An alias can be reused by a different entry after a project switch, so a
-    raw key is resolved against the installed profile first. Overrides whose
-    previous owner is retired are dropped, overrides whose owner survived are
-    re-keyed when only its identity changed, and genuinely invalid keys are
-    left in place for validate_profile to reject.
-    """
-    surviving_aliases = shortcut_override_aliases(
-        {**shortcuts, "enabled_entry": effective_enabled_entry}, effective_specs
-    )
-    surviving_targets = set(surviving_aliases.values())
-    reconciled: dict[Any, Any] = {}
-
-    def has_conflict(target: str, template: Any) -> bool:
-        for existing_key, existing_template in reconciled.items():
-            if existing_template == template:
-                continue
-            if existing_key == target:
-                return True
-            if not isinstance(existing_key, str):
-                continue
-            try:
-                existing_target = resolve_override_alias(existing_key, surviving_aliases)
-            except ProfileError:
-                continue
-            if existing_target == target:
-                return True
-        return False
-
-    def claim(target: str, template: Any) -> None:
-        if has_conflict(target, template):
-            raise ProfileError(
-                f"template_overrides 的多个键指向同一口令 {target} 且模板不同"
-            )
-        reconciled[target] = template
-
-    for raw_key, template in template_overrides.items():
-        if not isinstance(raw_key, str) or not raw_key.strip():
-            reconciled[raw_key] = template
-            continue
-        try:
-            previous_owner = resolve_override_alias(raw_key, previous_aliases)
-            new_owner = resolve_override_alias(raw_key, surviving_aliases)
-        except ProfileError:
-            reconciled[raw_key] = template
-            continue
-        if previous_owner is None:
-            reconciled[raw_key] = template
-        elif (
-            previous_owner in retired_overlay_entries
-            and previous_owner not in surviving_targets
-        ):
-            continue
-        elif new_owner == previous_owner:
-            if has_conflict(previous_owner, template):
-                raise ProfileError(
-                    f"template_overrides 的多个键指向同一口令 {previous_owner} 且模板不同"
-                )
-            reconciled[raw_key] = template
-        else:
-            claim(previous_owner, template)
-    return reconciled
 
 
 def _is_older_committed_overlay(

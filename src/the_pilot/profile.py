@@ -31,7 +31,7 @@ def resolve_profile(
     return validate_profile(merged, project=project)
 
 
-def shortcut_override_aliases(
+def _shortcut_override_aliases(
     shortcuts: dict[str, Any], specs: dict[str, Any]
 ) -> dict[str, str]:
     """Map every alias ``template_overrides`` accepts to its canonical key.
@@ -100,6 +100,135 @@ def _custom_comma_command_id(alias: str, spec: Any = None) -> str:
     return str(provided) if provided else (
         f"CMD_CUSTOM_COMMA_{alias.lstrip(',').upper().replace('-', '_')}"
     )
+
+
+def migrate_project_shortcuts(
+    base: dict[str, Any],
+    installed_project: dict[str, Any] | None,
+    project: dict[str, Any] | None,
+    *,
+    explicit_entries: list[str] | None = None,
+) -> dict[str, Any]:
+    """Keep installed shortcut state valid when the effective project changes.
+
+    Reusing an installed profile must preserve every personal preference while
+    the project tier adds, removes, renames or rebinds shortcut entries. Custom
+    shortcuts that a new overlay now owns become built-in entries, entries the
+    user already decided about keep their decision, and template overrides
+    follow the shortcut identity they were written for.
+    """
+    migrated = copy.deepcopy(base)
+    shortcuts = migrated.get("shortcuts")
+    if not isinstance(shortcuts, dict):
+        return migrated
+    explicit_entry_override = explicit_entries is not None
+    previous_specs = project_specs(installed_project)
+    effective_specs = project_specs(project)
+    previous_order = set(previous_specs["entry_order"])
+    entry_order_set = set(effective_specs["entry_order"])
+    retired_overlay_entries = previous_order - entry_order_set
+    previous_aliases = _shortcut_override_aliases(shortcuts, previous_specs)
+    enabled_entry = shortcuts.get("enabled_entry")
+    custom_entry = shortcuts.get("custom_entry")
+
+    # A custom shortcut whose key now names a built-in entry is promoted, so
+    # the user keeps using the same word for the overlay-provided workflow.
+    if isinstance(custom_entry, dict):
+        for key in list(custom_entry):
+            if key not in entry_order_set:
+                continue
+            del custom_entry[key]
+            if (
+                not explicit_entry_override
+                and isinstance(enabled_entry, list)
+                and key not in enabled_entry
+            ):
+                enabled_entry.append(key)
+
+    if retired_overlay_entries and not explicit_entry_override and isinstance(
+        enabled_entry, list
+    ):
+        enabled_entry[:] = [
+            key for key in enabled_entry if key not in retired_overlay_entries
+        ]
+
+    # Recommended entries that a newly attached overlay introduces are adopted;
+    # keys the user already had stay exactly as enabled or disabled.
+    if not explicit_entry_override and isinstance(enabled_entry, list):
+        recommended_enabled = effective_specs["presets"]["recommended"]["shortcuts"].get(
+            "enabled_entry", ()
+        )
+        for key in recommended_enabled:
+            if (
+                key in entry_order_set
+                and key not in previous_order
+                and key not in enabled_entry
+            ):
+                enabled_entry.append(key)
+
+    # Overrides follow the shortcut that owned them in the installed profile,
+    # not whichever shortcut happens to reuse their alias next.
+    template_overrides = shortcuts.get("template_overrides")
+    if isinstance(template_overrides, dict):
+        shortcuts["template_overrides"] = _reconcile_template_overrides(
+            template_overrides,
+            shortcuts,
+            previous_aliases,
+            effective_specs,
+            explicit_entries if explicit_entries is not None else enabled_entry,
+            retired_overlay_entries,
+        )
+    return migrated
+
+
+def _reconcile_template_overrides(
+    template_overrides: dict[Any, Any],
+    shortcuts: dict[str, Any],
+    previous_aliases: dict[str, str],
+    effective_specs: dict[str, Any],
+    effective_enabled_entry: Any,
+    retired_overlay_entries: set[str],
+) -> dict[Any, Any]:
+    """Rebind installed overrides to the shortcut that owned them before.
+
+    An alias can be reused by a different entry after a project switch, so a
+    raw key is resolved against the installed profile first. Overrides whose
+    previous owner retired are dropped, overrides whose owner survived are
+    re-keyed to that owner, and genuinely invalid keys are left in place for
+    validate_profile to reject.
+    """
+    surviving_aliases = _shortcut_override_aliases(
+        {**shortcuts, "enabled_entry": effective_enabled_entry}, effective_specs
+    )
+    surviving_targets = set(surviving_aliases.values())
+    passthrough: dict[Any, Any] = {}
+    canonical_overrides: dict[str, str] = {}
+    for raw_key, item in template_overrides.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            passthrough[raw_key] = item
+            continue
+        try:
+            previous_owner = _resolve_override_alias(raw_key, previous_aliases)
+            new_owner = _resolve_override_alias(raw_key, surviving_aliases)
+        except ProfileError:
+            passthrough[raw_key] = item
+            continue
+        if previous_owner is None:
+            passthrough[raw_key] = item
+        elif (
+            previous_owner in retired_overlay_entries
+            and previous_owner not in surviving_targets
+        ):
+            if not isinstance(item, str) or not item.strip():
+                passthrough[raw_key] = item
+        elif previous_owner not in surviving_targets:
+            if new_owner is not None:
+                passthrough[previous_owner] = item
+            else:
+                passthrough[raw_key] = item
+        else:
+            _record_override(canonical_overrides, previous_owner, raw_key, item)
+    return {**passthrough, **canonical_overrides}
 
 
 def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -181,7 +310,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     for alias in custom_aliases:
         if alias in entry_aliases:
             raise ProfileError(f"自定义口令 {alias} 与开局口令冲突")
-    override_aliases = shortcut_override_aliases(
+    override_aliases = _shortcut_override_aliases(
         {
             "enabled_entry": enabled_entry,
             "custom_entry": custom_entry,
@@ -362,7 +491,7 @@ def normalize_comma_alias(raw: Any) -> str:
     return text
 
 
-def resolve_override_alias(raw_key: str, aliases: dict[str, str]) -> str | None:
+def _resolve_override_alias(raw_key: str, aliases: dict[str, str]) -> str | None:
     """Resolve one ``template_overrides`` key to its canonical shortcut key.
 
     Whitespace and comma-alias case are normalized exactly as validation does,
@@ -375,6 +504,19 @@ def resolve_override_alias(raw_key: str, aliases: dict[str, str]) -> str | None:
     return aliases.get(lookup)
 
 
+def _record_override(
+    overrides: dict[str, str], canonical: str, raw_key: Any, item: Any
+) -> None:
+    if not isinstance(item, str) or not item.strip():
+        raise ProfileError(f"template_overrides[{raw_key!r}] 必须是非空字符串")
+    template = item.strip()
+    if canonical in overrides and overrides[canonical] != template:
+        raise ProfileError(
+            f"template_overrides 的多个键指向同一口令 {canonical} 且模板不同"
+        )
+    overrides[canonical] = template
+
+
 def _normalize_overrides(value: Any, aliases: dict[str, str]) -> dict[str, str]:
     if value is None:
         return {}
@@ -383,17 +525,10 @@ def _normalize_overrides(value: Any, aliases: dict[str, str]) -> dict[str, str]:
     for raw_key, item in mapping.items():
         if not isinstance(raw_key, str) or not raw_key.strip():
             raise ProfileError("template_overrides 的键必须是非空字符串")
-        canonical = resolve_override_alias(raw_key, aliases)
+        canonical = _resolve_override_alias(raw_key, aliases)
         if canonical is None:
             raise ProfileError(f"template_overrides 指向不存在的口令 {raw_key!r}")
-        if not isinstance(item, str) or not item.strip():
-            raise ProfileError(f"template_overrides[{raw_key!r}] 必须是非空字符串")
-        template = item.strip()
-        if canonical in overrides and overrides[canonical] != template:
-            raise ProfileError(
-                f"template_overrides 的多个键指向同一口令 {canonical} 且模板不同"
-            )
-        overrides[canonical] = template
+        _record_override(overrides, canonical, raw_key, item)
     return overrides
 
 
