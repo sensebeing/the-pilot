@@ -48,6 +48,7 @@ STATE_DIR = Path(
 ).expanduser()
 LOG_PATH = STATE_DIR / "autopilot.log"
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 3600
+_RUNNING_SCRIPT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 MODES = ("gate", "confirm", "off")
@@ -186,16 +187,21 @@ def save_json(path: Path, value: dict[str, Any]) -> bool:
 
 
 def _pilot_binary() -> str:
-    candidate = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN") or shutil.which("pilot") or str(Path.home() / "the-pilot/bin/pilot")
+    override = os.environ.get("ORCA_AUTOPILOT_PILOT_BIN", "").strip()
+    local = Path.home() / "the-pilot/bin/pilot"
+    if override:
+        candidate = override
+    elif (local.parent.parent / ".git").exists() and local.is_file() and os.access(local, os.X_OK):
+        candidate = str(local)
+    else:
+        candidate = shutil.which("pilot") or str(local)
     return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else ""
 
 
 def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
     workspace_paths = payload.get("workspacePaths")
-    if not isinstance(workspace_paths, list) or not workspace_paths:
-        return
-    if not (AUTOPILOT_DIR / "project.json").is_file():
-        return
+    if not isinstance(workspace_paths, list):
+        workspace_paths = []
     if (os.environ.get("ORCA_AUTOPILOT_GEMINI_DIR", "").strip()
             and os.environ.get("ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE", "").strip() != "1"
             and not os.environ.get("ORCA_AUTOPILOT_PILOT_BIN", "").strip()):
@@ -203,19 +209,14 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
     pilot_bin = _pilot_binary()
     if not pilot_bin:
         return
-    workspace = str(workspace_paths[0])
+    workspace = str(workspace_paths[0]) if workspace_paths else ""
+    command = [pilot_bin, "self-update", "--project-only"]
+    if workspace:
+        command.extend(["--workspace", workspace])
+    command.extend(["--gemini-dir", str(GEMINI_DIR), "--json"])
     try:
         result = subprocess.run(
-            [
-                pilot_bin,
-                "self-update",
-                "--project-only",
-                "--workspace",
-                workspace,
-                "--gemini-dir",
-                str(GEMINI_DIR),
-                "--json",
-            ],
+            command,
             capture_output=True,
             text=True,
             timeout=3,
@@ -236,7 +237,7 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
     except ValueError as exc:
         log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
         return
-    if isinstance(receipt, dict) and receipt.get("project_status") == "updated":
+    if isinstance(receipt, dict) and (receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated"):
         log_event("project_auto_synced", workspace=workspace)
 
 
@@ -1313,6 +1314,31 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     maybe_sync_project_overlay(payload)
+    if os.environ.get("ORCA_AUTOPILOT_REEXEC") != "1":
+        updated_engine = AUTOPILOT_DIR / "autopilot.py"
+        try:
+            changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
+        except OSError:
+            changed = False
+        if changed:
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(updated_engine), *sys.argv[1:]],
+                    input=json.dumps(payload, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    env={**os.environ, "ORCA_AUTOPILOT_REEXEC": "1"},
+                )
+                if result.returncode == 0:
+                    try:
+                        return json.loads(result.stdout) if result.stdout.strip() else {}
+                    except ValueError as exc:
+                        log_event("engine_reexec_failed", error=str(exc))
+                else:
+                    log_event("engine_reexec_failed", returncode=result.returncode, error=(result.stderr or result.stdout).strip()[-300:])
+            except (OSError, subprocess.SubprocessError) as exc:
+                log_event("engine_reexec_failed", error=str(exc))
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})

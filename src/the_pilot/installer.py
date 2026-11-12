@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -401,17 +402,48 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
-def _discover_checkout(explicit: str | None) -> tuple[Path | None, bool]:
+def _discover_checkout(explicit: str | None, *, home_dir: Path | None = None) -> tuple[Path | None, bool]:
     if explicit:
         path = Path(explicit).expanduser().resolve()
         if not (path / ".git").exists():
             raise SetupError(f"Checkout directory is not a Git repository: {path}")
         return path, True
-    candidates = [SCRIPTS_DIR.parents[1], Path.home() / "the-pilot"]
+    candidates = [SCRIPTS_DIR.parents[1], (home_dir or Path.home()) / "the-pilot"]
     for path in candidates:
         if (path / ".git").exists():
             return path, False
     return None, False
+
+
+def _compute_source_tree_digest(src_root: Path) -> str:
+    """Hash source Python files and bundled assets deterministically."""
+    digest = hashlib.sha256()
+    if not src_root.is_dir():
+        return digest.hexdigest()
+    files = []
+    for path in src_root.rglob("*"):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        relative = path.relative_to(src_root)
+        if path.suffix == ".py" or relative.parts[:1] == ("assets",):
+            files.append((relative.as_posix(), path))
+    for relative, path in sorted(files):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _installed_uv_package_dir(home_dir: Path) -> Path | None:
+    root = home_dir / ".local/share/uv/tools/the-pilot"
+    matches = sorted(root.glob("lib/python*/site-packages/the_pilot"))
+    return matches[0] if matches else None
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    value = read_json_object(path, path.name)
+    return value if isinstance(value, dict) else {}
 
 
 def _state_dir_for(autopilot_dir: Path) -> Path:
@@ -579,25 +611,64 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
     state_dir.mkdir(parents=True, exist_ok=True)
     if getattr(args, "project_only", False):
         project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, autopilot_dir)
-        return {
+        result = {
             "status": project_status,
             "source_status": "skipped_project_only",
             "project_status": project_status,
+            "local_source_status": "none",
             "head_sha": None,
             "synced_skills": [],
             "error": None,
         }
+        home_dir = Path(args.home_dir).expanduser()
+        checkout, _ = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
+        if checkout is not None and (autopilot_dir / "profile.json").is_file():
+            status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 2)
+            branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 2).strip()
+            if not status.strip() and branch == "main":
+                checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
+                existing = _load_json_object(state_dir / "auto_update.json")
+                source_engine = checkout / "src/the_pilot/assets/autopilot.py"
+                installed_engine = autopilot_dir / "autopilot.py"
+                differs = (
+                    existing.get("installed_tree_digest") != checkout_digest
+                    or (source_engine.is_file() and installed_engine.is_file() and source_engine.read_bytes() != installed_engine.read_bytes())
+                )
+                if differs:
+                    project_path = autopilot_dir / "project.json"
+                    project_args = ["--project", str(project_path)] if project_path.is_file() else ["--no-project"]
+                    apply_command = [sys.executable, str(checkout / "bin/pilot"), "apply", "--upgrade", "--gemini-dir", str(gemini_dir), *project_args, "--json"]
+                    subprocess_run(apply_command, 30)
+                    result["local_source_status"] = "updated"
+                    sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 2).strip()
+                    result["head_sha"] = sha
+                    uv_available = bool(shutil.which("uv"))
+                    pilot_path = home_dir / ".local/bin/pilot"
+                    if uv_available and (pilot_path.exists() or shutil.which("pilot")):
+                        try:
+                            subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                        except OSError:
+                            pass
+                    else:
+                        existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
+                        atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+        return result
+    existing_metadata = _load_json_object(state_dir / "auto_update.json")
     report: dict[str, Any] = {
         "last_checked_at": time.time(), "last_updated_at": None,
         "status": "failed", "source_status": "failed", "project_status": "none",
         "head_sha": None, "synced_skills": [], "error": None,
     }
+    for key in ("last_updated_at", "installed_sha", "installed_tree_digest"):
+        if key in existing_metadata:
+            report[key] = existing_metadata[key]
     with _file_lock(state_dir / "auto_update.lock"):
         try:
             report["project_status"] = _sync_workspace_overlay(
                 getattr(args, "workspace", None), gemini_dir, autopilot_dir
             )
-            checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None))
+            home_dir = Path(args.home_dir).expanduser()
+            checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
             if checkout is not None:
                 status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 20)
                 branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 20).strip()
@@ -613,13 +684,23 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     after_sha = subprocess_run(
                         ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
                     ).strip()
+                    checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
+                    package_dir = _installed_uv_package_dir(home_dir)
+                    uv_needs_reinstall = (
+                        after_sha != before_sha
+                        or existing_metadata.get("installed_sha") != after_sha
+                        or existing_metadata.get("installed_tree_digest") != checkout_digest
+                        or (package_dir is not None and _compute_source_tree_digest(package_dir) != checkout_digest)
+                    )
                     if after_sha != before_sha:
                         report["source_status"] = "updated"
-                        pilot_bin = Path.home() / ".local/bin/pilot"
-                        if not explicit and shutil.which("uv") and (pilot_bin.exists() or shutil.which("pilot")):
-                            subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
                     else:
                         report["source_status"] = "up_to_date"
+                    pilot_bin = home_dir / ".local/bin/pilot"
+                    if uv_needs_reinstall and not explicit and shutil.which("uv") and (pilot_bin.exists() or shutil.which("pilot")):
+                        subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
+                    report["installed_sha"] = after_sha
+                    report["installed_tree_digest"] = checkout_digest
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
             elif not explicit and shutil.which("uv"):
                 uv_out = subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
@@ -630,7 +711,6 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 report["source_status"] = "skipped_no_source"
 
             if checkout is not None:
-                home_dir = Path(args.home_dir).expanduser()
                 for skill_name in ("the-pilot", "the-pilot-setup"):
                     source = checkout / "skills" / skill_name
                     if not source.exists():

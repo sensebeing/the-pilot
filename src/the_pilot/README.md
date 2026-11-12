@@ -22,4 +22,4 @@ Only installer operations perform discovery. Inputs are copied, never mutated.
 
 ### Automatic updates
 
-`pilot self-update` serializes source updates, global skill symlink synchronization, and runtime recompilation while preserving `profile.json` and `project.json`. The runtime invokes it in the background after a six hour cooldown and forwards the workspace path for project overlay synchronization; `pilot status --json` exposes the persisted result.
+`pilot self-update` serializes source updates, global skill symlink synchronization, and runtime recompilation while preserving `profile.json` and `project.json`. Persisted `installed_sha` and `installed_tree_digest` keep the uv tool bundle aligned even when a checkout was pulled outside the updater. The runtime performs a zero-cooldown local checkout check before a turn and, when the installed engine changes, re-executes the updated standalone `autopilot.py` once so the current turn uses the new runtime; background remote checks still use a six hour cooldown, and `pilot status --json` exposes the persisted result.
