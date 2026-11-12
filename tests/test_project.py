@@ -192,6 +192,84 @@ class ProjectTest(unittest.TestCase):
         self.assertIn("shipcheck", result["shortcuts"]["enabled_entry"])
         self.assertNotIn("fb", result["shortcuts"]["enabled_entry"])
 
+    def test_reapply_switches_projects_without_resetting_preferences(self):
+        """Detaching and reattaching an overlay preserves personal preferences.
+
+        Failure means `pilot apply --no-project` or `--project` resets the
+        installed profile, re-enables shortcuts the user disabled, or leaves
+        retired project-only entries and template overrides behind so the next
+        validation fails.
+        """
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+        link = self.gemini / "config/the-pilot/project.json"
+        profile = json.loads(profile_path.read_text())
+        profile["orchestration"]["worker_agents"] = ["codex", "claude"]
+        profile["shortcuts"]["template_overrides"] = {
+            "r": "通用 review {arg}",
+            "fb": "项目反馈 {arg}",
+        }
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--no-project")
+        detached = json.loads(profile_path.read_text())
+        self.assertFalse(link.exists())
+        self.assertEqual(detached["orchestration"]["worker_agents"], ["codex", "claude"])
+        self.assertEqual(
+            detached["shortcuts"]["enabled_entry"], ["r", "rt", "d", "pull"]
+        )
+        self.assertEqual(
+            detached["shortcuts"]["template_overrides"], {"r": "通用 review {arg}"}
+        )
+        self.assertEqual(self.cli("status", "--no-project")["drift"], [])
+
+        detached["shortcuts"]["enabled_entry"].remove("pull")
+        profile_path.write_text(json.dumps(detached))
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        reattached = json.loads(profile_path.read_text())
+        self.assertEqual(
+            reattached["orchestration"]["worker_agents"], ["codex", "claude"]
+        )
+        self.assertEqual(
+            reattached["shortcuts"]["enabled_entry"], ["cq", "fb", "al", "r", "rt", "d"]
+        )
+        self.assertEqual(
+            reattached["shortcuts"]["template_overrides"], {"r": "通用 review {arg}"}
+        )
+        self.assertEqual(self.cli("status")["drift"], [])
+
+    def test_detach_keeps_overrides_shadowed_by_custom_shortcuts(self):
+        """Retiring a project entry must not delete an override a custom shortcut owns.
+
+        Failure means `pilot apply --no-project` removes a template override
+        keyed like the retired entry even though a surviving custom comma
+        command uses the same canonical name.
+        """
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/the-pilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["enabled_entry"].remove("fb")
+        profile["shortcuts"]["custom_comma"] = {
+            "fb": {"template": "自定义反馈流程 {arg}"}
+        }
+        profile["shortcuts"]["template_overrides"] = {"fb": "改后的反馈流程 {arg}"}
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--no-project")
+        detached = json.loads(profile_path.read_text())
+        self.assertEqual(
+            detached["shortcuts"]["template_overrides"], {"fb": "改后的反馈流程 {arg}"}
+        )
+        self.assertEqual(
+            detached["shortcuts"]["custom_comma"]["fb"]["template"],
+            "自定义反馈流程 {arg}",
+        )
+        config = json.loads((self.gemini / "config/the-pilot/config.json").read_text())
+        command = next(
+            item for item in config["comma_commands"].values() if ",fb" in item["aliases"]
+        )
+        self.assertEqual(command["template"], "改后的反馈流程 {arg}")
+
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"
         (repo / ".pilot").mkdir(parents=True)

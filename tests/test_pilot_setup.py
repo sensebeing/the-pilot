@@ -990,6 +990,116 @@ class SetupTest(unittest.TestCase):
         )
         self.assertIn("profile.json 缺失", report["drift"])
 
+    def test_reapply_preserves_installed_profile_without_upgrade(self) -> None:
+        """Bare re-apply keeps personal preferences instead of factory defaults.
+
+        Failure means `pilot apply` (also with `--project`) silently resets
+        worker order, autopilot mode, turn cap, delivery policy, disabled
+        entries, custom shortcuts and template overrides the user already chose.
+        """
+        apply_profile(self.root, self.gemini, "--preset", "recommended")
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        profile["orchestration"]["worker_agents"] = ["codex", "claude"]
+        profile["pilot"]["mode"] = "confirm"
+        profile["pilot"]["max_consecutive_auto_turns"] = 5
+        profile["scenes"]["deliver_strategy"] = "local_verify_only"
+        profile["scenes"]["enable_feedback_email"] = True
+        profile["shortcuts"]["enabled_entry"] = ["cq", "fb", "al", "r", "rt", "d"]
+        profile["shortcuts"]["custom_entry"] = {"req": "request {arg}"}
+        profile["shortcuts"]["custom_comma"] = {
+            "ts": {"template": "先跑最小定向测试", "aliases": [",t1"]}
+        }
+        profile["shortcuts"]["template_overrides"] = {
+            "r": "自定义 review {arg}",
+            "req": "自定义 request {arg}",
+        }
+        write_json(profile_path, profile)
+
+        result = apply_profile(self.root, self.gemini)
+        applied = read_json(profile_path)
+        self.assertEqual(result["preset"], "installed-profile")
+        self.assertEqual(result["worker_agents"], ["codex", "claude"])
+        self.assertEqual(result["mode"], "confirm")
+        self.assertEqual(result["max_consecutive_auto_turns"], 5)
+        self.assertEqual(result["deliver_strategy"], "local_verify_only")
+        self.assertEqual(applied["orchestration"]["worker_agents"], ["codex", "claude"])
+        self.assertEqual(
+            applied["pilot"],
+            {"mode": "confirm", "max_consecutive_auto_turns": 5},
+        )
+        self.assertEqual(applied["scenes"]["deliver_strategy"], "local_verify_only")
+        self.assertTrue(applied["scenes"]["enable_feedback_email"])
+        self.assertEqual(
+            applied["shortcuts"]["enabled_entry"],
+            ["cq", "fb", "al", "r", "rt", "d"],
+        )
+        self.assertEqual(
+            applied["shortcuts"]["custom_entry"]["req"]["template"], "request {arg}"
+        )
+        self.assertEqual(
+            applied["shortcuts"]["custom_comma"]["ts"]["template"],
+            "先跑最小定向测试",
+        )
+        self.assertEqual(
+            applied["shortcuts"]["template_overrides"],
+            {"r": "自定义 review {arg}", "req": "自定义 request {arg}"},
+        )
+        config = read_json(self.gemini / CONFIG_REL)
+        self.assertEqual(config["entry_shortcuts"]["r"]["template"], "自定义 review {arg}")
+        self.assertEqual(
+            config["entry_shortcuts"]["req"]["template"], "自定义 request {arg}"
+        )
+        command = next(
+            item
+            for item in config["comma_commands"].values()
+            if ",ts" in item["aliases"]
+        )
+        self.assertEqual(command["aliases"], [",ts", ",t1"])
+
+    def test_reapply_fails_closed_on_corrupt_installed_profile(self) -> None:
+        """A corrupt installed profile is never treated as absent and overwritten.
+
+        Failure means a bare `pilot apply` silently resets (and destroys) the
+        user's preferences when profile.json cannot be parsed, instead of
+        reporting the parse error while leaving the file untouched.
+        """
+        apply_profile(self.root, self.gemini, "--preset", "recommended")
+        profile_path = self.gemini / PROFILE_REL
+        corrupt = '{"orchestration": '
+        profile_path.write_text(corrupt, encoding="utf-8")
+
+        blocked = run_setup(self.root, self.gemini, "apply")
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("profile.json", blocked.stderr)
+        self.assertEqual(profile_path.read_text(encoding="utf-8"), corrupt)
+
+        recovered = apply_profile(self.root, self.gemini, "--preset", "recommended")
+        self.assertEqual(recovered["preset"], "recommended")
+        self.assertEqual(read_json(profile_path)["pilot"]["mode"], "gate")
+
+    def test_explicit_preset_resets_installed_preferences(self) -> None:
+        """Choosing a preset is the documented reset path for a customized install.
+
+        Failure means users cannot return to a known preset because the
+        installed profile always wins over the explicit `--preset` selection.
+        """
+        apply_profile(self.root, self.gemini, "--preset", "recommended")
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        profile["orchestration"]["worker_agents"] = ["codex", "claude"]
+        profile["pilot"] = {"mode": "off", "max_consecutive_auto_turns": 12}
+        write_json(profile_path, profile)
+
+        result = apply_profile(self.root, self.gemini, "--preset", "conservative")
+        reset = read_json(profile_path)
+        self.assertEqual(result["preset"], "conservative")
+        self.assertEqual(reset["orchestration"]["worker_agents"], ["claude", "codex"])
+        self.assertEqual(
+            reset["pilot"],
+            {"mode": "confirm", "max_consecutive_auto_turns": 4},
+        )
+
     def test_uninstall_removes_only_managed_files(self) -> None:
         self.seed_user_files()
         custom_scene = self.gemini / SCENES_REL / "05-custom.md"

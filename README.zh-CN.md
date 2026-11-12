@@ -209,10 +209,13 @@ pilot status --json
 ```
 
 ```sh
-pilot apply --project /path/to/repo --preset recommended --json
-pilot apply --upgrade --json       # 升级运行时与产物，保留已安装的项目扩展与个人偏好
-pilot apply --no-project --json    # 解除项目扩展绑定，恢复通用默认规格
+pilot apply --project /path/to/repo --preset recommended --json  # 首次安装：显式选择预设
+pilot apply --project /path/to/repo --json  # 重复执行：绑定项目扩展并保留已安装的个人偏好
+pilot apply --upgrade --json       # 以已安装的 profile.json 为基线重编译（该文件必须存在）
+pilot apply --no-project --json    # 解除项目扩展绑定；个人偏好保持不变
 ```
+
+重复执行 `pilot apply`（包括带 `--project` 或 `--no-project`）都会保留已安装的 `profile.json`，个人偏好在项目扩展切换后依然有效；只有 `--preset` 或 `--profile` 会显式重置或替换这些偏好。
 
 ---
 
@@ -235,7 +238,7 @@ pilot apply --no-project --json    # 解除项目扩展绑定，恢复通用默�
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | 只读探测已安装的个人偏好、项目扩展与本机可用的 Agent CLI（`codex`、`claude`、`agy`）。 |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | 只读扫描最近 N 天多 Agent 聊天记录（`antigravity`、`claude`、`codex`、`cursor`），提炼重复输入模式与流水线健康度诊断。 |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块与 `the-pilot` Hook 组。 |
+| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块与 `the-pilot` Hook 组；除非显式传入 `--preset` 或 `--profile`，否则保留已安装的个人偏好。 |
 | `pilot self-update [--project-only] [--workspace <path>] --json` | 在文件排他锁下安全快进 `main`、刷新 CLI 与全局技能软链，并执行 `pilot apply --upgrade`。 |
 | `pilot status [--project <repo>] --json` | 检查安装完整性、当前模式、执行器优先级、`auto_update` 状态与字节级产物漂移（`drift: []`）。 |
 | `pilot uninstall --json` | 移除托管文件、`GEMINI.md` 托管块与 Hook 条目，保留用户其他配置。 |

@@ -31,6 +31,75 @@ def resolve_profile(
     return validate_profile(merged, project=project)
 
 
+def shortcut_override_aliases(
+    shortcuts: dict[str, Any], specs: dict[str, Any]
+) -> dict[str, str]:
+    """Map every alias ``template_overrides`` accepts to its canonical key.
+
+    Accepts fresh normalized sections or raw installed profile state. Values
+    that cannot be read contribute no alias here; validation reports them with
+    a precise error instead of silently treating them as absent shortcuts.
+    """
+    aliases: dict[str, str] = {}
+
+    def add(alias: str, canonical: str) -> None:
+        if alias:
+            aliases.setdefault(alias, canonical)
+
+    enabled_entry = shortcuts.get("enabled_entry")
+    if isinstance(enabled_entry, list):
+        for key in enabled_entry:
+            spec = specs["entry_specs"].get(key) if isinstance(key, str) else None
+            if not isinstance(spec, dict):
+                continue
+            add(key, key)
+            add(f",{key}", key)
+            add(str(spec.get("command_id") or ""), key)
+    custom_entry = shortcuts.get("custom_entry")
+    if isinstance(custom_entry, dict):
+        for key, spec in custom_entry.items():
+            if not isinstance(key, str):
+                continue
+            add(key, key)
+            add(f",{key}", key)
+            add(_custom_entry_command_id(key, spec), key)
+    custom_comma = shortcuts.get("custom_comma")
+    if isinstance(custom_comma, dict):
+        for raw_key, spec in custom_comma.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip().lstrip(",")
+            if not key:
+                continue
+            add(key, key)
+            add(f",{key}", key)
+            add(_custom_comma_command_id(key, spec), key)
+            if isinstance(spec, dict):
+                for alias in spec.get("aliases") or ():
+                    if isinstance(alias, str) and alias.strip():
+                        add(_comma_alias(alias), key)
+    return aliases
+
+
+def _comma_alias(value: str) -> str:
+    text = value.strip().lower()
+    return text if text.startswith(",") else f",{text}"
+
+
+def _custom_entry_command_id(key: str, spec: Any = None) -> str:
+    provided = spec.get("command_id") if isinstance(spec, dict) else None
+    return str(provided) if provided else (
+        f"CMD_CUSTOM_ENTRY_{key.upper().replace('-', '_')}"
+    )
+
+
+def _custom_comma_command_id(alias: str, spec: Any = None) -> str:
+    provided = spec.get("command_id") if isinstance(spec, dict) else None
+    return str(provided) if provided else (
+        f"CMD_CUSTOM_COMMA_{alias.lstrip(',').upper().replace('-', '_')}"
+    )
+
+
 def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a normalized copy of ``raw`` or raise ``ProfileError``."""
     specs = project_specs(project)
@@ -110,24 +179,14 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     for alias in custom_aliases:
         if alias in entry_aliases:
             raise ProfileError(f"自定义口令 {alias} 与开局口令冲突")
-    override_aliases: dict[str, str] = {}
-    for key in enabled_entry:
-        canonical = key
-        override_aliases[key] = canonical
-        override_aliases[f",{key}"] = canonical
-        override_aliases[specs['entry_specs'][key]["command_id"]] = canonical
-    for key, spec in custom_entry.items():
-        canonical = key
-        override_aliases[key] = canonical
-        override_aliases[f",{key}"] = canonical
-        override_aliases[spec["command_id"]] = canonical
-    for key, spec in custom_comma.items():
-        canonical = key
-        override_aliases[key] = canonical
-        override_aliases[f",{key}"] = canonical
-        override_aliases[spec["command_id"]] = canonical
-        for alias in spec["aliases"]:
-            override_aliases[str(alias).lower()] = canonical
+    override_aliases = shortcut_override_aliases(
+        {
+            "enabled_entry": enabled_entry,
+            "custom_entry": custom_entry,
+            "custom_comma": custom_comma,
+        },
+        specs,
+    )
     template_overrides = _normalize_overrides(
         shortcuts.get("template_overrides"), override_aliases
     )
@@ -198,7 +257,7 @@ def _normalize_custom_entries(value: Any, *, project: dict[str, Any] | None = No
         requires_arg = spec.get("requires_arg", "{arg}" in template)
         if not isinstance(requires_arg, bool):
             raise ProfileError(f"custom_entry[{key!r}].requires_arg 必须是布尔值")
-        command_id = f"CMD_CUSTOM_ENTRY_{key.upper().replace('-', '_')}"
+        command_id = _custom_entry_command_id(key)
         if command_id in command_ids:
             raise ProfileError(
                 f"custom_entry 命令身份冲突：{key!r} 与 {command_ids[command_id]!r}"
@@ -265,7 +324,7 @@ def _normalize_custom_comma(
             if entry in aliases:
                 raise ProfileError(f"custom_comma 别名重复：{entry}")
         aliases.update(all_aliases)
-        command_id = f"CMD_CUSTOM_COMMA_{alias.lstrip(',').upper().replace('-', '_')}"
+        command_id = _custom_comma_command_id(alias)
         if command_id in command_ids:
             raise ProfileError(
                 f"custom_comma 命令身份冲突：{alias} 与 {command_ids[command_id]}"

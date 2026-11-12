@@ -36,8 +36,10 @@ To register the skills globally across coding agents, run
 3. Apply the confirmed preferences with `pilot apply --preset recommended
    --project <repo> --profile <json-or-file> --json`. Omit the project flag for
    discovery, or use `--no-project` to explicitly choose universal defaults.
-   Upgrade with `pilot apply --upgrade --json` to retain personal preferences
-   and the installed project link from any directory.
+   Re-running `pilot apply` (also with `--project` or `--no-project`) preserves
+   the installed profile; only `--preset` or `--profile` resets it. Upgrade with
+   `pilot apply --upgrade --json` to recompile from an existing installed
+   `profile.json` and retain the installed project link from any directory.
 4. Run `pilot status --json`; explain any drift. Give a personalized cheatsheet
    of enabled shortcuts, modes, worker selection, sync and recovery.
 

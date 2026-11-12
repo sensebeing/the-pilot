@@ -38,8 +38,10 @@ Do not invent authorization from a scene or change existing write safety gates.
 
 Runtime commands select the installation with `THE_PILOT_GEMINI_DIR`.
 For tests use a temporary root. Never use real user directories as fixtures.
-Project overlays and long-term preferences are managed by `pilot apply`; use
-`pilot apply --upgrade` to recompile an installation without resetting preferences.
+Project overlays and long-term preferences are managed by `pilot apply`;
+re-running it (including with `--project` or `--no-project`) keeps the installed
+`profile.json` unless `--preset` or `--profile` is passed. Use
+`pilot apply --upgrade` to recompile from an existing installed profile.
 The Pilot does not dispatch network work or run background Dealer daemons.
 
 ## Automatic updates
