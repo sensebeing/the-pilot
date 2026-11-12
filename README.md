@@ -209,10 +209,13 @@ Universal mode stays project-neutral (`r`, `rt`, `d`, `pull`). A repository can 
 ```
 
 ```sh
-pilot apply --project /path/to/repo --preset recommended --json
-pilot apply --upgrade --json       # Recompiles runtime and artifacts while preserving installed project overlay
-pilot apply --no-project --json    # Switches back to universal project-neutral defaults
+pilot apply --project /path/to/repo --preset recommended --json  # First install: explicitly choose a preset
+pilot apply --project /path/to/repo --json  # Re-apply: attaches the overlay and keeps installed preferences
+pilot apply --upgrade --json       # Recompiles from the installed profile.json (must exist; cannot be combined with --preset/--profile)
+pilot apply --no-project --json    # Detaches the overlay; personal preferences are preserved
 ```
+
+Re-running `pilot apply` — including with `--project` or `--no-project` — preserves the installed `profile.json`, so your personal preferences survive overlay changes. Only `--preset` or `--profile` explicitly resets or replaces them.
 
 ---
 
@@ -235,7 +238,7 @@ Check update status anytime via `pilot status --json` (`auto_update` field) or t
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | Read-only discovery of installed profile, project overlay, and available agent CLIs (`codex`, `claude`, `agy`). |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | Read-only distillation of recent local agent chat logs (`antigravity`, `claude`, `codex`, `cursor`) into recurring prompt patterns and pipeline health diagnostics. |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, and the `the-pilot` Hook group. |
+| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, and the `the-pilot` Hook group. Installed preferences are preserved unless `--preset` or `--profile` is given. |
 | `pilot self-update [--project-only] [--workspace <path>] --json` | Pull clean `main`, refresh CLI and global skill symlinks, and run `pilot apply --upgrade` under an exclusive file lock. |
 | `pilot status [--project <repo>] --json` | Verify installation health, active mode, worker priority, `auto_update` status, and byte-level artifact drift (`drift: []`). |
 | `pilot uninstall --json` | Remove managed files, `GEMINI.md` managed block, and Hook entries while preserving unrelated user config. |

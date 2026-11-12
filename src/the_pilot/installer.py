@@ -10,7 +10,6 @@ are never touched.
 from __future__ import annotations
 
 import argparse
-import copy
 import fcntl
 import hashlib
 import json
@@ -26,8 +25,8 @@ from typing import Any
 
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
-from .profile import resolve_profile, validate_profile
-from .project import ProfileError, normalize_project, project_specs
+from .profile import migrate_project_shortcuts, resolve_profile, validate_profile
+from .project import ProfileError, normalize_project
 from .defaults import (
     DEFAULT_SPECS,
     DELIVER_STRATEGIES,
@@ -139,11 +138,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="用户主目录（用于定位 ~/.claude、~/.codex、~/.cursor 与 ~/.gemini）",
     )
 
-    apply_parser = subparsers.add_parser("apply", help="编译并原子写入配置")
+    apply_parser = subparsers.add_parser(
+        "apply", help="编译并原子写入配置（默认保留已安装的个人偏好）"
+    )
     add_common_arguments(apply_parser)
-    apply_parser.add_argument("--preset", choices=sorted(DEFAULT_SPECS["presets"]))
-    apply_parser.add_argument("--profile", help="JSON 对象、JSON 文件路径或 @文件路径")
-    apply_parser.add_argument("--upgrade", action="store_true", help="以已安装 profile.json 为基线重编译")
+    apply_parser.add_argument(
+        "--preset",
+        choices=sorted(DEFAULT_SPECS["presets"]),
+        help="显式重置为指定预设；会丢弃已安装 profile.json 中的个人偏好",
+    )
+    apply_parser.add_argument(
+        "--profile",
+        help="JSON 对象、JSON 文件路径或 @文件路径；会显式替换已安装的个人偏好",
+    )
+    apply_parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="以已安装 profile.json 为基线重编译（要求该文件已存在，不能与 --preset/--profile 同用）",
+    )
     apply_parser.add_argument("--mode", choices=MODES)
     apply_parser.add_argument("--max-turns", type=int)
     apply_parser.add_argument("--worker-agents")
@@ -262,28 +274,46 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     gemini_md = gemini_dir / GEMINI_MD_SUBPATH
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
+    installed_profile_path = _installed_path(gemini_dir, "profile.json")
     if args.upgrade:
-        if args.profile:
-            raise SetupError("--upgrade 不能与 --profile 同用；请先完成定制，再单独升级")
-        base = read_json_object(_installed_path(gemini_dir, "profile.json"), "已安装的 profile.json")
+        if args.preset is not None or args.profile:
+            raise SetupError(
+                "--upgrade 不能与 --preset 或 --profile 同用；重置预设或替换配置时请直接运行 pilot apply"
+            )
+        base = read_json_object(installed_profile_path, "已安装的 profile.json")
         if base is None:
             raise SetupError("--upgrade 需要已安装的 profile.json；未找到安装配置")
+        reusing_installed = True
+    elif args.preset is None and not args.profile and installed_profile_path.is_file():
+        base = read_json_object(installed_profile_path, "已安装的 profile.json")
+        if base is None:
+            raise SetupError(
+                "已安装的 profile.json 读取失败；请检查该文件或显式使用 --preset/--profile"
+            )
+        reusing_installed = True
     else:
         base = load_default_profile()
-    installed_project = None
-    if args.upgrade and project is not None:
+        reusing_installed = False
+    if reusing_installed:
+        installed_project = None
         installed_project_path = _installed_path(gemini_dir, "project.json")
         if installed_project_path.is_file():
             installed_project = normalize_project(
                 read_json_object(installed_project_path, "project.json")
             )
-        base = _migrate_upgraded_project_shortcuts(
+        base = migrate_project_shortcuts(
             base,
             installed_project,
             project,
-            explicit_entry_override=args.entry_shortcuts is not None,
+            explicit_entries=(
+                split_list(args.entry_shortcuts, allow_empty=True)
+                if args.entry_shortcuts is not None
+                else None
+            ),
         )
-    preset = args.preset if args.preset is not None else (None if args.upgrade else "recommended")
+    preset = args.preset if args.preset is not None else (
+        None if reusing_installed else "recommended"
+    )
     profile = resolve_profile(
         base, preset=preset, overrides=overrides_from_args(args), project=project
     )
@@ -585,45 +615,6 @@ def _find_ancestor_overlay(start: Path) -> Path | None:
         ),
         None,
     )
-
-
-def _migrate_upgraded_project_shortcuts(
-    base: dict[str, Any],
-    installed_project: dict[str, Any] | None,
-    project: dict[str, Any],
-    *,
-    explicit_entry_override: bool,
-) -> dict[str, Any]:
-    """Migrate user shortcut state when an installed overlay gains entries."""
-    migrated = copy.deepcopy(base)
-    shortcuts = migrated.get("shortcuts")
-    if not isinstance(shortcuts, dict):
-        return migrated
-    custom_entry = shortcuts.get("custom_entry")
-    effective_specs = project_specs(project)
-    entry_order = effective_specs["entry_order"]
-    if isinstance(custom_entry, dict):
-        for key in list(custom_entry):
-            if key not in entry_order:
-                continue
-            del custom_entry[key]
-            enabled_entry = shortcuts.get("enabled_entry")
-            if (
-                not explicit_entry_override
-                and isinstance(enabled_entry, list)
-                and key not in enabled_entry
-            ):
-                enabled_entry.append(key)
-    enabled_entry = shortcuts.get("enabled_entry")
-    if installed_project is not None and not explicit_entry_override and isinstance(enabled_entry, list):
-        previous_order = set(installed_project.get("entry_order", ()))
-        recommended_enabled = effective_specs["presets"]["recommended"]["shortcuts"].get(
-            "enabled_entry", ()
-        )
-        for key in recommended_enabled:
-            if key in entry_order and key not in previous_order and key not in enabled_entry:
-                enabled_entry.append(key)
-    return migrated
 
 
 def _is_older_committed_overlay(

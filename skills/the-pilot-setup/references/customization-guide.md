@@ -28,8 +28,11 @@ conservative uses confirm/4 turns; orchestration-only uses off/no scenes/no entr
 A project may override these presets. User overrides are applied last.
 
 `pilot apply --help` lists individual override flags. `--profile` accepts inline
-JSON, a file, or `@file`; `--upgrade` uses installed preferences and cannot be
-combined with `--profile`. Use `pilot set` for durable template edits, and
+JSON, a file, or `@file`, and explicitly replaces installed preferences;
+`--preset` explicitly resets them to that preset. Otherwise apply reuses an
+installed `profile.json`, so attaching or detaching a project keeps personal
+preferences. `--upgrade` requires an installed `profile.json` and cannot be
+combined with `--preset` or `--profile`. Use `pilot set` for durable template edits, and
 `pilot distill --days 7 --json` (see [distillation-guide.md](distillation-guide.md))
 to discover repeated user prompt patterns across local coding agents before
 proposing custom shortcuts or scene guardrails.
