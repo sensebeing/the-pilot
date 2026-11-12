@@ -211,7 +211,7 @@ pilot status --json
 ```sh
 pilot apply --project /path/to/repo --preset recommended --json  # 首次安装：显式选择预设
 pilot apply --project /path/to/repo --json  # 重复执行：绑定项目扩展并保留已安装的个人偏好
-pilot apply --upgrade --json       # 以已安装的 profile.json 为基线重编译（该文件必须存在）
+pilot apply --upgrade --json       # 以已安装的 profile.json 为基线重编译（该文件必须存在，不能与 --preset/--profile 同用）
 pilot apply --no-project --json    # 解除项目扩展绑定；个人偏好保持不变
 ```
 

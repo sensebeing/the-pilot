@@ -26,7 +26,12 @@ from typing import Any
 
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
-from .profile import resolve_profile, shortcut_override_aliases, validate_profile
+from .profile import (
+    resolve_override_alias,
+    resolve_profile,
+    shortcut_override_aliases,
+    validate_profile,
+)
 from .project import ProfileError, normalize_project, project_specs
 from .defaults import (
     DEFAULT_SPECS,
@@ -155,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--upgrade",
         action="store_true",
-        help="以已安装 profile.json 为基线重编译（要求该文件已存在）",
+        help="以已安装 profile.json 为基线重编译（要求该文件已存在，不能与 --preset/--profile 同用）",
     )
     apply_parser.add_argument("--mode", choices=MODES)
     apply_parser.add_argument("--max-turns", type=int)
@@ -276,8 +281,10 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     hooks_path = gemini_dir / HOOKS_SUBPATH
 
     if args.upgrade:
-        if args.profile:
-            raise SetupError("--upgrade 不能与 --profile 同用；请先完成定制，再单独升级")
+        if args.preset is not None or args.profile:
+            raise SetupError(
+                "--upgrade 不能与 --preset 或 --profile 同用；重置预设或替换配置时请直接运行 pilot apply"
+            )
         base = read_json_object(_installed_path(gemini_dir, "profile.json"), "已安装的 profile.json")
         if base is None:
             raise SetupError("--upgrade 需要已安装的 profile.json；未找到安装配置")
@@ -303,7 +310,11 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             base,
             installed_project,
             project,
-            explicit_entry_override=args.entry_shortcuts is not None,
+            explicit_entries=(
+                split_list(args.entry_shortcuts, allow_empty=True)
+                if args.entry_shortcuts is not None
+                else None
+            ),
         )
     preset = args.preset if args.preset is not None else (
         None if reusing_installed else "recommended"
@@ -616,25 +627,25 @@ def _migrate_project_shortcuts(
     installed_project: dict[str, Any] | None,
     project: dict[str, Any] | None,
     *,
-    explicit_entry_override: bool,
+    explicit_entries: list[str] | None,
 ) -> dict[str, Any]:
     """Keep installed shortcut state valid when the effective project changes.
 
     Reusing an installed profile must preserve every personal preference while
-    the project tier adds, removes or renames shortcut entries. Custom shortcuts
-    that a new overlay now owns become built-in entries, entries the user
-    already decided about keep their decision, and overrides for a project that
-    is no longer installed are retired with it.
+    the project tier adds, removes, renames or rebinds shortcut entries. Custom
+    shortcuts that a new overlay now owns become built-in entries, entries the
+    user already decided about keep their decision, and template overrides
+    follow the shortcut identity they were written for.
     """
     migrated = copy.deepcopy(base)
     shortcuts = migrated.get("shortcuts")
     if not isinstance(shortcuts, dict):
         return migrated
+    explicit_entry_override = explicit_entries is not None
     previous_specs = project_specs(installed_project)
     effective_specs = project_specs(project)
     previous_order = set(previous_specs["entry_order"])
-    entry_order = effective_specs["entry_order"]
-    entry_order_set = set(entry_order)
+    entry_order_set = set(effective_specs["entry_order"])
     retired_overlay_entries = previous_order - entry_order_set
     enabled_entry = shortcuts.get("enabled_entry")
     custom_entry = shortcuts.get("custom_entry")
@@ -653,21 +664,49 @@ def _migrate_project_shortcuts(
             ):
                 enabled_entry.append(key)
 
-    if retired_overlay_entries:
-        if not explicit_entry_override and isinstance(enabled_entry, list):
-            enabled_entry[:] = [
-                key for key in enabled_entry if key not in retired_overlay_entries
-            ]
-        template_overrides = shortcuts.get("template_overrides")
-        if isinstance(template_overrides, dict):
-            surviving_aliases = set(shortcut_override_aliases(shortcuts, effective_specs))
-            retired_aliases: set[str] = set()
-            for key in retired_overlay_entries:
-                retired_aliases.update(
-                    shortcut_override_aliases({"enabled_entry": [key]}, previous_specs)
-                )
-            for alias in retired_aliases - surviving_aliases:
-                template_overrides.pop(alias, None)
+    if retired_overlay_entries and not explicit_entry_override and isinstance(
+        enabled_entry, list
+    ):
+        enabled_entry[:] = [
+            key for key in enabled_entry if key not in retired_overlay_entries
+        ]
+
+    # Overrides follow the shortcut identity they were written for. A key that
+    # no longer resolves under the effective project is retired with its old
+    # overlay, re-keyed when only the entry's command identity changed, or left
+    # for validate_profile to reject when it is genuinely invalid.
+    template_overrides = shortcuts.get("template_overrides")
+    if isinstance(template_overrides, dict):
+        effective_enabled_entry = (
+            explicit_entries if explicit_entries is not None else enabled_entry
+        )
+        surviving_aliases = shortcut_override_aliases(
+            {**shortcuts, "enabled_entry": effective_enabled_entry}, effective_specs
+        )
+        previous_entry_aliases = shortcut_override_aliases(
+            {"enabled_entry": list(previous_specs["entry_order"])}, previous_specs
+        )
+        for raw_key in list(template_overrides):
+            if resolve_override_alias(raw_key, surviving_aliases) is not None:
+                continue
+            previous_target = resolve_override_alias(raw_key, previous_entry_aliases)
+            if previous_target in retired_overlay_entries:
+                del template_overrides[raw_key]
+                continue
+            previous_command_id = (
+                previous_specs["entry_specs"].get(previous_target, {}).get("command_id")
+            )
+            if (
+                previous_target is not None
+                and isinstance(effective_enabled_entry, list)
+                and previous_target in effective_enabled_entry
+                and raw_key.strip() == previous_command_id
+            ):
+                template = template_overrides[raw_key]
+                existing = template_overrides.get(previous_target)
+                if existing is None or existing == template:
+                    del template_overrides[raw_key]
+                    template_overrides[previous_target] = template
 
     # Recommended entries that a newly attached overlay introduces are adopted;
     # keys the user already had stay exactly as enabled or disabled.

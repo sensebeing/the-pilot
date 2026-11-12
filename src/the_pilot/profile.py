@@ -360,6 +360,19 @@ def normalize_comma_alias(raw: Any) -> str:
     return text
 
 
+def resolve_override_alias(raw_key: str, aliases: dict[str, str]) -> str | None:
+    """Resolve one ``template_overrides`` key to its canonical shortcut key.
+
+    Whitespace and comma-alias case are normalized exactly as validation does,
+    so hand-edited installed state and project-switch migration share one
+    resolution rule.
+    """
+    key = raw_key.strip()
+    normalized_key = normalize_comma_alias(key) if key.startswith(",") else key
+    lookup = key if key in aliases else normalized_key
+    return aliases.get(lookup)
+
+
 def _normalize_overrides(value: Any, aliases: dict[str, str]) -> dict[str, str]:
     if value is None:
         return {}
@@ -368,10 +381,7 @@ def _normalize_overrides(value: Any, aliases: dict[str, str]) -> dict[str, str]:
     for raw_key, item in mapping.items():
         if not isinstance(raw_key, str) or not raw_key.strip():
             raise ProfileError("template_overrides 的键必须是非空字符串")
-        key = raw_key.strip()
-        normalized_key = normalize_comma_alias(key) if key.startswith(",") else key
-        lookup = key if key in aliases else normalized_key
-        canonical = aliases.get(lookup)
+        canonical = resolve_override_alias(raw_key, aliases)
         if canonical is None:
             raise ProfileError(f"template_overrides 指向不存在的口令 {raw_key!r}")
         if not isinstance(item, str) or not item.strip():

@@ -211,7 +211,7 @@ Universal mode stays project-neutral (`r`, `rt`, `d`, `pull`). A repository can 
 ```sh
 pilot apply --project /path/to/repo --preset recommended --json  # First install: explicitly choose a preset
 pilot apply --project /path/to/repo --json  # Re-apply: attaches the overlay and keeps installed preferences
-pilot apply --upgrade --json       # Recompiles from the installed profile.json (which must exist)
+pilot apply --upgrade --json       # Recompiles from the installed profile.json (must exist; cannot be combined with --preset/--profile)
 pilot apply --no-project --json    # Detaches the overlay; personal preferences are preserved
 ```
 

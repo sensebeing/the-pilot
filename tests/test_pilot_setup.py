@@ -888,6 +888,15 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(conflict.returncode, 2)
         self.assertIn("--upgrade", conflict.stderr)
 
+        preset_conflict = run_setup(
+            self.root, self.gemini, "apply", "--upgrade", "--preset", "conservative"
+        )
+        self.assertEqual(preset_conflict.returncode, 2)
+        self.assertIn("--upgrade", preset_conflict.stderr)
+        unchanged = read_json(profile_path)
+        self.assertEqual(unchanged["orchestration"]["worker_agents"], ["codex"])
+        self.assertEqual(unchanged["autopilot"]["mode"], "confirm")
+
     def test_upgrade_without_installed_profile_fails(self) -> None:
         result = run_setup(self.root, self.gemini, "apply", "--upgrade")
         self.assertEqual(result.returncode, 2)

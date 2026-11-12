@@ -270,6 +270,89 @@ class ProjectTest(unittest.TestCase):
         )
         self.assertEqual(command["template"], "改后的反馈流程 {arg}")
 
+    def test_detach_prunes_unnormalized_retired_entry_overrides(self):
+        """Hand-edited override keys resolve through the same aliases as validation.
+
+        Failure means `pilot apply --no-project` keeps a raw `,FB ` override that
+        validation resolves to the retired project entry, so clean detachment
+        fails instead of dropping that project-only customization.
+        """
+        self.cli("apply", "--project", str(FIXTURES / "alter-service.json"))
+        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {
+            ",FB ": "手写反馈模板 {arg}",
+            " r ": "通用 review {arg}",
+        }
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--no-project")
+        detached = json.loads(profile_path.read_text())
+        self.assertEqual(
+            detached["shortcuts"]["template_overrides"], {"r": "通用 review {arg}"}
+        )
+        self.assertEqual(self.cli("status", "--no-project")["drift"], [])
+
+    def test_switch_rekeys_overrides_when_entry_command_id_changes(self):
+        """An override written for a shared entry key follows its new command identity.
+
+        Failure means switching between overlays that keep an entry name but
+        change its command_id rejects the installed override instead of
+        re-keying it to the surviving entry.
+        """
+        alpha = dict(self.project, projectId="alpha")
+        alpha["entry_order"] = ["deploy", *self.project["entry_order"]]
+        alpha["entry_specs"] = {
+            "deploy": {
+                "command_id": "CMD_A_DEPLOY",
+                "description": "alpha deploy",
+                "requires_arg": True,
+                "usage": "deploy <arg>",
+                "template": "deploy alpha {arg}",
+            },
+            **self.project["entry_specs"],
+        }
+        alpha["presets"] = {
+            "recommended": {
+                "shortcuts": {
+                    "enabled_entry": [
+                        "deploy",
+                        *self.project["presets"]["recommended"]["shortcuts"][
+                            "enabled_entry"
+                        ],
+                    ]
+                }
+            }
+        }
+        beta = json.loads(json.dumps(alpha))
+        beta["projectId"] = "beta"
+        beta["entry_specs"]["deploy"] = {
+            **alpha["entry_specs"]["deploy"],
+            "command_id": "CMD_B_DEPLOY",
+            "template": "deploy beta {arg}",
+        }
+        alpha_path = self.root / "alpha.json"
+        beta_path = self.root / "beta.json"
+        alpha_path.write_text(json.dumps(alpha))
+        beta_path.write_text(json.dumps(beta))
+
+        self.cli("apply", "--project", str(alpha_path))
+        profile_path = self.gemini / "config/autopilot/profile.json"
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["template_overrides"] = {"CMD_A_DEPLOY": "我的部署 {arg}"}
+        profile_path.write_text(json.dumps(profile))
+
+        self.cli("apply", "--project", str(beta_path))
+        migrated = json.loads(profile_path.read_text())
+        self.assertEqual(
+            migrated["shortcuts"]["template_overrides"], {"deploy": "我的部署 {arg}"}
+        )
+        config = json.loads((self.gemini / "config/autopilot/config.json").read_text())
+        self.assertEqual(
+            config["entry_shortcuts"]["deploy"]["template"], "我的部署 {arg}"
+        )
+        self.assertEqual(self.cli("status")["drift"], [])
+
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"
         (repo / ".pilot").mkdir(parents=True)
