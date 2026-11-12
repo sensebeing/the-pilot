@@ -14,6 +14,55 @@ from the_pilot.assets import autopilot
 
 
 class AutoUpdateTest(unittest.TestCase):
+    def test_project_only_skips_older_clean_worktree_but_updates_dirty_or_newer(self):
+        """Overlay sync compares normalized committed content and protects newer installs."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            repo = root / "repo"
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
+                subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
+            fixture = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
+            fixture["projectId"] = "overlay-test"
+            pilot_dir = repo / ".pilot"
+            pilot_dir.mkdir()
+            (pilot_dir / "project.json").write_text(json.dumps(fixture))
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "v1"], check=True, capture_output=True)
+            older = root / "older-wt"
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", "old-topic", str(older), "HEAD"], check=True, capture_output=True)
+            v2 = dict(fixture, description="v2")
+            (pilot_dir / "project.json").write_text(json.dumps(v2, indent=2) + "\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "v2"], check=True, capture_output=True)
+            gemini = root / "gemini"
+            installer.apply(installer.build_parser().parse_args([
+                "apply", "--gemini-dir", str(gemini), "--project", str(repo), "--json",
+            ]))
+            args = installer.build_parser().parse_args([
+                "self-update", "--project-only", "--workspace", str(older),
+                "--gemini-dir", str(gemini), "--json",
+            ])
+            self.assertEqual(installer.self_update(args)["project_status"], "skipped_older_worktree")
+            installed = json.loads((gemini / "config/autopilot/project.json").read_text())
+            self.assertEqual(installed, installer.normalize_project(v2) if hasattr(installer, "normalize_project") else v2)
+
+            dirty = dict(fixture, description="dirty-v3")
+            (older / ".pilot/project.json").write_text(json.dumps(dirty))
+            self.assertEqual(installer.self_update(args)["project_status"], "updated")
+            self.assertEqual(json.loads((gemini / "config/autopilot/project.json").read_text())["description"], "dirty-v3")
+
+            newer = root / "newer-wt"
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", str(newer), "-b", "new-topic"], check=True, capture_output=True)
+            newest = dict(v2, description="newer-v3")
+            (newer / ".pilot/project.json").write_text(json.dumps(newest, indent=2) + "\n")
+            subprocess.run(["git", "-C", str(newer), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(newer), "commit", "-m", "newer"], check=True, capture_output=True)
+            newer_args = installer.build_parser().parse_args([
+                "self-update", "--project-only", "--workspace", str(newer),
+                "--gemini-dir", str(gemini), "--json",
+            ])
+            self.assertEqual(installer.self_update(newer_args)["project_status"], "updated")
     def test_workspace_overlay_sync_is_invoked_before_runtime_load(self):
         """Matching project IDs sync the workspace overlay on the same turn."""
         with tempfile.TemporaryDirectory() as root:

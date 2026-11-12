@@ -49,6 +49,10 @@ class SetupError(Exception):
     """The requested install cannot be completed safely."""
 
 
+class _OverlayHistoryUnknown(Exception):
+    """Git history was inconclusive, so overlay synchronization must not write."""
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -469,7 +473,9 @@ def _migrate_upgraded_project_shortcuts(
     return migrated
 
 
-def _is_older_committed_overlay(overlay: Path, installed_path: Path) -> bool:
+def _is_older_committed_overlay(
+    overlay: Path, installed_project: dict[str, Any]
+) -> bool:
     """Return whether a clean worktree overlay predates installed content."""
     repo_root = overlay.parent.parent
     if not (repo_root / ".git").exists():
@@ -487,30 +493,49 @@ def _is_older_committed_overlay(overlay: Path, installed_path: Path) -> bool:
             return subprocess.CompletedProcess([], 1, "", "")
 
     status = git("status", "--porcelain", "--", ".pilot/project.json")
-    if status.returncode != 0 or status.stdout.strip():
+    if status.returncode != 0:
+        raise _OverlayHistoryUnknown("无法检查 workspace overlay 工作区状态")
+    if status.stdout.strip():
         return False
     overlay_commit = git("log", "-n", "1", "--format=%H", "HEAD", "--", ".pilot/project.json")
     overlay_sha = overlay_commit.stdout.strip()
     if overlay_commit.returncode != 0 or not overlay_sha:
-        return False
-    installed_blob_result = git("hash-object", str(installed_path))
-    installed_blob = installed_blob_result.stdout.strip()
-    if installed_blob_result.returncode != 0 or not installed_blob:
-        return False
-    if git("cat-file", "-e", installed_blob).returncode != 0:
-        return False
+        raise _OverlayHistoryUnknown("无法定位 workspace overlay 提交")
     commits = git("log", "--all", "-n", "50", "--format=%H", "--", ".pilot/project.json")
     if commits.returncode != 0:
-        return False
-    for commit in commits.stdout.splitlines():
-        commit = commit.strip()
+        raise _OverlayHistoryUnknown("无法读取 workspace overlay Git 历史")
+    commit_list = [item.strip() for item in commits.stdout.splitlines() if item.strip()]
+    if len(commit_list) >= 50:
+        exhaustive = git("log", "--all", "--format=%H", "--", ".pilot/project.json")
+        if exhaustive.returncode != 0:
+            raise _OverlayHistoryUnknown("无法完整读取 workspace overlay Git 历史")
+        commit_list = [item.strip() for item in exhaustive.stdout.splitlines() if item.strip()]
+    seen_blobs: dict[str, dict[str, Any] | None] = {}
+    for commit in commit_list:
         if not commit or commit == overlay_sha:
             continue
         blob = git("rev-parse", f"{commit}:.pilot/project.json")
-        if blob.returncode != 0 or blob.stdout.strip() != installed_blob:
+        blob_sha = blob.stdout.strip()
+        if blob.returncode != 0:
+            raise _OverlayHistoryUnknown("无法读取 workspace overlay 提交对象")
+        if not blob_sha:
+            continue
+        if blob_sha not in seen_blobs:
+            content = git("show", blob_sha)
+            if content.returncode != 0:
+                raise _OverlayHistoryUnknown("无法读取 workspace overlay Git 对象")
+            else:
+                try:
+                    parsed = json.loads(content.stdout)
+                    seen_blobs[blob_sha] = normalize_project(parsed)
+                except (ValueError, ProfileError):
+                    seen_blobs[blob_sha] = None
+        if seen_blobs[blob_sha] != installed_project:
             continue
         if git("merge-base", "--is-ancestor", overlay_sha, commit).returncode == 0:
             return True
+    if not seen_blobs:
+        raise _OverlayHistoryUnknown("workspace overlay 没有可验证的 Git 历史")
     return False
 
 
@@ -530,7 +555,11 @@ def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, autopil
             return "skipped_unmatched_project"
         if workspace_project == installed_project:
             return "up_to_date"
-        if _is_older_committed_overlay(overlay, installed_path):
+        try:
+            older = _is_older_committed_overlay(overlay, installed_project)
+        except _OverlayHistoryUnknown:
+            return "skipped_unknown_worktree"
+        if older:
             return "skipped_older_worktree"
         apply_args = argparse.Namespace(
             command="apply", gemini_dir=str(gemini_dir), project=str(overlay), no_project=False,

@@ -121,6 +121,24 @@ class ProjectTest(unittest.TestCase):
             resolve_profile(profile, project=upgraded)
         self.assertEqual(self.cli("status")["drift"], [])
 
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["enabled_entry"].remove("fb")
+        profile_path.write_text(json.dumps(profile))
+        newer = copy.deepcopy(upgraded)
+        newer["entry_order"] = ["prod", "shipcheck", *upgraded["entry_order"][1:]]
+        newer["entry_specs"] = {
+            "shipcheck": {"command_id": "CMD_SHIPCHECK", "description": "shipcheck", "requires_arg": False, "usage": "shipcheck", "template": "check shipment"},
+            **upgraded["entry_specs"],
+        }
+        newer["presets"]["recommended"]["shortcuts"]["enabled_entry"] = [
+            "prod", "shipcheck", *upgraded["presets"]["recommended"]["shortcuts"]["enabled_entry"][1:]
+        ]
+        overlay.write_text(json.dumps(newer))
+        self.cli("apply", "--project", str(overlay), "--upgrade")
+        result = json.loads(profile_path.read_text())
+        self.assertIn("shipcheck", result["shortcuts"]["enabled_entry"])
+        self.assertNotIn("fb", result["shortcuts"]["enabled_entry"])
+
     def test_discovery_persistence_explicit_override_and_uninstall(self):
         repo = self.root / "repo"
         (repo / ".pilot").mkdir(parents=True)
