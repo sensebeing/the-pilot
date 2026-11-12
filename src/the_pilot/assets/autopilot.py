@@ -1335,10 +1335,13 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                         return json.loads(result.stdout) if result.stdout.strip() else {}
                     except ValueError as exc:
                         log_event("engine_reexec_failed", error=str(exc))
+                        return {"error": "engine_reexec_invalid_output"}
                 else:
                     log_event("engine_reexec_failed", returncode=result.returncode, error=(result.stderr or result.stdout).strip()[-300:])
+                    return {"error": "engine_reexec_failed"}
             except (OSError, subprocess.SubprocessError) as exc:
                 log_event("engine_reexec_failed", error=str(exc))
+                return {"error": "engine_reexec_failed"}
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
