@@ -7,10 +7,18 @@ library script. Do not add a second runtime implementation.
 
 Run `PYTHONPATH=src python3 -m unittest discover -s tests -v` and
 `guard check --repo-root . --base origin/main` with Python 3.11+, then run
-`guard review` before pushing to `main`. Every test must use a temporary
+`guard review --repo-root .` before opening the pull request. Every test must use a temporary
 directory and explicit Gemini-root isolation; never read or write real user
 configuration as test data. New resident tests must explain the stable
 behavioral fact they protect.
+
+## Integration workflow
+
+This repository uses GitHub PR mode (`review.integration_mode=github-pr`): commit changes on a
+topic branch, push it to `origin`, open a GitHub PR with `gh pr create`, review it with
+`guard review --repo-root . --github-pr sensebeing/the-pilot#<number>` (the review is published as
+`the-guard-reviewer[bot]`), and merge with `gh pr merge` rather than pushing directly to `main`.
+The local `pre-push` hook blocks direct pushes to `main`.
 
 ## Engineering Quality Policy
 

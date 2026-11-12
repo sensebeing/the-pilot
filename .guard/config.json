@@ -141,6 +141,7 @@
       "docs/standards/rules/**",
       "skills/**",
       "examples/**"
-    ]
+    ],
+    "integration_mode": "github-pr"
   }
 }
