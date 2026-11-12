@@ -614,9 +614,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = _state_dir_for(autopilot_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     if getattr(args, "project_only", False):
-        project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, autopilot_dir)
         result = {
-            "status": project_status,
+            "status": "none",
             "source_status": "skipped_project_only",
             "project_status": project_status,
             "local_source_status": "none",
@@ -627,6 +626,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         home_dir = Path(args.home_dir).expanduser()
         with _file_lock(state_dir / "auto_update.lock"):
             try:
+                project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, autopilot_dir)
+                result["status"] = result["project_status"] = project_status
                 checkout, _ = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
                 if checkout is not None and (autopilot_dir / "profile.json").is_file():
                     status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 2)
