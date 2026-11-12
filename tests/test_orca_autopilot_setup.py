@@ -472,17 +472,17 @@ class CompilerTest(unittest.TestCase):
         self.assertNotIn("seabass", universal.lower())
         for clause in (
             "提问未答",
-            "同步澄清直接调用 `ask_question` 工具",
-            "同一步不写 autopilot 标签",
-            "悬空 `：`",
-            "异步或跨回合等待回复",
+            "，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；",
+            '异步提问未答或结案输出 `<!-- autopilot: {"scene": "NONE"} -->`',
         ):
             self.assertIn(clause, universal)
 
         bundle = compile_bundle(profile)
         plan_scene = bundle.scenes["01-plan-and-orchestrate.md"]
-        self.assertIn("同步 ask_question 直接发起工具调用、不写标签", plan_scene)
-        self.assertIn("提问待答需结束回合时输出 `scene=NONE`", plan_scene)
+        self.assertIn(
+            "同步提问直接调 `ask_question`（不写标签），异步待答输出 `scene=NONE`",
+            plan_scene,
+        )
         self.assertLess(len(bundle.gemini_block.encode("utf-8")), 20000)
         for preset in sorted(DEFAULT_SPECS["presets"]):
             for strategy in DELIVER_STRATEGIES:
@@ -1879,6 +1879,54 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(text_argument(sends[0]), "继续推进实施")
         self.assertNotIn(
             '"event": "stop_continue_unasked_question"',
+            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+        )
+
+        # An unclosed fenced block ending in `:` is code, not a lead-in.
+        fenced = self.stop_decision(
+            "c-unclosed-fence",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "代码如下：\n```python\nif ready:",
+                },
+            ],
+        )
+        self.assertEqual(fenced["decision"], "allow")
+        self.assertNotIn(
+            "continued_unasked_turn_id", read_state(self.state, "c-unclosed-fence")
+        )
+        self.assertIn(
+            '"event": "stop_invalid_tag", "cid": "c-unclosed-fence", "reason": "missing_tag"',
+            (self.state / "autopilot.log").read_text(encoding="utf-8"),
+        )
+
+    def test_unasked_question_guard_fails_closed_when_state_cannot_persist(self) -> None:
+        # Failure means an unwritable state directory loses the durable
+        # per-user-turn guard yet still returns "continue", allowing a loop.
+        session = "c-state-fail"
+        steps = [
+            {"type": "USER_INPUT", "content": "请给我完整方案"},
+            {"type": "PLANNER_RESPONSE", "content": "请确认以下 2 个问题："},
+        ]
+        seeded = self.stop_decision(session, steps, continuation_active=True)
+        self.assertEqual(seeded["decision"], "allow")
+        self.assertTrue(state_path(self.state, session).is_file())
+
+        # The lock and log files already exist and stay writable; only new
+        # files (the state temp file) fail, so the hook can still log why.
+        self.state.chmod(0o555)
+        try:
+            decision = self.stop_decision(session, steps)
+        finally:
+            self.state.chmod(0o755)
+        self.assertEqual(decision["decision"], "allow")
+        self.assertNotIn(
+            "continued_unasked_turn_id", read_state(self.state, session)
+        )
+        self.assertIn(
+            f'"event": "stop_continue_state_failed", "cid": "{session}"',
             (self.state / "autopilot.log").read_text(encoding="utf-8"),
         )
 

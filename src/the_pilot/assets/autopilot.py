@@ -1507,7 +1507,7 @@ def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
     """
     if planner_step.get("type") != "PLANNER_RESPONSE":
         return False
-    if planner_step.get("tool_calls") or []:
+    if planner_step.get("tool_calls"):
         return False
     if "content" in _truncated_fields(planner_step):
         return False
@@ -1516,6 +1516,8 @@ def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
         return False
     trimmed = content.rstrip()
     if not trimmed:
+        return False
+    if sum(1 for line in trimmed.splitlines() if line.lstrip().startswith("```")) % 2 == 1:
         return False
     last_line = trimmed.splitlines()[-1].strip()
     if not last_line or last_line.startswith("```") or last_line.endswith("```"):
@@ -1598,7 +1600,13 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             ):
                 clear_suggestion(state)
                 state["continued_unasked_turn_id"] = user_turn
-                save_state(conversation_id, state)
+                if not save_state(conversation_id, state):
+                    log_event(
+                        "stop_continue_state_failed",
+                        cid=conversation_id,
+                        turn_id=turn_id,
+                    )
+                    return {"decision": "allow"}
                 log_event(
                     "stop_continue_unasked_question",
                     cid=conversation_id,
