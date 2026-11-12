@@ -30,7 +30,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 guard check --repo-root . --base origin/main
 ```
 
-Commit on your topic branch before independent architecture review:
+Commit on your topic branch and run the independent architecture review before opening the PR:
 
 ```sh
 guard review --repo-root .
@@ -41,4 +41,11 @@ Resolve blocking findings at their architectural root, or supply code and owner-
 
 ## Submit a pull request
 
-Describe the concrete problem, resulting behavior, and verification results. Disclose checks that could not run and unresolved findings. Never include credentials or private session transcripts/logs. Maintainers review contributions and decide when to integrate them; a local review receipt does not replace that decision or grant permission to push to `main`.
+This repository uses GitHub PR mode (`review.integration_mode=github-pr`): changes must be committed on a topic branch, pushed to `origin`, and merged through GitHub rather than pushed directly to `main`. Open the PR and publish the independent review to it:
+
+```sh
+gh pr create --fill
+guard review --repo-root . --github-pr sensebeing/the-pilot#<number>
+```
+
+The review is published as `the-guard-reviewer[bot]`; resolve its findings or supply `--note` evidence and rerun until `GO`. Describe the concrete problem, resulting behavior, and verification results. Disclose checks that could not run and unresolved findings. Never include credentials or private session transcripts/logs. Merge the reviewed PR with `gh pr merge`; the local `pre-push` hook blocks direct pushes to `main`.
