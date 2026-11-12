@@ -348,3 +348,97 @@ class AutoUpdateTest(unittest.TestCase):
                 11,
             )
 
+    def test_self_update_reinstalls_uv_tool_when_head_already_pulled(self):
+        """A pulled-ahead checkout refreshes the uv bundle even when pull changes no commit."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            home = root / "home"
+            checkout = home / "the-pilot"
+            checkout.mkdir(parents=True)
+            shutil = __import__("shutil")
+            shutil.copytree(Path(__file__).parents[1] / "src", checkout / "src")
+            shutil.copytree(Path(__file__).parents[1] / "bin", checkout / "bin")
+            subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-m", "source"], check=True, capture_output=True)
+            bare = root / "origin.git"
+            subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(bare)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "push", "-u", "origin", "main"], check=True, capture_output=True)
+            (home / ".local/bin").mkdir(parents=True)
+            (home / ".local/bin/pilot").write_text("#!/bin/sh\n")
+            (home / ".local/bin/pilot").chmod(0o755)
+            uv_log = root / "uv.log"
+            uv = root / "uv"
+            uv.write_text("#!/bin/sh\necho \"$@\" >> \"$UV_LOG\"\nexit 0\n")
+            uv.chmod(0o755)
+            gemini = root / "gemini"
+            state = gemini / "config/autopilot/state"
+            state.mkdir(parents=True)
+            sha = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            (state / "auto_update.json").write_text(json.dumps({"installed_sha": "old", "installed_tree_digest": "old"}))
+            env = {"HOME": str(root / "process-home"), "PATH": f"{root}:{os.environ['PATH']}", "UV_LOG": str(uv_log)}
+            with mock.patch.dict(os.environ, env, clear=False):
+                args = installer.build_parser().parse_args(["self-update", "--gemini-dir", str(gemini), "--home-dir", str(home), "--no-project", "--json"])
+                installer.self_update(args)
+                report = json.loads((state / "auto_update.json").read_text())
+                self.assertEqual(report["installed_sha"], sha)
+                self.assertIn("tool install --force", uv_log.read_text())
+                uv_log.write_text("")
+                installer.self_update(args)
+                self.assertEqual(uv_log.read_text(), "")
+
+    def test_project_only_zero_cooldown_syncs_clean_main_checkout_and_skips_dirty_or_branch(self):
+        """Project-only sync updates clean main immediately and ignores dirty or feature branches."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            home, gemini = root / "home", root / "gemini"
+            checkout = home / "the-pilot"
+            shutil = __import__("shutil")
+            shutil.copytree(Path(__file__).parents[1], checkout, ignore=shutil.ignore_patterns(".git", ".venv"))
+            subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-m", "source"], check=True, capture_output=True)
+            installer.apply(installer.build_parser().parse_args(["apply", "--gemini-dir", str(gemini), "--no-project", "--json"]))
+            engine = checkout / "src/the_pilot/assets/autopilot.py"
+            engine.write_text(engine.read_text() + "\n# local upgrade marker\n")
+            subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-m", "upgrade"], check=True, capture_output=True)
+            state = gemini / "config/autopilot/state"
+            state.mkdir(parents=True)
+            metadata = {"last_checked_at": time.time()}
+            (state / "auto_update.json").write_text(json.dumps(metadata))
+            args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
+            report = installer.self_update(args)
+            self.assertEqual(report["local_source_status"], "updated")
+            self.assertIn("local upgrade marker", (gemini / "config/autopilot/autopilot.py").read_text())
+            engine.write_text(engine.read_text() + "\n# dirty\n")
+            before = (gemini / "config/autopilot/autopilot.py").read_bytes()
+            self.assertEqual(installer.self_update(args)["local_source_status"], "none")
+            self.assertEqual(before, (gemini / "config/autopilot/autopilot.py").read_bytes())
+            subprocess.run(["git", "-C", str(checkout), "restore", str(engine.relative_to(checkout))], check=True)
+            subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "feature"], check=True, capture_output=True)
+            self.assertEqual(installer.self_update(args)["local_source_status"], "none")
+
+    def test_autopilot_pre_invocation_reexecs_updated_engine_on_same_turn(self):
+        """A changed on-disk engine is delegated once so the current turn uses new behavior."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            gemini = root / "gemini"
+            autopilot_dir = gemini / "config/autopilot"
+            autopilot_dir.mkdir(parents=True)
+            source = Path(__file__).parents[1] / "src/the_pilot/assets/autopilot.py"
+            engine = autopilot_dir / "autopilot.py"
+            engine.write_bytes(source.read_bytes())
+            marker = "\n# reexec marker\n"
+            payload = {"conversationId": "c", "lastUserInput": ",mode status", "workspacePaths": []}
+            with mock.patch.object(autopilot, "AUTOPILOT_DIR", autopilot_dir), mock.patch.object(autopilot, "GEMINI_DIR", gemini), mock.patch.object(autopilot, "maybe_sync_project_overlay", side_effect=lambda _payload: engine.write_text(engine.read_text() + marker)), mock.patch.object(autopilot, "maybe_trigger_auto_update"), mock.patch.object(autopilot, "is_first_invocation_of_turn", return_value=True), mock.patch.object(autopilot, "read_steps", return_value=([], True)), mock.patch.object(autopilot.subprocess, "run") as run:
+                run.return_value = mock.Mock(returncode=0, stdout='{"reexec":true}', stderr="")
+                result = autopilot.handle_pre_invocation(payload)
+            self.assertEqual(result, {"reexec": True})
+            self.assertTrue(any(call.kwargs.get("env", {}).get("ORCA_AUTOPILOT_REEXEC") == "1" for call in run.call_args_list))
+

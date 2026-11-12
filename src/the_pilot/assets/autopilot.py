@@ -213,7 +213,7 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> None:
     command = [pilot_bin, "self-update", "--project-only"]
     if workspace:
         command.extend(["--workspace", workspace])
-    command.extend(["--gemini-dir", str(GEMINI_DIR), "--json"])
+    command.extend(["--home-dir", str(Path.home()), "--gemini-dir", str(GEMINI_DIR), "--json"])
     try:
         result = subprocess.run(
             command,

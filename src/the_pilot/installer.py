@@ -408,7 +408,10 @@ def _discover_checkout(explicit: str | None, *, home_dir: Path | None = None) ->
         if not (path / ".git").exists():
             raise SetupError(f"Checkout directory is not a Git repository: {path}")
         return path, True
-    candidates = [SCRIPTS_DIR.parents[1], (home_dir or Path.home()) / "the-pilot"]
+    if home_dir is not None and home_dir.expanduser().resolve() != Path.home().resolve():
+        candidates = [home_dir.expanduser() / "the-pilot"]
+    else:
+        candidates = [SCRIPTS_DIR.parents[1], Path.home() / "the-pilot"]
     for path in candidates:
         if (path / ".git").exists():
             return path, False
@@ -621,37 +624,49 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             "error": None,
         }
         home_dir = Path(args.home_dir).expanduser()
-        checkout, _ = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
-        if checkout is not None and (autopilot_dir / "profile.json").is_file():
-            status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 2)
-            branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 2).strip()
-            if not status.strip() and branch == "main":
-                checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
-                existing = _load_json_object(state_dir / "auto_update.json")
-                source_engine = checkout / "src/the_pilot/assets/autopilot.py"
-                installed_engine = autopilot_dir / "autopilot.py"
-                differs = (
-                    existing.get("installed_tree_digest") != checkout_digest
-                    or (source_engine.is_file() and installed_engine.is_file() and source_engine.read_bytes() != installed_engine.read_bytes())
-                )
-                if differs:
-                    project_path = autopilot_dir / "project.json"
-                    project_args = ["--project", str(project_path)] if project_path.is_file() else ["--no-project"]
-                    apply_command = [sys.executable, str(checkout / "bin/pilot"), "apply", "--upgrade", "--gemini-dir", str(gemini_dir), *project_args, "--json"]
-                    subprocess_run(apply_command, 30)
-                    result["local_source_status"] = "updated"
-                    sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 2).strip()
-                    result["head_sha"] = sha
-                    uv_available = bool(shutil.which("uv"))
-                    pilot_path = home_dir / ".local/bin/pilot"
-                    if uv_available and (pilot_path.exists() or shutil.which("pilot")):
-                        try:
-                            subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                        except OSError:
-                            pass
-                    else:
-                        existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
-                        atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+        try:
+            checkout, _ = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
+            if checkout is not None and (autopilot_dir / "profile.json").is_file():
+                status = subprocess_run(["git", "-C", str(checkout), "status", "--porcelain"], 2)
+                branch = subprocess_run(["git", "-C", str(checkout), "branch", "--show-current"], 2).strip()
+                if not status.strip() and branch == "main":
+                    checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
+                    existing = _load_json_object(state_dir / "auto_update.json")
+                    source_engine = checkout / "src/the_pilot/assets/autopilot.py"
+                    installed_engine = autopilot_dir / "autopilot.py"
+                    differs = (
+                        existing.get("installed_tree_digest") != checkout_digest
+                        or (source_engine.is_file() and installed_engine.is_file() and source_engine.read_bytes() != installed_engine.read_bytes())
+                    )
+                    if differs:
+                        project_path = autopilot_dir / "project.json"
+                        project_args = ["--project", str(project_path)] if project_path.is_file() else ["--no-project"]
+                        apply_command = [sys.executable, str(checkout / "bin/pilot"), "apply", "--upgrade", "--gemini-dir", str(gemini_dir), *project_args, "--json"]
+                        subprocess_run(apply_command, 30)
+                        result["local_source_status"] = "updated"
+                        sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 2).strip()
+                        result["head_sha"] = sha
+                        uv_available = bool(shutil.which("uv"))
+                        pilot_path = home_dir / ".local/bin/pilot"
+                        is_real_home = home_dir.resolve() == Path.home().resolve()
+                        has_installed_pilot = pilot_path.exists() or (is_real_home and bool(shutil.which("pilot")))
+                        if uv_available and has_installed_pilot:
+                            try:
+                                elapsed = time.time() - float(existing.get("last_checked_at") or 0)
+                            except (TypeError, ValueError):
+                                elapsed = 30
+                            if elapsed >= 30:
+                                existing["last_checked_at"] = time.time()
+                                atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+                                try:
+                                    subprocess.Popen([sys.executable, str(checkout / "bin/pilot"), "self-update", "--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                                except OSError as exc:
+                                    result["error"] = str(exc)
+                        else:
+                            existing.update({"installed_sha": sha, "installed_tree_digest": checkout_digest})
+                            atomic_write_text(state_dir / "auto_update.json", json_text(existing))
+        except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
+            result["error"] = str(exc)
         return result
     existing_metadata = _load_json_object(state_dir / "auto_update.json")
     report: dict[str, Any] = {
@@ -697,7 +712,9 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     else:
                         report["source_status"] = "up_to_date"
                     pilot_bin = home_dir / ".local/bin/pilot"
-                    if uv_needs_reinstall and not explicit and shutil.which("uv") and (pilot_bin.exists() or shutil.which("pilot")):
+                    is_real_home = home_dir.resolve() == Path.home().resolve()
+                    has_installed_pilot = pilot_bin.exists() or (is_real_home and bool(shutil.which("pilot")))
+                    if uv_needs_reinstall and not explicit and shutil.which("uv") and has_installed_pilot:
                         subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
                     report["installed_sha"] = after_sha
                     report["installed_tree_digest"] = checkout_digest
