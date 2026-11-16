@@ -1614,9 +1614,19 @@ def emit_osc_7501(frame: str) -> bool:
                 return False
             fd = os.open(target, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
         try:
+            if not is_override:
+                # The path may be replaced between stat and open: re-check the
+                # descriptor actually opened before writing escape bytes.
+                opened = os.fstat(fd)
+                if not stat.S_ISCHR(opened.st_mode) or opened.st_uid != os.getuid():
+                    log_event("osc_status_target_rejected", target=str(target))
+                    return False
             written = 0
             while written < len(data):
-                written += os.write(fd, data[written:])
+                count = os.write(fd, data[written:])
+                if count <= 0:
+                    raise OSError("short_osc_write")
+                written += count
         finally:
             os.close(fd)
     except (OSError, ValueError) as exc:

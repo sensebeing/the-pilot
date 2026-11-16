@@ -4226,6 +4226,89 @@ class OscTargetResolutionTest(unittest.TestCase):
             self.assertFalse(runtime.emit_osc_7501(""))
         resolve.assert_not_called()
 
+    def test_production_target_rechecks_the_opened_descriptor(self) -> None:
+        """A target swapped between stat and open is rejected after opening.
+
+        Failure means a replaced path could let escape bytes reach a regular
+        file or another user's device even though the pre-open check passed.
+        resident-fact: status: 生产目标在 `os.open` 后用 `fstat` 复核字符设备与
+        所有者，不一致时记录 `osc_status_target_rejected`、关闭描述符且不写入。
+        """
+        target = self.root / "swapped-tty"
+        log = self.root / "state" / "pilot.log"
+        owned_char = os.stat_result(
+            (stat.S_IFCHR | 0o600, 0, 0, 0, os.getuid(), 0, 0, 0, 0, 0)
+        )
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == os.fspath(target):
+                return owned_char
+            return real_stat(path, *args, **kwargs)
+
+        cases = (
+            (
+                "not-character",
+                os.stat_result(
+                    (stat.S_IFREG | 0o600, 0, 0, 0, os.getuid(), 0, 0, 0, 0, 0)
+                ),
+            ),
+            (
+                "wrong-owner",
+                os.stat_result(
+                    (stat.S_IFCHR | 0o600, 0, 0, 0, os.getuid() + 1, 0, 0, 0, 0, 0)
+                ),
+            ),
+        )
+        for label, opened in cases:
+            with self.subTest(case=label):
+                if log.exists():
+                    log.unlink()
+                with self.isolated_env(), mock.patch.object(
+                    runtime, "_resolve_osc_target", return_value=(target, False)
+                ), mock.patch.object(
+                    runtime, "STATE_DIR", log.parent
+                ), mock.patch.object(
+                    runtime, "LOG_PATH", log
+                ), mock.patch.object(
+                    runtime.os, "stat", side_effect=fake_stat
+                ), mock.patch.object(
+                    runtime.os, "open", return_value=99
+                ), mock.patch.object(
+                    runtime.os, "fstat", return_value=opened
+                ), mock.patch.object(
+                    runtime.os, "close"
+                ) as close, mock.patch.object(
+                    runtime.os, "write"
+                ) as write:
+                    self.assertFalse(runtime.emit_osc_7501(runtime.OSC_7501_DONE))
+                write.assert_not_called()
+                close.assert_called_once_with(99)
+                self.assertIn(
+                    "osc_status_target_rejected", log.read_text(encoding="utf-8")
+                )
+
+    def test_zero_byte_write_is_logged_not_spun(self) -> None:
+        """A write that reports zero bytes fails instead of looping forever.
+
+        Failure means a degenerate terminal write can spin the hook and block
+        every turn end.
+        resident-fact: status: `os.write` 返回 0 时立即以 `short_osc_write`
+        失败并记录 `osc_status_write_failed`，不重试自旋。
+        """
+        target = self.root / "short-write.log"
+        log = self.root / "state" / "pilot.log"
+        with self.isolated_env(THE_PILOT_OSC_TARGET=str(target)), mock.patch.object(
+            runtime, "STATE_DIR", log.parent
+        ), mock.patch.object(runtime, "LOG_PATH", log), mock.patch.object(
+            runtime.os, "write", return_value=0
+        ) as write:
+            self.assertFalse(runtime.emit_osc_7501(runtime.OSC_7501_DONE))
+        self.assertEqual(write.call_count, 1)
+        record = log.read_text(encoding="utf-8")
+        self.assertIn("osc_status_write_failed", record)
+        self.assertIn("short_osc_write", record)
+
 
 if __name__ == "__main__":
     unittest.main()
