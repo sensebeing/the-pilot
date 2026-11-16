@@ -1394,6 +1394,8 @@ def clear_suggestion(state: dict[str, Any]) -> None:
             "auto_submitted_text": "",
         }
     )
+    if state.get("delivery_status") not in {"pending", "unknown"}:
+        state["delivery_status"] = "none"
 
 
 def orca_binary() -> str:
@@ -1775,6 +1777,10 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 cid=conversation_id,
                 status=previous_status,
             )
+        if state.get("delivery_status") not in {"pending", "unknown"}:
+            # A confirmed new turn starts from no delivery decision. Pending
+            # or unknown stays frozen until a manual input clears it above.
+            state["delivery_status"] = "none"
         state["auto_submitted_text"] = ""
         candidates = state.get("candidates") or []
         candidate_turn = str(state.get("candidate_turn_id") or "")
@@ -1926,6 +1932,21 @@ def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
     return last_line.endswith(("：", ":"))
 
 
+def _osc_frame_for_delivery_status(status: str) -> str:
+    """Map one persisted delivery state to the OSC 7501 frame it implies.
+
+    This is the only owner of that decision: `accepted` already pressed Enter
+    for the next turn, so the pane keeps working; pending/unknown/prefilled
+    states may own the composer and must hold orchestration mail; every
+    settled state frees it.
+    """
+    if status == "accepted":
+        return ""
+    if status in {"pending", "unknown", "prefilled", "prefill_unknown"}:
+        return OSC_7501_WAITING_QUESTION
+    return OSC_7501_DONE
+
+
 def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Decide the Stop hook action and the OSC 7501 frame it implies.
 
@@ -1991,7 +2012,9 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 current=current_user_turn,
                 incoming=user_turn,
             )
-            return {"decision": "allow"}, OSC_7501_DONE
+            # A newer PreInvocation already claimed this pane as working; an
+            # obsolete Stop must never overwrite that active turn's status.
+            return {"decision": "allow"}, ""
         state["current_user_turn_id"] = user_turn
         turn_steps = current_turn_steps(steps)
         unsettled_reason = ask_question_unsettled_reason(turn_steps)
@@ -2013,15 +2036,12 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 turn_id=turn_id,
                 status=str(state.get("delivery_status") or ""),
             )
-            if state.get("delivery_status") in {"pending", "unknown"} or (
-                bool(state.get("candidates"))
-                and current_mode(profile) in {"gate", "confirm"}
-                and state.get("delivery_status") != "accepted"
-            ):
-                # The composer may still hold a draft or an unconfirmed
-                # delivery: arriving mail must not press Enter into it.
-                return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
-            return {"decision": "allow"}, OSC_7501_DONE
+            return (
+                {"decision": "allow"},
+                _osc_frame_for_delivery_status(
+                    str(state.get("delivery_status") or "")
+                ),
+            )
 
         planners = [step for step in turn_steps if step.get("type") == "PLANNER_RESPONSE"]
         if not planners:
@@ -2118,9 +2138,13 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             if not handle:
                 state["last_settled_turn_id"] = turn_id
                 state["auto_submitted_text"] = ""
+                state["delivery_status"] = "none"
                 save_state(conversation_id, state)
                 log_event("auto_submit_no_terminal", cid=conversation_id, scene=scene)
-                return {"decision": "allow"}, OSC_7501_DONE
+                return (
+                    {"decision": "allow"},
+                    _osc_frame_for_delivery_status(state["delivery_status"]),
+                )
             previous_count = int(state.get("consecutive_auto_turns") or 0)
             previous_text = str(state.get("auto_submitted_text") or "")
             state["consecutive_auto_turns"] = previous_count + 1
@@ -2144,13 +2168,10 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 state["delivery_status"] = "unknown"
                 log_event("auto_submit_unknown", cid=conversation_id, scene=scene)
             save_state(conversation_id, state)
-            if outcome == "accepted":
-                # The next turn was just submitted with Enter, so the agent is
-                # already working again and must not claim an idle terminal.
-                return {"decision": "allow"}, ""
-            if outcome == "rejected":
-                return {"decision": "allow"}, OSC_7501_DONE
-            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
+            return (
+                {"decision": "allow"},
+                _osc_frame_for_delivery_status(state["delivery_status"]),
+            )
         # The cap (or a pause) is the decision for this turn: keep the auto
         # count and mark the turn settled so a repeated Stop cannot upgrade
         # the pause into an auto-submit. Only a confirmed new user turn
@@ -2164,13 +2185,17 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 prefill_outcome = send_to_terminal(handle, primary, enter=False)
                 if prefill_outcome != "accepted":
                     log_event("prefill_not_accepted", cid=conversation_id, scene=scene)
+        state["delivery_status"] = {
+            "accepted": "prefilled",
+            "unknown": "prefill_unknown",
+            "rejected": "rejected",
+        }.get(prefill_outcome, "none")
         log_event("prefilled_only", cid=conversation_id, scene=scene, gate=gate, mode=mode)
         save_state(conversation_id, state)
-        if prefill_outcome in {"accepted", "unknown"}:
-            # The composer holds an unconfirmed prefilled draft; mailbox
-            # pointers must not append text and Enter into it.
-            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
-        return {"decision": "allow"}, OSC_7501_DONE
+        return (
+            {"decision": "allow"},
+            _osc_frame_for_delivery_status(state["delivery_status"]),
+        )
 
 
 def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:

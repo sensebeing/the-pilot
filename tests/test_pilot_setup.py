@@ -3152,8 +3152,12 @@ class EngineTest(unittest.TestCase):
 
         self.pre("c-unknown", "我自己接手")
         state = read_state(self.state, "c-unknown")
-        self.assertEqual(state["delivery_status"], "cleared")
+        # A confirmed new turn resets the authoritative delivery status; the
+        # freeze release itself is still recorded for the previous turn.
+        self.assertEqual(state["delivery_status"], "none")
         self.assertEqual(state["consecutive_auto_turns"], 0)
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("delivery_state_cleared", log)
 
         self.stop("c-unknown", suggestion("继续推进", gate="auto"))
         self.assertEqual(len(send_calls(self.root)), 2)
@@ -3995,6 +3999,230 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(
             target.read_text(encoding="utf-8"),
             runtime.OSC_7501_WAITING_QUESTION + runtime.OSC_7501_DONE,
+        )
+
+    def test_osc_stale_stop_never_overwrites_active_working_status(self) -> None:
+        """An obsolete Stop leaves the newer turn's working status untouched.
+
+        Failure means a late Stop from a previous transcript can flip the pane
+        to done while the newer turn is still running.
+        resident-fact: status: stop_stale_turn 返回空帧，绝不覆盖新回合的
+        `state=working`。
+        """
+        target = self.root / "osc-stale.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+        old_transcript = write_transcript(
+            self.root,
+            "osc-stale-old.jsonl",
+            [
+                {"type": "USER_INPUT", "content": "turn1"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": suggestion("继续推进", gate="auto"),
+                },
+            ],
+        )
+        self.pre("c-osc-stale", "turn1", extra_env=env)
+        self.pre("c-osc-stale", "turn2", extra_env=env)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING * 2
+        )
+
+        stale = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(
+                "c-osc-stale",
+                transcriptPath=str(old_transcript),
+                terminationReason="NO_TOOL_CALL",
+                fullyIdle=True,
+                workspacePaths=[str(self.workspace)],
+            ),
+            extra_env=env,
+        )
+        self.assertEqual(stale.returncode, 0, stale.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING * 2
+        )
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        self.assertIn("stop_stale_turn", log)
+
+    def test_osc_duplicate_stop_after_auto_submit_stays_working(self) -> None:
+        """A duplicate Stop on an accepted auto-submitted turn stays silent.
+
+        Failure means the duplicate Stop overwrites the working state of the
+        next turn that the accepted Enter already started.
+        resident-fact: status: `delivery_status=accepted` 的重复 Stop 返回空帧。
+        """
+        target = self.root / "osc-dup-auto.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+        transcript = write_transcript(
+            self.root,
+            "osc-dup-auto.jsonl",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": suggestion("继续推进", gate="auto"),
+                },
+            ],
+        )
+        body = payload(
+            "c-osc-dup-auto",
+            transcriptPath=str(transcript),
+            terminationReason="NO_TOOL_CALL",
+            fullyIdle=True,
+            workspacePaths=[str(self.workspace)],
+        )
+        for attempt in ("initial", "duplicate"):
+            result = run_engine(
+                self.root,
+                self.gemini,
+                self.state,
+                "hook",
+                "--event",
+                "Stop",
+                stdin=body,
+                extra_env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(target.exists(), attempt)
+        state = read_state(self.state, "c-osc-dup-auto")
+        self.assertEqual(state["delivery_status"], "accepted")
+        self.assertEqual(len(send_calls(self.root)), 1)
+
+    def test_osc_repeated_stop_reports_each_prefill_outcome(self) -> None:
+        """Every prefill outcome persists a status that a repeated Stop preserves.
+
+        Failure means a duplicate Stop reports done while an unconfirmed draft
+        still owns the composer, or holds mail after an explicit rejection.
+        resident-fact: status: prefilled/prefill_unknown 保持 blocked:question；
+        rejected/none 报告 done，重复 Stop 与首次一致。
+        """
+        cases = (
+            ("accepted", {}, runtime.OSC_7501_WAITING_QUESTION),
+            (
+                "unknown",
+                {"FAKE_SEND_RESULT": "invalid"},
+                runtime.OSC_7501_WAITING_QUESTION,
+            ),
+            ("rejected", {"FAKE_SEND_ACCEPTED": "0"}, runtime.OSC_7501_DONE),
+            ("no-terminal", {"FAKE_TERMINAL_COUNT": "2"}, runtime.OSC_7501_DONE),
+        )
+        for label, extra, expected in cases:
+            with self.subTest(outcome=label):
+                session = f"c-osc-repeat-{label}"
+                target = self.root / f"osc-repeat-{label}.log"
+                transcript = write_transcript(
+                    self.root,
+                    f"transcript-{session}.jsonl",
+                    [
+                        {"type": "USER_INPUT", "content": "开始"},
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "content": suggestion("继续推进实施", gate="pause"),
+                        },
+                    ],
+                )
+                body = payload(
+                    session,
+                    transcriptPath=str(transcript),
+                    terminationReason="NO_TOOL_CALL",
+                    fullyIdle=True,
+                    workspacePaths=[str(self.workspace)],
+                )
+                env = {"THE_PILOT_OSC_TARGET": str(target), **extra}
+                for attempt, expected_frames in (
+                    ("initial", expected),
+                    ("repeated", expected * 2),
+                ):
+                    result = run_engine(
+                        self.root,
+                        self.gemini,
+                        self.state,
+                        "hook",
+                        "--event",
+                        "Stop",
+                        stdin=body,
+                        extra_env=env,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        expected_frames,
+                        attempt,
+                    )
+
+    def test_osc_new_turn_prefill_after_auto_submit_holds_mail(self) -> None:
+        """A prior accepted auto-submit never masks the next turn's prefill.
+
+        Failure means the persisted `accepted` status from the previous turn
+        makes the new turn's initial and repeated Stop look like a working
+        turn, so Orca presses Enter into the unconfirmed draft.
+        resident-fact: status: 上一回合 accepted 自动投递后，新回合 gate=pause
+        预填的首次与重复 Stop 都报告 blocked:question。
+        """
+        target = self.root / "osc-handoff.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+
+        auto = self.stop(
+            "c-osc-handoff",
+            suggestion("继续推进实施", gate="auto"),
+            extra_env=env,
+        )
+        self.assertEqual(auto.returncode, 0, auto.stderr)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            read_state(self.state, "c-osc-handoff")["delivery_status"], "accepted"
+        )
+
+        self.pre("c-osc-handoff", "继续推进实施", extra_env=env)
+        self.assertEqual(
+            read_state(self.state, "c-osc-handoff")["delivery_status"], "none"
+        )
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING
+        )
+
+        first = self.stop(
+            "c-osc-handoff",
+            suggestion("继续推进实施", gate="pause"),
+            extra_env=env,
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(
+            read_state(self.state, "c-osc-handoff")["delivery_status"], "prefilled"
+        )
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            runtime.OSC_7501_WORKING + runtime.OSC_7501_WAITING_QUESTION,
+        )
+
+        transcript = self.root / "transcript-c-osc-handoff.jsonl"
+        repeated = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(
+                "c-osc-handoff",
+                transcriptPath=str(transcript),
+                terminationReason="NO_TOOL_CALL",
+                fullyIdle=True,
+                workspacePaths=[str(self.workspace)],
+            ),
+            extra_env=env,
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            runtime.OSC_7501_WORKING + runtime.OSC_7501_WAITING_QUESTION * 2,
         )
 
     def test_status_reports_active_mode_scenes_and_hook_group(self) -> None:
