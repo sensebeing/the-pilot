@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .defaults import is_comma_alias, DELIVER_STRATEGIES, is_entry_key, LEGACY_PROFILE_SCHEMA, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
+from .defaults import COORDINATOR_AGENT_ALIASES, COORDINATOR_AGENTS, is_comma_alias, DELIVER_STRATEGIES, is_entry_key, LEGACY_PROFILE_SCHEMA, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
 from .project import ProfileError, project_specs
 
 
@@ -315,7 +315,11 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     pilot = _require_mapping(profile.get("pilot"), "pilot")
     scenes = _require_mapping(profile.get("scenes"), "scenes")
     shortcuts = _require_mapping(profile.get("shortcuts"), "shortcuts")
-    _reject_unknown(orchestration, ("worker_agents", "review_agents"), "orchestration")
+    _reject_unknown(
+        orchestration,
+        ("coordinator_agent", "worker_agents", "review_agents"),
+        "orchestration",
+    )
     _reject_unknown(pilot, ("mode", "max_consecutive_auto_turns"), "pilot")
     _reject_unknown(
         scenes,
@@ -357,6 +361,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         "orchestration.worker_agents",
         allowed=WORKER_AGENT_ORDER,
     )
+    coordinator_agent = _coordinator_agent(orchestration.get("coordinator_agent"))
     review_agents = _string_list(
         orchestration.get("review_agents"),
         "orchestration.review_agents",
@@ -398,6 +403,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     return {
         "schema": PROFILE_SCHEMA,
         "orchestration": {
+            "coordinator_agent": coordinator_agent,
             "worker_agents": worker_agents,
             "review_agents": review_agents,
         },
@@ -417,6 +423,25 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             },
         },
     }
+
+
+def _coordinator_agent(value: Any) -> str:
+    """Normalize the Tier-1 primary agent, defaulting an absent key to AGY.
+
+    Installed profiles written before the two-tier contract carry no
+    ``coordinator_agent``; they must keep validating while normalizing to the
+    one supported native coordinator.
+    """
+    if value is None:
+        return COORDINATOR_AGENTS[0]
+    if isinstance(value, str):
+        normalized = COORDINATOR_AGENT_ALIASES.get(value.strip().lower())
+        if normalized is not None:
+            return normalized
+    raise ProfileError(
+        f"orchestration.coordinator_agent 必须是 {list(COORDINATOR_AGENTS)} 之一"
+        f"（兼容 'antigravity'），实际为 {value!r}"
+    )
 
 
 def _normalize_pilot_section(profile: dict[str, Any]) -> dict[str, Any]:

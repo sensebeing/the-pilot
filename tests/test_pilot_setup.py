@@ -9,6 +9,7 @@ resident-fact: admission: 只有同回合已回答的同步提问才放行预填
 """
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -142,6 +143,24 @@ def apply_profile(root: Path, gemini: Path, *args: str) -> dict:
     return json.loads(result.stdout)
 
 
+def run_setup_default(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run a default HOME install without redirecting ``~/.gemini``."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SETUP_SCRIPT),
+            *args,
+            "--project",
+            str(PROJECT_PATH),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        env=base_env(root),
+        timeout=60,
+    )
+
+
 def engine_env(root: Path, gemini: Path, state: Path, extra: dict | None = None) -> dict[str, str]:
     env = base_env(root)
     env["THE_PILOT_GEMINI_DIR"] = str(gemini)
@@ -168,6 +187,21 @@ def run_engine(
         capture_output=True,
         text=True,
         env=engine_env(root, gemini, state, extra_env),
+        timeout=30,
+    )
+
+
+def run_default_engine(
+    root: Path, gemini: Path, state: Path, *args: str
+) -> subprocess.CompletedProcess:
+    """Run the installed engine where ``~/.gemini`` is the default install."""
+    env = engine_env(root, gemini, state)
+    env.pop("THE_PILOT_GEMINI_DIR", None)
+    return subprocess.run(
+        [sys.executable, str(gemini / ENGINE_REL), *args],
+        capture_output=True,
+        text=True,
+        env=env,
         timeout=30,
     )
 
@@ -479,6 +513,113 @@ class CompilerTest(unittest.TestCase):
             < text.index(profile_compiler.GEMINI_END),
             True,
         )
+
+    def test_coordinator_agent_normalizes_and_legacy_profiles_default_to_agy(self) -> None:
+        # Failure means an installed profile without coordinator_agent stops
+        # validating, or a non-AGY value silently becomes the Tier-1 primary.
+        legacy = copy.deepcopy(self.base)
+        legacy["orchestration"].pop("coordinator_agent", None)
+        normalized = resolve_profile(legacy, preset=None)
+        self.assertEqual(normalized["orchestration"]["coordinator_agent"], "agy")
+        for value in ("agy", "antigravity", " Antigravity "):
+            with self.subTest(value=value):
+                profile = resolve_profile(
+                    self.base,
+                    preset=None,
+                    overrides={"orchestration": {"coordinator_agent": value}},
+                )
+                self.assertEqual(
+                    profile["orchestration"]["coordinator_agent"], "agy"
+                )
+        for value in ("claude", "codex", "gemini", ""):
+            with self.subTest(value=value):
+                with self.assertRaises(ProfileError):
+                    resolve_profile(
+                        self.base,
+                        preset=None,
+                        overrides={"orchestration": {"coordinator_agent": value}},
+                    )
+
+    def test_two_tier_guidance_survives_worker_hot_switch(self) -> None:
+        # Failure means the Tier-1 AGY / Tier-2 worker contract, cross-repo
+        # callback, or `,worker` slot rewriting is missing or diverges from a
+        # fresh compile.
+        profile = resolve_profile(self.base, preset="recommended")
+        section = profile_compiler.render_orchestration_section(profile)
+        for required in (
+            "Tier-1 主会话",
+            "Tier-2 子会话",
+            "agy --dangerously-skip-permissions",
+            "agy-switch",
+            "magpie agy",
+            "trustedWorkspaces",
+            "严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话",
+            'worker-start --spec "<任务契约>" --worktree current --agent claude --json',
+            'worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent claude --setup run --json',
+            'worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent claude --setup run --json',
+            "worker-start --worktree path:<子工作区路径> --terminal <handle>",
+            "worker_done",
+        ):
+            self.assertIn(required, section)
+        for initial, target in (
+            (["claude", "codex"], ["codex", "claude"]),
+            (["claude"], ["claude", "codex"]),
+            (["codex"], ["codex", "claude"]),
+        ):
+            with self.subTest(initial=initial, target=target):
+                block = profile_compiler.render_orchestration_block(
+                    resolve_profile(
+                        self.base,
+                        preset=None,
+                        overrides={"orchestration": {"worker_agents": initial}},
+                    )
+                )
+                expected = profile_compiler.render_orchestration_block(
+                    resolve_profile(
+                        self.base,
+                        preset=None,
+                        overrides={"orchestration": {"worker_agents": target}},
+                    )
+                )
+                self.assertEqual(
+                    runtime.update_orchestration_guidance(block, target), expected
+                )
+
+    def test_orchestration_block_merge_preserves_prose_and_strips_cleanly(self) -> None:
+        # Failure means install/uninstall rewrites unrelated global agent
+        # prose, appends a second managed block, or guesses at malformed markers.
+        block = profile_compiler.render_orchestration_block(
+            resolve_profile(self.base, preset=None)
+        )
+        existing = "# 我的全局规则\n\n始终使用中文。\n"
+        merged = profile_compiler.merge_orchestration_md(existing, block)
+        self.assertTrue(merged.startswith(existing))
+        self.assertIn(profile_compiler.ORCHESTRATION_BEGIN, merged)
+        self.assertIn(profile_compiler.ORCHESTRATION_END, merged)
+        self.assertEqual(profile_compiler.merge_orchestration_md(merged, block), merged)
+        self.assertEqual(profile_compiler.strip_orchestration_md(merged), existing)
+        self.assertEqual(profile_compiler.merge_orchestration_md("", block), block)
+        embedded = "before\n\n" + block + "\nafter\n"
+        self.assertEqual(
+            profile_compiler.merge_orchestration_md(embedded, block), embedded
+        )
+        self.assertEqual(
+            profile_compiler.strip_orchestration_md(embedded), "before\n\nafter\n"
+        )
+        for malformed in (
+            profile_compiler.ORCHESTRATION_BEGIN + "\n",
+            profile_compiler.ORCHESTRATION_END + "\n",
+            profile_compiler.ORCHESTRATION_END
+            + "\n"
+            + profile_compiler.ORCHESTRATION_BEGIN
+            + "\n",
+            block + block,
+        ):
+            with self.subTest(malformed=malformed[:40]):
+                with self.assertRaises(ValueError):
+                    profile_compiler.merge_orchestration_md(malformed, block)
+                with self.assertRaises(ValueError):
+                    profile_compiler.strip_orchestration_md(malformed)
 
     def test_compiled_guidance_separates_synchronous_and_async_questions(self) -> None:
         # Failure means the guidance again conflates an in-turn synchronous
@@ -3709,6 +3850,142 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(report["mode"], "gate")
         self.assertEqual(len(report["scenes"]), 4)
         self.assertTrue(report["hooks_group"])
+
+
+class GlobalGuidanceTest(unittest.TestCase):
+    """Default-install ownership of Claude Code and Codex global guidance."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+        self.home = self.root / "home"
+        self.gemini = self.home / ".gemini"
+        self.state = self.root / "state"
+        fake_orca(self.root)
+        self.guidance = {
+            self.home
+            / ".claude/CLAUDE.md": "# Claude 全局规则\n\n保留 Claude 用户规则。\n",
+            self.home
+            / ".codex/AGENTS.md": "# Codex 全局规则\n\n保留 Codex 用户规则。\n",
+        }
+
+    def seed_guidance(self) -> None:
+        for path, text in self.guidance.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+
+    def default_apply(self, *args: str) -> dict:
+        result = run_setup_default(self.root, "apply", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_default_install_syncs_and_uninstalls_managed_blocks(self) -> None:
+        # Failure means a default install leaves stale global guidance behind,
+        # status hides that drift, or uninstall deletes unrelated user prose.
+        self.seed_guidance()
+        self.default_apply("--preset", "recommended")
+        for path, original in self.guidance.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(original, text)
+            self.assertIn(profile_compiler.ORCHESTRATION_BEGIN, text)
+            self.assertIn(profile_compiler.ORCHESTRATION_END, text)
+            self.assertIn("Tier-1 主会话", text)
+            self.assertIn("agy --dangerously-skip-permissions", text)
+        report = json.loads(run_setup_default(self.root, "status").stdout)
+        self.assertEqual(report["drift"], [], report["drift"])
+
+        tampered = next(iter(self.guidance))
+        text = tampered.read_text(encoding="utf-8")
+        tampered.write_text(
+            text.replace("Tier-1 主会话", "Tier-1 已被篡改"), encoding="utf-8"
+        )
+        drift = json.loads(run_setup_default(self.root, "status").stdout)["drift"]
+        self.assertTrue(any(".claude/CLAUDE.md" in item for item in drift), drift)
+
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, original in self.guidance.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn(profile_compiler.ORCHESTRATION_BEGIN, text)
+            self.assertNotIn(profile_compiler.ORCHESTRATION_END, text)
+            self.assertEqual(text, original)
+
+    def test_worker_switch_refreshes_managed_blocks_without_drift(self) -> None:
+        # Failure means `,worker codex` leaves stale Tier-1/Tier-2 slots in the
+        # managed global blocks, or runtime rewriting disagrees with recompiling.
+        self.seed_guidance()
+        self.default_apply("--preset", "recommended")
+        result = run_default_engine(
+            self.root, self.gemini, self.state, "worker", "codex", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["worker_agents"], ["codex", "claude"])
+        for path, original in self.guidance.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(original, text)
+            self.assertIn("Orca Orchestration：Codex > Claude Code", text)
+            self.assertIn(
+                'worker-start --spec "<任务契约>" --worktree new-child --repo '
+                "path:<目标仓库根> --name <name> --agent codex --setup run --json",
+                text,
+            )
+        report = json.loads(run_setup_default(self.root, "status").stdout)
+        self.assertEqual(report["drift"], [], report["drift"])
+
+    def test_explicit_gemini_dir_leaves_global_guidance_untouched(self) -> None:
+        # Failure means a sandboxed apply, uninstall, or status reads or edits
+        # the user's real Claude Code / Codex global guidance.
+        self.seed_guidance()
+        sandbox = self.root / "sandbox-gemini"
+        apply_profile(self.root, sandbox, "--preset", "recommended")
+        for path, original in self.guidance.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+        report = json.loads(run_setup(self.root, sandbox, "status").stdout)
+        self.assertEqual(report["drift"], [], report["drift"])
+        result = run_setup(self.root, sandbox, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, original in self.guidance.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_gemini_dir_env_override_leaves_global_guidance_untouched(self) -> None:
+        # Failure means an environment-redirected root is mistaken for the
+        # default install and edits the user's global agent guidance.
+        self.seed_guidance()
+        sandbox = self.root / "env-gemini"
+        env = base_env(self.root)
+        env["THE_PILOT_GEMINI_DIR"] = str(sandbox)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SETUP_SCRIPT),
+                "apply",
+                "--preset",
+                "recommended",
+                "--project",
+                str(PROJECT_PATH),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, original in self.guidance.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_upgrade_normalizes_profile_without_coordinator_agent(self) -> None:
+        # Failure means an installed profile written before the two-tier
+        # contract cannot upgrade, or its coordinator agent stays undefined.
+        self.default_apply("--preset", "recommended")
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        profile["orchestration"].pop("coordinator_agent", None)
+        write_json(profile_path, profile)
+        self.default_apply("--upgrade")
+        upgraded = read_json(profile_path)
+        self.assertEqual(upgraded["orchestration"]["coordinator_agent"], "agy")
 
 
 if __name__ == "__main__":

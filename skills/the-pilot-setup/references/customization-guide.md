@@ -15,7 +15,8 @@ apply deletes a previous link. Probe and status never write the link.
 
 ## Profile dimensions
 
-- `orchestration`: ordered `worker_agents` and `review_agents`.
+- `orchestration`: Tier-1 `coordinator_agent` (fixed to native `agy`, accepting
+  the `antigravity` alias) plus ordered `worker_agents` and `review_agents`.
 - `pilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (`1..50`).
 - `scenes`: enabled scenes, delivery strategy, feedback notification preference,
   and additional guardrails. An overlay defines what the notification preference
@@ -45,8 +46,11 @@ proposing custom shortcuts or scene guardrails.
 - Unknown delivery: inspect `pilot log`, then explicitly request recovery.
 - Invalid overlay/profile: fix its reported contract error; nothing is installed.
 - Worker priority updates are locked and persistent; isolated roots do not sync
-  other real client configuration files. Existing conversations load changes at
-  their next PreInvocation, including after a new compaction checkpoint.
+  other real client configuration files. A default `$HOME/.gemini` install also
+  maintains the managed `THE_PILOT_ORCHESTRATION` block in `~/.claude/CLAUDE.md`
+  and `~/.codex/AGENTS.md`; an explicit `--gemini-dir` or environment override
+  never touches them. Existing conversations load changes at their next
+  PreInvocation, including after a new compaction checkpoint.
 
 The installer locks the profile and writes each file via same-directory atomic
 replacement. This is not a multi-file transaction; rerun a valid apply after a

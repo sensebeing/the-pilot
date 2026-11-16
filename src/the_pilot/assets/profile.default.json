@@ -1,6 +1,7 @@
 {
   "schema": "the-pilot-profile/v1",
   "orchestration": {
+    "coordinator_agent": "agy",
     "worker_agents": [
       "claude",
       "codex"

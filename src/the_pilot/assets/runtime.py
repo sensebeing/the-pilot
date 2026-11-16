@@ -77,6 +77,8 @@ GEMINI_BEGIN = "<!-- BEGIN THE_PILOT_PROFILE -->"
 GEMINI_END = "<!-- END THE_PILOT_PROFILE -->"
 SCENES_BEGIN = "<!-- BEGIN THE_PILOT_SCENES -->"
 SCENES_END = "<!-- END THE_PILOT_SCENES -->"
+ORCHESTRATION_BEGIN = "<!-- BEGIN THE_PILOT_ORCHESTRATION -->"
+ORCHESTRATION_END = "<!-- END THE_PILOT_ORCHESTRATION -->"
 LEGACY_GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
 LEGACY_GEMINI_END = "<!-- END ORCA_AUTOPILOT_PROFILE -->"
 LEGACY_SCENES_BEGIN = "<!-- BEGIN AUTOPILOT SCENES -->"
@@ -537,6 +539,30 @@ def replace_worker_guidance(text: str, workers: list[str]) -> str:
     return text
 
 
+def update_orchestration_guidance(text: str, workers: list[str]) -> str | None:
+    """Refresh worker slots inside the managed block, or a legacy unmanaged file.
+
+    A single valid marker pair scopes the rewrite so unrelated user prose is
+    never touched. A file without markers keeps the legacy whole-file rewrite;
+    duplicate or malformed markers return ``None`` so the caller fails closed
+    instead of guessing which section the tool owns.
+    """
+    begins = _find_all_positions(text, ORCHESTRATION_BEGIN)
+    ends = _find_all_positions(text, ORCHESTRATION_END)
+    if not begins and not ends:
+        return replace_worker_guidance(text, workers)
+    if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
+        log_event("orchestration_block_ambiguous")
+        return None
+    start = begins[0] + len(ORCHESTRATION_BEGIN)
+    end = ends[0]
+    return (
+        text[:start]
+        + replace_worker_guidance(text[start:end], workers)
+        + text[end:]
+    )
+
+
 def _profile_block_bounds(text: str) -> tuple[int, int] | None:
     """Return the profile block content bounds, accepting one legacy block."""
     blocks: list[tuple[int, int]] = []
@@ -595,8 +621,12 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
                     and GEMINI_DIR.resolve() == (Path.home() / ".gemini").resolve()):
                 for path in (Path.home() / ".claude/CLAUDE.md", Path.home() / ".codex/AGENTS.md"):
                     if path.is_file():
-                        text = replace_worker_guidance(path.read_text(encoding="utf-8"), new_workers)
-                        prepared.append((path, text))
+                        guidance = update_orchestration_guidance(
+                            path.read_text(encoding="utf-8"), new_workers
+                        )
+                        if guidance is None:
+                            return False, old_workers, updated
+                        prepared.append((path, guidance))
         except (OSError, UnicodeError) as exc:
             log_event("worker_guidance_read_failed", error=str(exc))
             return False, old_workers, updated

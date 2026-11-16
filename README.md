@@ -184,7 +184,7 @@ If your repository has a `.pilot/project.json` overlay, pass `--project /path/to
 
 | Dimension | Profile keys | Supported values and defaults | What it governs |
 | --- | --- | --- | --- |
-| 1. Orchestration | `worker_agents`<br>`review_agents` | Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Coordinator (design & review) vs. Dispatched Worker (branch implementation) separation, child-worktree isolation, and worker priority. |
+| 1. Orchestration | `coordinator_agent`<br>`worker_agents`<br>`review_agents` | Coordinator: `agy` (alias `antigravity`)<br>Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Tier-1 native AGY Coordinator (design & review) vs. Tier-2 Dispatched Workers (branch implementation), child-worktree isolation, cross-repo callbacks, and worker priority. |
 | 2. Pilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..50` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
 | 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | Strategies: `merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
 | 4. Shortcuts | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | Universal entries: `r`, `rt`, `d`, `pull`<br>Plus project entries and custom aliases | Short aliases expanded on `PreInvocation` into full review, design, or workflow prompts. |

@@ -4,6 +4,8 @@ Notable changes are recorded here. Version numbers follow [Semantic Versioning](
 
 ## Unreleased
 
+- Codified the two-tier Orca orchestration contract: Tier-1 top-level workspaces always run the native AGY coordinator (`agy --dangerously-skip-permissions`, `trustedWorkspaces` registration, never `claude`/`codex`), while Tier-2 child workers run through `orca orchestration worker-start` and report via `worker_done`; cross-repo callbacks use `--worktree new-child --repo path:<root>`. The profile accepts a normalized `orchestration.coordinator_agent` (`agy`, alias `antigravity`) and defaults legacy profiles to `agy`.
+- A default `$HOME/.gemini` install now owns a `<!-- BEGIN/END THE_PILOT_ORCHESTRATION -->` block in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`, keeping `pilot apply`, `pilot status` drift, `uninstall`, and `,worker` hot-switching in sync; explicit `--gemini-dir` or `THE_PILOT_GEMINI_DIR` installs never touch those files.
 - Renamed the runtime and installed layout to canonical `the-pilot` identifiers: `<gemini-dir>/config/the-pilot/runtime.py`, the `the-pilot-profile/v1` schema, the `pilot` profile section, the `the-pilot` hook group, `<!-- pilot: ... -->` tags, `,pilot recover`, and `THE_PILOT_*` environment variables.
 - `pilot apply --upgrade` now performs a one-way migration of a legacy `config/autopilot` install (profile, project overlay, session state, custom scenes) and removes the legacy hook group; sessions opened before the rename keep working through transitional tag and recovery-command compatibility.
 
