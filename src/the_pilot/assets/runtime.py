@@ -1777,9 +1777,9 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 cid=conversation_id,
                 status=previous_status,
             )
-        if state.get("delivery_status") not in {"pending", "unknown"}:
-            # A confirmed new turn starts from no delivery decision. Pending
-            # or unknown stays frozen until a manual input clears it above.
+        elif state.get("delivery_status") not in {"pending", "unknown"}:
+            # A confirmed new turn starts from no delivery decision, except a
+            # freeze just recovered above, whose `cleared` stays authoritative.
             state["delivery_status"] = "none"
         state["auto_submitted_text"] = ""
         candidates = state.get("candidates") or []

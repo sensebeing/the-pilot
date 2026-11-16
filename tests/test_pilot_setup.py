@@ -3152,9 +3152,7 @@ class EngineTest(unittest.TestCase):
 
         self.pre("c-unknown", "我自己接手")
         state = read_state(self.state, "c-unknown")
-        # A confirmed new turn resets the authoritative delivery status; the
-        # freeze release itself is still recorded for the previous turn.
-        self.assertEqual(state["delivery_status"], "none")
+        self.assertEqual(state["delivery_status"], "cleared")
         self.assertEqual(state["consecutive_auto_turns"], 0)
         log = (self.state / "pilot.log").read_text(encoding="utf-8")
         self.assertIn("delivery_state_cleared", log)
