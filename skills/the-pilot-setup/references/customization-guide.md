@@ -48,7 +48,7 @@ proposing custom shortcuts or scene guardrails.
 - Worker priority updates are locked and persistent; isolated roots do not sync
   other real client configuration files. A default `$HOME/.gemini` install also
   maintains the managed `THE_PILOT_ORCHESTRATION` block in `~/.claude/CLAUDE.md`
-  and `~/.codex/AGENTS.md`; an explicit `--gemini-dir` or environment override
+  and `~/.codex/AGENTS.md`; a resolved install root other than `$HOME/.gemini`
   never touches them. Existing conversations load changes at their next
   PreInvocation, including after a new compaction checkpoint.
 

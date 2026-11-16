@@ -326,7 +326,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
 
     merged_gemini = profile_compiler.merge_gemini_md(current_gemini, bundle.gemini_block)
     merged_hooks = profile_compiler.merge_hooks_json(hooks, str(engine_path))
-    global_guidance = _merged_global_guidance(args, bundle.profile_json, gemini_dir)
+    global_guidance = _merged_global_guidance(bundle.profile_json, gemini_dir)
     stale_scenes = [
         name
         for name in BUILTIN_SCENE_FILES
@@ -388,28 +388,30 @@ def _installed_path(gemini_dir: Path, name: str) -> Path:
     return legacy if legacy.exists() else canonical
 
 
-def default_install_home(args: argparse.Namespace, gemini_dir: Path) -> Path | None:
+def default_install_home(gemini_dir: Path) -> Path | None:
     """Return the home dir of the resolved default install, else ``None``.
 
     Only the install rooted at ``$HOME/.gemini`` owns the agent products'
-    global guidance. The decision is made from the resolved install root, so
-    every entry point (apply, status, uninstall, self-update, auto-upgrade)
-    classifies the same installation identically. A redirected root such as an
-    explicit ``--gemini-dir /tmp/sandbox`` or the environment override is a
-    sandboxed install, which must never read or write the real ``~/.claude``
-    or ``~/.codex`` files.
+    global guidance. The decision is made from the resolved install root and
+    the resolved user home, so every entry point (apply, status, uninstall,
+    self-update, auto-upgrade, runtime ``,worker``) classifies the same
+    installation identically. ``self-update --home-dir`` is the skill-link
+    root, not an install-scope signal. A redirected root such as an explicit
+    ``--gemini-dir /tmp/sandbox`` or the environment override is a sandboxed
+    install, which must never read or write the real ``~/.claude`` or
+    ``~/.codex`` files.
     """
-    home = Path(os.path.expanduser(getattr(args, "home_dir", "~"))).resolve()
+    home = Path.home().resolve()
     if gemini_dir.resolve() != (home / ".gemini").resolve():
         return None
     return home
 
 
 def _merged_global_guidance(
-    args: argparse.Namespace, profile: dict[str, Any], gemini_dir: Path
+    profile: dict[str, Any], gemini_dir: Path
 ) -> list[tuple[Path, str]]:
     """Render the managed orchestration block into existing agent files."""
-    home_dir = default_install_home(args, gemini_dir)
+    home_dir = default_install_home(gemini_dir)
     if home_dir is None:
         return []
     block = profile_compiler.render_orchestration_block(profile)
@@ -429,10 +431,10 @@ def _merged_global_guidance(
 
 
 def _stripped_global_guidance(
-    args: argparse.Namespace, gemini_dir: Path
+    gemini_dir: Path,
 ) -> tuple[list[tuple[Path, str]], list[str]]:
     """Remove the managed orchestration block from existing agent files."""
-    home_dir = default_install_home(args, gemini_dir)
+    home_dir = default_install_home(gemini_dir)
     if home_dir is None:
         return [], []
     removals: list[tuple[Path, str]] = []
@@ -453,10 +455,10 @@ def _stripped_global_guidance(
 
 
 def _global_guidance_drift(
-    args: argparse.Namespace, profile: dict[str, Any], gemini_dir: Path
+    profile: dict[str, Any], gemini_dir: Path
 ) -> list[str]:
     """Report agent files whose managed orchestration block is stale."""
-    home_dir = default_install_home(args, gemini_dir)
+    home_dir = default_install_home(gemini_dir)
     if home_dir is None:
         return []
     block = profile_compiler.render_orchestration_block(profile)
@@ -589,7 +591,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
 
     existing_config = read_json_object(config_path, "config.json") or {}
     bundle = profile_compiler.compile_bundle(profile, project=project)
-    report["drift"].extend(_global_guidance_drift(args, bundle.profile_json, gemini_dir))
+    report["drift"].extend(_global_guidance_drift(bundle.profile_json, gemini_dir))
     report.update(
         {
             "mode": bundle.profile_json["pilot"]["mode"],
@@ -1066,7 +1068,7 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         or (legacy_dir / LEGACY_ENGINE_NAME).is_file()
     )
     removed: list[str] = []
-    global_guidance, global_labels = _stripped_global_guidance(args, gemini_dir)
+    global_guidance, global_labels = _stripped_global_guidance(gemini_dir)
     hooks = read_json_object(hooks_path, "hooks.json")
     if hooks is not None and (HOOK_GROUP in hooks or LEGACY_HOOK_GROUP in hooks):
         for group in (HOOK_GROUP, LEGACY_HOOK_GROUP):

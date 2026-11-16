@@ -5057,6 +5057,38 @@ class GlobalGuidanceTest(unittest.TestCase):
                 path.read_text(encoding="utf-8"),
             )
 
+    def test_self_update_home_dir_is_not_a_guidance_root(self) -> None:
+        # Failure means `self-update --home-dir` (documented as the skill-link
+        # root) reclassifies the same default install, so guidance is skipped
+        # or redirected away from the resolved default home.
+        self.seed_guidance()
+        self.default_apply("--preset", "recommended")
+        self.strip_managed_blocks()
+        skill_root = self.root / "skill-root"
+        skill_root.mkdir()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.home),
+                "THE_PILOT_GEMINI_DIR": "",
+                "ORCA_AUTOPILOT_GEMINI_DIR": "",
+            },
+        ), mock.patch.object(
+            installer, "_discover_checkout", return_value=(None, False)
+        ):
+            args = installer.build_parser().parse_args(
+                ["self-update", "--local-only", "--home-dir", str(skill_root), "--json"]
+            )
+            report = installer.self_update(args)
+        self.assertEqual(report["status"], "skipped_no_source", report)
+        for path in self.guidance:
+            self.assertIn(
+                profile_compiler.ORCHESTRATION_BEGIN,
+                path.read_text(encoding="utf-8"),
+            )
+        self.assertFalse((skill_root / ".claude/CLAUDE.md").exists())
+        self.assertFalse((skill_root / ".codex/AGENTS.md").exists())
+
     def test_self_update_with_checkout_syncs_global_guidance(self) -> None:
         # Failure means the checkout re-apply passes --gemini-dir explicitly and
         # is then mistaken for a sandbox, skipping the managed blocks.
