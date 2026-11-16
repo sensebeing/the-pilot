@@ -78,6 +78,8 @@ GEMINI_BEGIN = "<!-- BEGIN THE_PILOT_PROFILE -->"
 GEMINI_END = "<!-- END THE_PILOT_PROFILE -->"
 SCENES_BEGIN = "<!-- BEGIN THE_PILOT_SCENES -->"
 SCENES_END = "<!-- END THE_PILOT_SCENES -->"
+ORCHESTRATION_BEGIN = "<!-- BEGIN THE_PILOT_ORCHESTRATION -->"
+ORCHESTRATION_END = "<!-- END THE_PILOT_ORCHESTRATION -->"
 LEGACY_GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
 LEGACY_GEMINI_END = "<!-- END ORCA_AUTOPILOT_PROFILE -->"
 LEGACY_SCENES_BEGIN = "<!-- BEGIN AUTOPILOT SCENES -->"
@@ -224,6 +226,27 @@ def save_text(path: Path, text: str) -> bool:
         return True
     except OSError as exc:
         log_event("text_write_failed", path=str(path), error=str(exc))
+        return False
+
+
+def save_user_text(path: Path, text: str) -> bool:
+    """Rewrite an existing user-owned file, keeping its symlink target and mode."""
+    try:
+        target = path.resolve(strict=True)
+        mode = stat.S_IMODE(target.stat().st_mode)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            os.chmod(temporary, mode)
+            os.replace(temporary, target)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        return True
+    except OSError as exc:
+        log_event("user_text_write_failed", path=str(path), error=str(exc))
         return False
 
 
@@ -544,6 +567,30 @@ def replace_worker_guidance(text: str, workers: list[str]) -> str:
     return text
 
 
+def update_orchestration_guidance(text: str, workers: list[str]) -> str | None:
+    """Refresh worker slots inside the single managed orchestration block.
+
+    A single valid marker pair scopes the rewrite so unrelated user prose is
+    never touched. Without markers the file is not ours to rewrite, so it is
+    returned unchanged; duplicate or malformed markers return ``None`` so the
+    caller fails closed instead of guessing which section the tool owns.
+    """
+    begins = _find_all_positions(text, ORCHESTRATION_BEGIN)
+    ends = _find_all_positions(text, ORCHESTRATION_END)
+    if not begins and not ends:
+        return text
+    if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
+        log_event("orchestration_block_ambiguous")
+        return None
+    start = begins[0] + len(ORCHESTRATION_BEGIN)
+    end = ends[0]
+    return (
+        text[:start]
+        + replace_worker_guidance(text[start:end], workers)
+        + text[end:]
+    )
+
+
 def _profile_block_bounds(text: str) -> tuple[int, int] | None:
     """Return the profile block content bounds, accepting one legacy block."""
     blocks: list[tuple[int, int]] = []
@@ -589,6 +636,7 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
             return False, current_worker_agents(profile), updated
         old_workers = current_worker_agents(profile)
         prepared: list[tuple[Path, str]] = []
+        user_prepared: list[tuple[Path, str]] = []
         try:
             if GEMINI_MD_PATH.is_file():
                 text = GEMINI_MD_PATH.read_text(encoding="utf-8")
@@ -598,12 +646,15 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
                 content_start, end = bounds
                 text = text[:content_start] + replace_worker_guidance(text[content_start:end], new_workers) + text[end:]
                 prepared.append((GEMINI_MD_PATH, text))
-            if (not _env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
-                    and GEMINI_DIR.resolve() == (Path.home() / ".gemini").resolve()):
+            if GEMINI_DIR.resolve() == (Path.home() / ".gemini").resolve():
                 for path in (Path.home() / ".claude/CLAUDE.md", Path.home() / ".codex/AGENTS.md"):
                     if path.is_file():
-                        text = replace_worker_guidance(path.read_text(encoding="utf-8"), new_workers)
-                        prepared.append((path, text))
+                        text = path.read_text(encoding="utf-8")
+                        guidance = update_orchestration_guidance(text, new_workers)
+                        if guidance is None:
+                            return False, old_workers, updated
+                        if guidance != text:
+                            user_prepared.append((path, guidance))
         except (OSError, UnicodeError) as exc:
             log_event("worker_guidance_read_failed", error=str(exc))
             return False, old_workers, updated
@@ -611,6 +662,10 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
         prepared.insert(0, (PROFILE_PATH, json.dumps(profile, ensure_ascii=False, indent=2) + "\n"))
         for path, text in prepared:
             if not save_text(path, text):
+                return False, old_workers, updated
+            updated.append(str(path))
+        for path, text in user_prepared:
+            if not save_user_text(path, text):
                 return False, old_workers, updated
             updated.append(str(path))
     return True, new_workers, updated

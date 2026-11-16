@@ -184,7 +184,7 @@ pilot status --json
 
 | 定制维度 | Profile 配置键 | 可选值与默认值 | 控制内容 |
 | --- | --- | --- | --- |
-| 1. 主从编排（Orchestration） | `worker_agents`<br>`review_agents` | 子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | 主会话（设计/Review）与子会话（分支编码）职责分离、父子工作区隔离与执行器优先级。 |
+| 1. 主从编排（Orchestration） | `coordinator_agent`<br>`worker_agents`<br>`review_agents` | 主会话：`agy`（兼容 `antigravity`）<br>子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | Tier-1 原生 AGY 主会话（设计/Review）与 Tier-2 派发子会话（分支编码）职责分离、父子工作区隔离、跨仓回调与执行器优先级。 |
 | 2. 自动推进（Pilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..50`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
 | 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | 交付策略：`merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线。 |
 | 4. 快捷口令（Shortcuts） | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | 通用口令：`r`、`rt`、`d`、`pull`<br>外加项目扩展口令与自定义 `,` 别名 | 在 `PreInvocation` 阶段将简短口令展开为完整的架构审查、设计或编排提示词。 |

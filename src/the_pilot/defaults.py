@@ -27,6 +27,10 @@ WORKER_AGENT_ORDER = ("claude", "codex")
 
 REVIEW_AGENT_ORDER = ("codex", "claude", "agy")
 
+COORDINATOR_AGENTS = ("agy",)
+
+COORDINATOR_AGENT_ALIASES = {"agy": "agy", "antigravity": "agy"}
+
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 
 SCENE_ORDER = (
@@ -80,6 +84,10 @@ GEMINI_END = "<!-- END THE_PILOT_PROFILE -->"
 SCENES_BEGIN = "<!-- BEGIN THE_PILOT_SCENES -->"
 
 SCENES_END = "<!-- END THE_PILOT_SCENES -->"
+
+ORCHESTRATION_BEGIN = "<!-- BEGIN THE_PILOT_ORCHESTRATION -->"
+
+ORCHESTRATION_END = "<!-- END THE_PILOT_ORCHESTRATION -->"
 
 LEGACY_GEMINI_BEGIN = "<!-- BEGIN ORCA_AUTOPILOT_PROFILE -->"
 

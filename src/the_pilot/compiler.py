@@ -7,9 +7,11 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
-from .defaults import AGENT_LABELS, GEMINI_BEGIN, GEMINI_END, HARNESS_ORCHESTRATION_SENTENCE, HOOK_GROUP, LEGACY_GEMINI_BEGIN, LEGACY_GEMINI_END, LEGACY_HOOK_GROUP, LEGACY_SCENES_BEGIN, LEGACY_SCENES_END, SCENES_BEGIN, SCENES_END, UNMANAGED_SCENES_MARKERS_ERROR
+from .defaults import AGENT_LABELS, COORDINATOR_AGENTS, GEMINI_BEGIN, GEMINI_END, HARNESS_ORCHESTRATION_SENTENCE, HOOK_GROUP, LEGACY_GEMINI_BEGIN, LEGACY_GEMINI_END, LEGACY_HOOK_GROUP, LEGACY_SCENES_BEGIN, LEGACY_SCENES_END, ORCHESTRATION_BEGIN, ORCHESTRATION_END, SCENES_BEGIN, SCENES_END, UNMANAGED_SCENES_MARKERS_ERROR
 from .project import ProfileError, project_specs
 from .profile import _copy_mapping, validate_profile
+
+LEGACY_ORCHESTRATION_HEADING = "## 子 Agent 与多任务编排规范（Orca Orchestration："
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,10 @@ def render_gemini_block(profile: dict[str, Any], scenes: dict[str, str]) -> str:
 def render_orchestration_section(profile: dict[str, Any]) -> str:
     worker_agents = profile["orchestration"]["worker_agents"]
     review_agents = profile["orchestration"]["review_agents"]
+    coordinator = (
+        profile["orchestration"].get("coordinator_agent") or COORDINATOR_AGENTS[0]
+    )
+    coordinator_label = AGENT_LABELS[coordinator]
     priority = " > ".join(AGENT_LABELS[item] for item in worker_agents)
     primary = worker_agents[0]
     secondary = worker_agents[1] if len(worker_agents) > 1 else ""
@@ -139,20 +145,120 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
         executor += f"，其次使用 {AGENT_LABELS[secondary]}（`--agent {secondary}`）"
     secondary_hint = f"次选 `--agent {secondary}`；" if secondary else ""
     review_priority = " > ".join(AGENT_LABELS[item] for item in review_agents)
-    return f"""## 子 Agent 与多任务编排规范（Orca Orchestration：{priority}）
+    return f"""{LEGACY_ORCHESTRATION_HEADING}{priority}）
 
 必须遵循 `~/.agents/skills/orchestration/SKILL.md`：编排前执行 `orca skills get orchestration`（按需加载 coordinator-loop、placement-and-remote、recovery-and-cleanup 等 references），并遵守 5 项准则：
 
-1. **主-子会话职责分离（主会话设计且 Review，实施交子会话）**：
-   - **主会话（Coordinator，提示词不含 Orca Task ID / Dispatch ID preamble）**：聚焦调研、工程架构级方案设计与受控编排，严格 Code Review 子会话产出；派发前必须给出工程架构级方案（模块职责、预期文件结构、接口契约、读写收敛路径、设计边界）。{HARNESS_ORCHESTRATION_SENTENCE}。排障、审查或设计须结合近期同链路修改史与端到端调用拓扑，**从整个架构去看，是否应该有更简洁、更加根本的修复方案**，严禁只修表象、枚举黑白名单或叠局部重试/特判；除极简单小改动可顺手处理外，实现统一经 Orca `orchestration` 交子工作区/子会话。
-   - **子会话（Dispatched Worker，提示词含 Orca live Task ID / Dispatch ID preamble）**：在分配的工作区与分支内按方案修改、本地定向验证并提交，用 `worker_done` 汇报，不向下套娃派发；架构级分歧回传主会话。
-2. **统一用 Orca Orchestration 替代内置 Subagent（执行器优先级：{priority}）**：有代码实施或并行任务时**禁用内置 `invoke_subagent`** 与无监督裸终端移交，统一经 `orca orchestration`：先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定受控 Run（持久化命名空间与收件箱）；{executor}。Task spec 自包含且带工程架构设计（Target、Contracts、Files、Boundaries、Ownership、Acceptance）。
-3. **工作区父子层级（禁止建成平级工作区）**：同工作区开新会话用 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）；新建子工作区用 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建时也必须显式 `--parent-worktree active` 或 `path:<当前路径>`），确保挂为当前工作区的**子工作区**；除非明确要求无关独立顶层任务，**严禁 `--worktree new-top-level` 或 `--no-parent`** 建平行顶层工作区。
-4. **子工作区分支隔离（先分支开发与 Review，通过后再合 `main`）**：子会话必须在独立功能分支上修改、本地定向验证与提交；初版实施及打回阶段**严禁自行合入或推送 `main`**（派发 Task spec 时必须声明），避免与主会话 Review 重复触发合入门禁；经主会话严格 Code Review 判定「审查通过」后才可合入 `main` 并推送。
-5. **主-子会话交互闭环：受控等待、严格审查、打回迭代与通过后收尾**：
-   - 主会话用 `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 阻塞等待，用 `reply` 回复阻塞问题、`send` 补充中途指导、`--ack` 确认消费（参数见 skill 协议）。
-   - 收到 `worker_done` 后不得草率结案：主会话必须亲自对子工作区分支结果做**彻底、不留情面的 Code Review**，首先**从整个架构去看，是否应该有更简洁、更加根本的修复方案**，并严格对照工程质量规范（`peq.*`、唯一真源、无循环依赖、无函数内联导入、无行内抑制注释、边界职责、测试覆盖与门禁脚本）逐项核查真实代码与分支 diff。（独立 Agent 架构审查门禁优先级：**`{review_priority}`**。）
-   - **同终端复用打回与受控释放**：有未达标项时按 `orchestration` 同终端复用机制，用 `worker-show` 取已验证终端句柄，再建整改 Task 并 `worker-start --terminal <agent_terminal_handle>` 派回原终端修改并复审至达标；审查通过则用同终端 follow-up Dispatch 通知「审查通过，可合入 `main` 并推送收尾」，全部结算后 `worker-release` 释放受控 worker（**严禁用 `orca terminal close` 替代 `worker-release`**），结束前用 `worker-list --terminal-state reclaimable` 确认无遗留可回收终端并清理子工作区与已合入分支。"""
+1. **主-子会话职责分离（Tier-1 AGY 主会话设计且 Review，Tier-2 子会话实施）**：
+   - **Tier-1 主会话（Coordinator，提示词不含 Orca Task ID / Dispatch ID preamble）**：固定为原生 **{coordinator_label}**（`antigravity`；直接 `agy --dangerously-skip-permissions` 启动，账户池由 Orca 与 `agy-switch` 管理，禁止 `magpie agy` 包装；新建顶层工作区须先把路径登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`）；**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障、审查或设计须结合近期同链路修改史与端到端调用拓扑，**从整个架构去看，是否应该有更简洁、更加根本的修复方案**，严禁只修表象、枚举黑白名单或叠局部重试/特判；除极简单小改动可顺手处理外，实现统一经 Orca `orchestration` 交子工作区/子会话。
+   - **Tier-2 子会话（Dispatched Worker，提示词含 Orca live Task ID / Dispatch ID preamble）**：由 `orca orchestration worker-start` 以 `claude`/`codex` 启动，在分配分支修改、定向验证并提交，用 `worker_done` 汇报，不向下套娃；架构级分歧回传主会话。
+2. **统一用 Orca Orchestration 替代内置 Subagent（执行器优先级：{priority}）**：有代码实施或并行任务时**禁用内置 `invoke_subagent`** 与无监督裸终端移交，统一经 `orca orchestration`：先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定受控 Run；{executor}。Task spec 自包含（Target、Contracts、Files、Boundaries、Ownership、Acceptance）并声明「分支开发、未经主会话 Review 通过不得合入或推送 `main`」。
+3. **工作区层级与跨仓回调（禁止平级工作区）**：同工作区用 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）；同仓子工作区用 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须显式 `--parent-worktree active` 或 `path:<当前路径>`），确保挂为**子工作区**；跨仓并需回传用 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，由 `worker_done` 唤醒主会话。仅用户明确要求独立长期 Tier-1 工作区时才用 `--no-parent` 建顶层工作区（原生 {coordinator_label} 任主会话）；若需回执，绑定 Dealer thread 或 `orca orchestration send` 回调，**严禁无监督移交后失联**；否则**严禁 `--worktree new-top-level`/`--no-parent`** 建平行顶层工作区。
+4. **分支隔离**：子会话在独立功能分支修改、定向验证并提交；初版实施及打回阶段**严禁自行合入或推送 `main`**（Task spec 必须声明）；仅主会话 Code Review 判定「审查通过」后才可合入 `main` 并推送。
+5. **交互闭环与收尾**：
+   - 主会话用 `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 阻塞等待，用 `reply`/`send` 处理问答与指导，`--ack` 确认消费。
+   - `worker_done` 后必须亲自对分支结果做**彻底 Code Review**：先从整个架构判断是否有更简洁、更根本的修复方案，并对照工程质量规范（`peq.*`、唯一真源、无循环依赖、无函数内联导入、无行内抑制注释、边界职责、测试覆盖与门禁脚本）核查真实 diff。（独立架构审查优先级：**`{review_priority}`**。）
+   - 未达标时用 `worker-show` 取得已验证终端，再建整改 Task 并 `worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回原终端；通过后用同终端 follow-up 通知合入 `main` 并推送。全部结算后 `worker-release` 释放 worker（**严禁 `orca terminal close` 替代**），用 `worker-list --terminal-state reclaimable` 确认无遗留终端并清理子工作区与已合入分支。"""
+
+
+def render_orchestration_block(profile: dict[str, Any]) -> str:
+    """Wrap the orchestration rules in the managed block used by agent files."""
+    return "\n\n".join(
+        (ORCHESTRATION_BEGIN, render_orchestration_section(profile), ORCHESTRATION_END)
+    ) + "\n"
+
+
+def merge_orchestration_md(existing: str, block: str) -> str:
+    """Replace our managed orchestration block, migrating one legacy section."""
+    text = existing or ""
+    bounds = _orchestration_block_bounds(text)
+    rendered = block if block.endswith("\n") else block + "\n"
+    if bounds is None:
+        legacy = _legacy_orchestration_heading_positions(text)
+        if len(legacy) > 1:
+            raise ValueError(
+                "Agent 全局指引存在多处未托管的「## 子 Agent 与多任务编排规范"
+                "（Orca Orchestration：」章节，无法安全迁移；请只保留一处后重试"
+            )
+        if legacy:
+            start = legacy[0]
+            end = _markdown_section_end(text, start)
+            prefix = text[:start].rstrip("\n")
+            suffix = text[end:].lstrip("\n")
+            parts = [part for part in (prefix, rendered.rstrip("\n"), suffix.rstrip("\n")) if part]
+            return "\n\n".join(parts) + "\n"
+        if not text.strip():
+            return rendered
+        return text.rstrip("\n") + "\n\n" + rendered
+    start, end = bounds
+    suffix = text[end:]
+    if suffix.startswith("\n"):
+        suffix = suffix[1:]
+    merged = text[:start] + rendered + suffix
+    return merged if merged.endswith("\n") else merged + "\n"
+
+
+def strip_orchestration_md(existing: str) -> str:
+    """Remove our managed orchestration block and tidy only its seam."""
+    text = existing or ""
+    bounds = _orchestration_block_bounds(text)
+    if bounds is None:
+        return text
+    start, end = bounds
+    left = text[:start].rstrip("\n")
+    right = text[end:].lstrip("\n")
+    if left and right:
+        return left + "\n\n" + right.rstrip("\n") + "\n"
+    remainder = left or right
+    return remainder.rstrip("\n") + "\n" if remainder else ""
+
+
+def _orchestration_block_bounds(text: str) -> tuple[int, int] | None:
+    """Return the managed orchestration block, failing closed on ambiguity."""
+    begins = _find_all_positions(text, ORCHESTRATION_BEGIN)
+    ends = _find_all_positions(text, ORCHESTRATION_END)
+    if not begins and not ends:
+        return None
+    if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
+        raise ValueError(
+            "Agent 全局指引的 THE_PILOT_ORCHESTRATION 托管标记必须恰好各出现一次且顺序正确"
+        )
+    return begins[0], ends[0] + len(ORCHESTRATION_END)
+
+
+def _legacy_orchestration_heading_positions(text: str) -> list[int]:
+    """Return offsets of the pre-managed orchestration heading outside fences."""
+    positions: list[int] = []
+    fence: str | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if fence is None:
+            if stripped.startswith(("```", "~~~")):
+                fence = stripped[:3]
+            elif line.startswith(LEGACY_ORCHESTRATION_HEADING):
+                positions.append(offset)
+        elif stripped.startswith(fence):
+            fence = None
+        offset += len(line)
+    return positions
+
+
+def _markdown_section_end(text: str, start: int) -> int:
+    """Return where the level-2 section starting at ``start`` ends, outside fences."""
+    fence: str | None = None
+    offset = start
+    for index, line in enumerate(text[start:].splitlines(keepends=True)):
+        stripped = line.strip()
+        if index and fence is None and (line.startswith("# ") or line.startswith("## ")):
+            return offset
+        if fence is None:
+            if stripped.startswith(("```", "~~~")):
+                fence = stripped[:3]
+        elif stripped.startswith(fence):
+            fence = None
+        offset += len(line)
+    return len(text)
 
 
 def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
