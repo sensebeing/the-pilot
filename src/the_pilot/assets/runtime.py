@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import signal
+import stat
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -111,6 +112,12 @@ TAG_FIELDS = frozenset(
         "alt",
     }
 )
+# Orca's `terminal.program-status.v1` contract. The escape sequence is stripped
+# from terminal output before rendering, so it only feeds program activity.
+OSC_7501_WORKING = "\x1b]7501;state=working:app=antigravity\x07"
+OSC_7501_DONE = "\x1b]7501;state=done:app=antigravity\x07"
+OSC_7501_WAITING_QUESTION = "\x1b]7501;state=blocked:kind=question:app=antigravity\x07"
+SHELL_WRAPPER_NAMES = frozenset({"sh", "dash", "bash", "zsh"})
 class HookExecutionError(RuntimeError):
     """A hook refused to act because its installed configuration is unusable."""
 
@@ -1498,6 +1505,126 @@ def injection(message: str) -> dict[str, Any]:
     return {"injectSteps": [{"ephemeralMessage": message}]}
 
 
+def _ps_process(pid: int) -> tuple[int, str, str] | None:
+    """Return one process's `(ppid, tty, comm)` or None when it is unknown."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ppid=,tty=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split(None, 2)
+    if len(parts) != 3:
+        return None
+    try:
+        ppid = int(parts[0])
+    except ValueError:
+        return None
+    return ppid, parts[1], parts[2]
+
+
+def _osc_target_from_tty(tty: str) -> tuple[Path, bool] | None:
+    """Validate one `ps` tty column and turn it into a `/dev` path."""
+    value = tty.strip()
+    if not value or value in {"?", "??", "-"} or ".." in value.split("/"):
+        return None
+    candidate = Path("/dev") / value
+    try:
+        resolved = candidate.resolve()
+        device_root = Path("/dev").resolve()
+    except OSError:
+        return None
+    if not resolved.is_relative_to(device_root):
+        return None
+    return candidate, False
+
+
+def _resolve_osc_target() -> tuple[Path, bool] | None:
+    """Resolve the Orca pane TTY that owns the agent process.
+
+    Antigravity allocates child PTYs for subprocesses, so `os.ctermid()` inside
+    this hook names the wrong terminal. Only the ancestor `agy` process's `ps`
+    tty column points at Orca's pane. Tests and non-Orca hosts resolve to None:
+    an explicit override always wins, then Gemini-dir isolation stays inert
+    (never probing `ps` or writing host TTYs), then the Orca pane environment
+    gates the ancestor walk.
+    """
+    raw_override = os.environ.get("THE_PILOT_OSC_TARGET")
+    if raw_override is not None:
+        stripped = raw_override.strip()
+        if not stripped or stripped.lower() == "none":
+            return None
+        return Path(stripped).expanduser(), True
+    if _env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR"):
+        return None
+    if not (
+        os.environ.get("ORCA_PANE_KEY", "").strip()
+        or os.environ.get("ORCA_TERMINAL_HANDLE", "").strip()
+    ):
+        return None
+    pid = os.getppid()
+    for hop in range(2):
+        process = _ps_process(pid)
+        if process is None:
+            return None
+        ppid, tty, comm = process
+        executable = Path(comm.strip().lstrip("-")).name
+        if hop == 0 and executable in SHELL_WRAPPER_NAMES:
+            if ppid <= 1:
+                return None
+            pid = ppid
+            continue
+        if executable != "agy":
+            return None
+        return _osc_target_from_tty(tty)
+    return None
+
+
+def _open_override_target(target: Path) -> int:
+    """Open an explicit `THE_PILOT_OSC_TARGET` for one frame append."""
+    if target.exists():
+        mode = target.stat().st_mode
+        if stat.S_ISCHR(mode) or stat.S_ISFIFO(mode):
+            return os.open(target, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+
+
+def emit_osc_7501(frame: str) -> bool:
+    """Write one OSC 7501 frame to Orca's pane; never raise into hook output."""
+    if not frame:
+        return False
+    resolved = _resolve_osc_target()
+    if resolved is None:
+        return False
+    target, is_override = resolved
+    data = frame.encode("utf-8")
+    try:
+        if is_override:
+            fd = _open_override_target(target)
+        else:
+            status = os.stat(target)
+            if not stat.S_ISCHR(status.st_mode) or status.st_uid != os.getuid():
+                log_event("osc_status_target_rejected", target=str(target))
+                return False
+            fd = os.open(target, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            written = 0
+            while written < len(data):
+                written += os.write(fd, data[written:])
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as exc:
+        log_event("osc_status_write_failed", target=str(target), error=str(exc))
+        return False
+    return True
+
+
 def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     conversation_id = str(payload.get("conversationId") or "")
     if not conversation_id:
@@ -1789,25 +1916,44 @@ def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
     return last_line.endswith(("：", ":"))
 
 
-def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
+def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Decide the Stop hook action and the OSC 7501 frame it implies.
+
+    The frame is emitted only after the hook prints its decision: ``""`` keeps
+    Orca treating the agent as working (the turn continues or a new turn was
+    already submitted), `done` releases orchestration mail, and
+    `blocked:kind=question` makes Orca hold mail while the agent waits behind a
+    picker or an unconfirmed prefilled draft.
+    """
     termination = str(payload.get("terminationReason") or "")
     fully_idle = payload.get("fullyIdle")
+    if fully_idle is None:
+        fully_idle = payload.get("fully_idle")
     error = str(payload.get("error") or "").strip()
     conversation_id = str(payload.get("conversationId") or "")
-    if termination != "NO_TOOL_CALL" or fully_idle is not True or error or not conversation_id:
-        return {"decision": "allow"}
+    if termination != "NO_TOOL_CALL" or fully_idle is not True:
+        # A tool call is running, background work is still active, or the stop
+        # is synthetic: the turn has not reached rest, so no status is claimed.
+        return {"decision": "allow"}, ""
+    if error or not conversation_id:
+        return {"decision": "allow"}, OSC_7501_DONE
     steps, complete = read_steps(payload.get("transcriptPath"))
+    if steps and ask_question_unsettled_reason(current_turn_steps(steps)):
+        if not complete or is_dispatched_worker(steps):
+            # A question UI is open without a settled answer. Pressing Enter
+            # from an orchestration delivery would answer it by accident.
+            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
     if not complete:
         log_event("stop_transcript_incomplete", cid=conversation_id)
-        return {"decision": "allow"}
+        return {"decision": "allow"}, OSC_7501_DONE
     if not steps or is_dispatched_worker(steps):
-        return {"decision": "allow"}
+        return {"decision": "allow"}, OSC_7501_DONE
 
     turn_id = turn_identity(steps)
     user_turn = turn_user_identity(steps)
     if not user_turn:
         log_event("stop_turn_identity_missing", cid=conversation_id)
-        return {"decision": "allow"}
+        return {"decision": "allow"}, OSC_7501_DONE
     with state_lock(conversation_id):
         state = load_state(conversation_id)
         profile, profile_status, profile_err = load_profile()
@@ -1826,7 +1972,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             raise HookExecutionError(code, detail)
         if state is None:
             log_event("stop_state_corrupt", cid=conversation_id)
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_DONE
         current_user_turn = str(state.get("current_user_turn_id") or "")
         if current_user_turn and current_user_turn != user_turn:
             log_event(
@@ -1835,7 +1981,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                 current=current_user_turn,
                 incoming=user_turn,
             )
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_DONE
         state["current_user_turn_id"] = user_turn
         turn_steps = current_turn_steps(steps)
         unsettled_reason = ask_question_unsettled_reason(turn_steps)
@@ -1847,7 +1993,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                 cid=conversation_id,
                 reason=unsettled_reason,
             )
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
         if state.get("last_settled_turn_id") == turn_id or state.get(
             "delivery_status"
         ) in {"pending", "unknown"}:
@@ -1857,13 +2003,21 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                 turn_id=turn_id,
                 status=str(state.get("delivery_status") or ""),
             )
-            return {"decision": "allow"}
+            if state.get("delivery_status") in {"pending", "unknown"} or (
+                bool(state.get("candidates"))
+                and current_mode(profile) in {"gate", "confirm"}
+                and state.get("delivery_status") != "accepted"
+            ):
+                # The composer may still hold a draft or an unconfirmed
+                # delivery: arriving mail must not press Enter into it.
+                return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
+            return {"decision": "allow"}, OSC_7501_DONE
 
         planners = [step for step in turn_steps if step.get("type") == "PLANNER_RESPONSE"]
         if not planners:
             clear_suggestion(state)
             save_state(conversation_id, state)
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_DONE
 
         parsed = parse_suggestion(str(planners[-1].get("content") or ""))
         if parsed["invalid"]:
@@ -1884,21 +2038,24 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                         cid=conversation_id,
                         turn_id=turn_id,
                     )
-                    return {"decision": "allow"}
+                    return {"decision": "allow"}, OSC_7501_DONE
                 log_event(
                     "stop_continue_unasked_question",
                     cid=conversation_id,
                     turn_id=turn_id,
                 )
-                return {
-                    "decision": "continue",
-                    "reason": (
-                        "上一条回复在冒号引导语处提前结束，既未发出 ask_question 工具调用，"
-                        "也未输出回合结束标签。若需向用户确认问题，请立即直接调用 ask_question "
-                        "工具（不要重复已输出的正文，同一步不写 pilot 标签）；若无需提问，"
-                        "请补齐收束结论与末尾 <!-- pilot: ... --> 标签。"
-                    ),
-                }
+                return (
+                    {
+                        "decision": "continue",
+                        "reason": (
+                            "上一条回复在冒号引导语处提前结束，既未发出 ask_question 工具调用，"
+                            "也未输出回合结束标签。若需向用户确认问题，请立即直接调用 ask_question "
+                            "工具（不要重复已输出的正文，同一步不写 pilot 标签）；若无需提问，"
+                            "请补齐收束结论与末尾 <!-- pilot: ... --> 标签。"
+                        ),
+                    },
+                    "",
+                )
             clear_suggestion(state)
             save_state(conversation_id, state)
             log_event(
@@ -1906,21 +2063,21 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                 cid=conversation_id,
                 reason=str(parsed["invalid"]),
             )
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_DONE
 
         scene = str(parsed["scene"])
         if scene == "NONE" or not parsed["prompt"] or scene not in scenes:
             clear_suggestion(state)
             save_state(conversation_id, state)
             log_event("stop_without_suggestion", cid=conversation_id, scene=scene or "")
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_DONE
 
         mode = current_mode(profile)
         if mode == "off":
             clear_suggestion(state)
             save_state(conversation_id, state)
             log_event("stop_mode_off", cid=conversation_id)
-            return {"decision": "allow"}
+            return {"decision": "allow"}, OSC_7501_DONE
 
         gate = resolve_gate(scene, str(parsed["gate"]), scenes)
         primary = str(parsed["prompt"])
@@ -1953,7 +2110,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                 state["auto_submitted_text"] = ""
                 save_state(conversation_id, state)
                 log_event("auto_submit_no_terminal", cid=conversation_id, scene=scene)
-                return {"decision": "allow"}
+                return {"decision": "allow"}, OSC_7501_DONE
             previous_count = int(state.get("consecutive_auto_turns") or 0)
             previous_text = str(state.get("auto_submitted_text") or "")
             state["consecutive_auto_turns"] = previous_count + 1
@@ -1962,7 +2119,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
             state["delivery_status"] = "pending"
             if not save_state(conversation_id, state):
                 log_event("auto_submit_state_failed", cid=conversation_id, scene=scene)
-                return {"decision": "allow"}
+                return {"decision": "allow"}, OSC_7501_DONE
             outcome = send_to_terminal(handle, primary, enter=True)
             if outcome == "accepted":
                 state["delivery_status"] = "accepted"
@@ -1977,20 +2134,38 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
                 state["delivery_status"] = "unknown"
                 log_event("auto_submit_unknown", cid=conversation_id, scene=scene)
             save_state(conversation_id, state)
-        else:
-            # The cap (or a pause) is the decision for this turn: keep the auto
-            # count and mark the turn settled so a repeated Stop cannot upgrade
-            # the pause into an auto-submit. Only a confirmed new user turn
-            # restarts the budget in PreInvocation.
-            state["last_settled_turn_id"] = turn_id
-            state["auto_submitted_text"] = ""
-            if mode in {"gate", "confirm"}:
-                handle = resolve_terminal(workspace_path, explicit_handle)
-                if handle and send_to_terminal(handle, primary, enter=False) != "accepted":
+            if outcome == "accepted":
+                # The next turn was just submitted with Enter, so the agent is
+                # already working again and must not claim an idle terminal.
+                return {"decision": "allow"}, ""
+            if outcome == "rejected":
+                return {"decision": "allow"}, OSC_7501_DONE
+            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
+        # The cap (or a pause) is the decision for this turn: keep the auto
+        # count and mark the turn settled so a repeated Stop cannot upgrade
+        # the pause into an auto-submit. Only a confirmed new user turn
+        # restarts the budget in PreInvocation.
+        state["last_settled_turn_id"] = turn_id
+        state["auto_submitted_text"] = ""
+        prefill_outcome = ""
+        if mode in {"gate", "confirm"}:
+            handle = resolve_terminal(workspace_path, explicit_handle)
+            if handle:
+                prefill_outcome = send_to_terminal(handle, primary, enter=False)
+                if prefill_outcome != "accepted":
                     log_event("prefill_not_accepted", cid=conversation_id, scene=scene)
-            log_event("prefilled_only", cid=conversation_id, scene=scene, gate=gate, mode=mode)
-            save_state(conversation_id, state)
-        return {"decision": "allow"}
+        log_event("prefilled_only", cid=conversation_id, scene=scene, gate=gate, mode=mode)
+        save_state(conversation_id, state)
+        if prefill_outcome in {"accepted", "unknown"}:
+            # The composer holds an unconfirmed prefilled draft; mailbox
+            # pointers must not append text and Enter into it.
+            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
+        return {"decision": "allow"}, OSC_7501_DONE
+
+
+def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return only the Stop hook decision for direct callers."""
+    return _evaluate_stop(payload)[0]
 
 
 def render_scenes_block(scenes: dict[str, dict[str, Any]]) -> str:
@@ -2267,14 +2442,17 @@ def run_hook(event: str) -> int:
     try:
         if event == "PreInvocation":
             result = handle_pre_invocation(payload)
+            osc_frame = OSC_7501_WORKING
         else:
-            result = handle_stop(payload)
+            result, osc_frame = _evaluate_stop(payload)
     except HookExecutionError as exc:
         return _hook_failure(event, exc.code, exc.detail)
     except Exception as exc:
         log_event("hook_failed", hook_event=event, error=repr(exc))
         return _hook_failure(event, "internal_error", repr(exc))
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1" and osc_frame:
+        emit_osc_7501(osc_frame)
     return 0
 
 

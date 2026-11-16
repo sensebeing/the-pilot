@@ -14,8 +14,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3702,6 +3704,299 @@ class EngineTest(unittest.TestCase):
             self.assertIn("boom", internal["detail"])
             self.assertIn("hook_failed", (root / "pilot.log").read_text(encoding="utf-8"))
 
+    def test_osc_pre_invocation_reports_working_once(self) -> None:
+        """A turn start reports working, including for dispatched workers.
+
+        Failure means Orca keeps the pane in an unknown state while agy is
+        already working, or the frame leaks into the hook's JSON stdout.
+        resident-fact: status: PreInvocation 只在控制终端发出一次
+        `state=working`，与是否由 Pilot 投递无关。
+        """
+        target = self.root / "osc-working.log"
+        result = self.pre(
+            "c-osc-pre", "开始", extra_env={"THE_PILOT_OSC_TARGET": str(target)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
+        self.assertNotIn("\x1b]7501;", result.stdout)
+
+        worker_target = self.root / "osc-worker.log"
+        worker = self.pre(
+            "c-osc-worker",
+            "任务",
+            extra_env={
+                "THE_PILOT_OSC_TARGET": str(worker_target),
+                "ORCA_TASK_ID": "task_osc",
+            },
+        )
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        self.assertEqual(
+            worker_target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING
+        )
+
+    def test_osc_pre_invocation_reexec_does_not_duplicate_working(self) -> None:
+        """The hot-reexec engine child stays silent so the outer hook owns the frame.
+
+        Failure means one turn emits two working frames, which can regress the
+        program activity Orca derives from the control terminal.
+        resident-fact: status: 引擎热重执行时只有外层进程发出 `state=working`。
+        """
+        target = self.root / "osc-reexec.log"
+        shim = self.root / "pilot-shim.py"
+        shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib\n"
+            "engine = pathlib.Path(os.environ['THE_PILOT_GEMINI_DIR']) / 'config/the-pilot/runtime.py'\n"
+            "engine.write_text(engine.read_text() + '\\n# upgraded\\n')\n"
+            "print('{\"local_source_status\": \"updated\"}')\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        result = self.pre(
+            "c-osc-reexec",
+            "开始",
+            extra_env={
+                "THE_PILOT_OSC_TARGET": str(target),
+                "THE_PILOT_BIN": str(shim),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
+
+    def test_osc_stop_reports_done_for_settled_turns(self) -> None:
+        """A settled turn with no picker or prefilled draft frees Orca mail.
+
+        Failure means an idle agy at its composer stays invisible to Orca, so
+        orchestration mail is never delivered until the user types.
+        resident-fact: status: scene=NONE、mode=off、dispatched worker 与带 error
+        的空闲 Stop 都发出 `state=done`。
+        """
+        target = self.root / "osc-done.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+
+        none = self.stop(
+            "c-osc-none",
+            '结论 <!-- pilot: {"scene": "NONE"} -->',
+            extra_env=env,
+        )
+        self.assertEqual(none.returncode, 0, none.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE)
+
+        apply_profile(self.root, self.gemini, "--mode", "off")
+        off = self.stop(
+            "c-osc-off", suggestion("继续推进实施", gate="auto"), extra_env=env
+        )
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE * 2
+        )
+
+        worker = self.stop(
+            "c-osc-stop-worker",
+            suggestion("继续推进实施", gate="auto"),
+            extra_env={**env, "ORCA_TASK_ID": "task_osc"},
+        )
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE * 3
+        )
+
+        error = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(
+                "c-osc-error",
+                transcriptPath=str(self.root / "missing.jsonl"),
+                terminationReason="NO_TOOL_CALL",
+                fullyIdle=True,
+                error="provider failed",
+            ),
+            extra_env=env,
+        )
+        self.assertEqual(error.returncode, 0, error.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE * 4
+        )
+
+    def test_osc_stop_accepts_fully_idle_snake_case(self) -> None:
+        """An idle stop is recognized from either payload spelling.
+
+        Failure means Antigravity's snake_case idle signal is ignored and the
+        pane never reports done.
+        resident-fact: status: `fullyIdle` 缺失时 `fully_idle=True` 同样证明回合
+        已静止并发出 `state=done`。
+        """
+        target = self.root / "osc-snake.log"
+        transcript = write_transcript(
+            self.root,
+            "osc-snake.jsonl",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": '结论 <!-- pilot: {"scene": "NONE"} -->',
+                },
+            ],
+        )
+        result = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(
+                "c-osc-snake",
+                transcriptPath=str(transcript),
+                terminationReason="NO_TOOL_CALL",
+                fully_idle=True,
+            ),
+            extra_env={"THE_PILOT_OSC_TARGET": str(target)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE)
+
+    def test_osc_stop_stays_working_while_the_turn_continues(self) -> None:
+        """Running, continuing and auto-submitted turns never claim an idle terminal.
+
+        Failure means a turn that is still running is advertised as done, which
+        lets orchestration mail collide with the running turn or the next one.
+        resident-fact: status: fullyIdle=False、continue 决策与回车成功的自动投递
+        都不发出 OSC 帧。
+        """
+        target = self.root / "osc-working-stop.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+        transcript = write_transcript(
+            self.root,
+            "osc-running.jsonl",
+            [
+                {"type": "USER_INPUT", "content": "开始"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": suggestion("继续推进", gate="auto"),
+                },
+            ],
+        )
+        running = run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(
+                "c-osc-running",
+                transcriptPath=str(transcript),
+                terminationReason="NO_TOOL_CALL",
+                fullyIdle=False,
+                workspacePaths=[str(self.workspace)],
+            ),
+            extra_env=env,
+        )
+        self.assertEqual(running.returncode, 0, running.stderr)
+        self.assertFalse(target.exists())
+
+        continued = self.stop(
+            "c-osc-continue",
+            "",
+            steps=[
+                {"type": "USER_INPUT", "content": "开始"},
+                {"type": "PLANNER_RESPONSE", "content": "请确认以下 2 个问题："},
+            ],
+            extra_env=env,
+        )
+        self.assertEqual(continued.returncode, 0, continued.stderr)
+        self.assertEqual(json.loads(continued.stdout)["decision"], "continue")
+        self.assertFalse(target.exists())
+
+        accepted = self.stop(
+            "c-osc-auto", suggestion("继续推进", gate="auto"), extra_env=env
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("--enter", send_calls(self.root)[-1])
+        self.assertFalse(target.exists())
+
+    def test_osc_stop_holds_mail_for_questions_and_prefilled_drafts(self) -> None:
+        """A picker or an unconfirmed composer draft reports blocked:question.
+
+        Failure means Orca may append orchestration mail plus Enter into an open
+        question picker or a gate=pause draft and submit it without consent.
+        resident-fact: status: 未结算的 ask_question 与 enter=False 的预填草稿都
+        发出 `state=blocked:kind=question`。
+        """
+        target = self.root / "osc-blocked.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+
+        question = self.stop(
+            "c-osc-question",
+            "",
+            steps=[
+                {"type": "USER_INPUT", "content": "选哪个方案"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "需要你确认方案。",
+                    "tool_calls": [{"name": "ask_question", **ask_args(1)}],
+                },
+            ],
+            extra_env=env,
+        )
+        self.assertEqual(question.returncode, 0, question.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_WAITING_QUESTION
+        )
+        self.assertEqual(send_calls(self.root), [])
+
+        pause = self.stop(
+            "c-osc-pause",
+            suggestion("继续推进实施", gate="pause"),
+            extra_env=env,
+        )
+        self.assertEqual(pause.returncode, 0, pause.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            runtime.OSC_7501_WAITING_QUESTION * 2,
+        )
+        sends = send_calls(self.root)
+        self.assertEqual(len(sends), 1)
+        self.assertNotIn("--enter", sends[0])
+
+    def test_osc_stop_holds_mail_when_delivery_is_ambiguous(self) -> None:
+        """An unknown send receipt never claims idle, and a rejection does.
+
+        Failure means an ambiguous delivery is treated as a free composer, so
+        arriving mail may be appended to the same draft, or a rejected prefill
+        is held forever.
+        resident-fact: status: 投递回执 unknown 时发出 blocked:question，
+        明确拒绝时发出 `state=done`。
+        """
+        target = self.root / "osc-ambiguous.log"
+        env = {"THE_PILOT_OSC_TARGET": str(target)}
+
+        unknown = self.stop(
+            "c-osc-unknown",
+            suggestion("继续推进", gate="auto"),
+            extra_env={**env, "FAKE_SEND_RESULT": "invalid"},
+        )
+        self.assertEqual(unknown.returncode, 0, unknown.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), runtime.OSC_7501_WAITING_QUESTION
+        )
+
+        rejected = self.stop(
+            "c-osc-rejected",
+            suggestion("继续推进", gate="auto"),
+            extra_env={**env, "FAKE_SEND_ACCEPTED": "0"},
+        )
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            runtime.OSC_7501_WAITING_QUESTION + runtime.OSC_7501_DONE,
+        )
+
     def test_status_reports_active_mode_scenes_and_hook_group(self) -> None:
         status = run_engine(self.root, self.gemini, self.state, "status", "--json")
         self.assertEqual(status.returncode, 0, status.stderr)
@@ -3709,6 +4004,227 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(report["mode"], "gate")
         self.assertEqual(len(report["scenes"]), 4)
         self.assertTrue(report["hooks_group"])
+
+
+class OscTargetResolutionTest(unittest.TestCase):
+    """Control-terminal facts for the OSC 7501 program-status channel."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+
+    def isolated_env(self, **values: str):
+        """Patch the process environment down to the OSC-relevant keys."""
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "THE_PILOT_GEMINI_DIR",
+                "ORCA_AUTOPILOT_GEMINI_DIR",
+                "THE_PILOT_OSC_TARGET",
+                "ORCA_PANE_KEY",
+                "ORCA_TERMINAL_HANDLE",
+            }
+        }
+        env.update(values)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    @staticmethod
+    def ps_result(stdout: str) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["ps"], 0, stdout, "")
+
+    def resolve_from(self, first: str, second: str | None = None):
+        responses = [first] if second is None else [first, second]
+
+        def fake_run(command, **kwargs):
+            stdout = responses.pop(0) if responses else ""
+            return self.ps_result(stdout)
+
+        with self.isolated_env(ORCA_PANE_KEY="pane-1"), mock.patch.object(
+            runtime.os, "getppid", return_value=5150
+        ), mock.patch.object(runtime.subprocess, "run", side_effect=fake_run):
+            return runtime._resolve_osc_target()
+
+    def test_frames_match_orca_program_status_contract(self) -> None:
+        """The exact wire frames Orca strips and maps to program activity.
+
+        Failure means Orca no longer recognizes the emitted sequence and the
+        pane status regresses to unknown.
+        resident-fact: status: OSC 7501 帧文本是 Orca
+        `terminal.program-status.v1` 的外部协议。
+        """
+        self.assertEqual(
+            runtime.OSC_7501_WORKING,
+            "\x1b]7501;state=working:app=antigravity\x07",
+        )
+        self.assertEqual(
+            runtime.OSC_7501_DONE, "\x1b]7501;state=done:app=antigravity\x07"
+        )
+        self.assertEqual(
+            runtime.OSC_7501_WAITING_QUESTION,
+            "\x1b]7501;state=blocked:kind=question:app=antigravity\x07",
+        )
+
+    def test_shell_wrapper_walks_up_to_the_agy_process(self) -> None:
+        """Only the ancestor agy's tty names Orca's pane, not a child PTY.
+
+        Failure means the hook writes status into an internal PTY created by
+        agy, where Orca never sees it.
+        resident-fact: status: `sh -> agy` 祖先链解析到 agy 的控制终端。
+        """
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[2] == "5150":
+                return self.ps_result("  4800 ttys999 -/bin/zsh\n")
+            if command[2] == "4800":
+                return self.ps_result("  4700 ttys999 /opt/homebrew/bin/agy\n")
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        with self.isolated_env(ORCA_PANE_KEY="pane-1"), mock.patch.object(
+            runtime.os, "getppid", return_value=5150
+        ), mock.patch.object(runtime.subprocess, "run", side_effect=fake_run):
+            resolved = runtime._resolve_osc_target()
+        self.assertEqual(resolved, (Path("/dev/ttys999"), False))
+        self.assertEqual([command[2] for command in calls], ["5150", "4800"])
+
+    def test_non_agy_lineage_and_invalid_ttys_are_rejected(self) -> None:
+        """A shell without an agy parent or a detached tty never targets a device.
+
+        Failure means status could be written to an unrelated process's
+        terminal or a non-terminal `ps` placeholder.
+        resident-fact: status: 非 agy 祖先、`?`/`??`/`-` tty 与越界路径一律拒绝。
+        """
+        cases = (
+            (
+                "shell-to-python",
+                "  4800 ttys999 /bin/bash\n",
+                "  4700 ttys999 /usr/bin/python3\n",
+            ),
+            ("direct-python", "  4700 ttys999 /usr/bin/python3\n", None),
+            ("detached-tty", "  4700 ?? /opt/homebrew/bin/agy\n", None),
+            ("unknown-tty", "  4700 - /opt/homebrew/bin/agy\n", None),
+            ("parent-gone", "", None),
+            (
+                "tty-traversal",
+                "  4700 ../../etc/passwd /opt/homebrew/bin/agy\n",
+                None,
+            ),
+        )
+        for label, first, second in cases:
+            with self.subTest(case=label):
+                self.assertIsNone(self.resolve_from(first, second))
+
+    def test_gemini_isolation_never_probes_processes_or_devices(self) -> None:
+        """Isolated unit tests and explicit installs resolve no control terminal.
+
+        Failure means the installed runtime probes host processes or writes to
+        host `/dev/tty*` during a test run inside a live Orca terminal.
+        resident-fact: status: 设置 THE_PILOT_GEMINI_DIR 且无显式目标时解析立即
+        返回 None，绝不运行 `ps`。
+        """
+        with self.isolated_env(
+            THE_PILOT_GEMINI_DIR=str(self.root / "gemini"),
+            ORCA_PANE_KEY="pane-1",
+        ), mock.patch.object(runtime.os, "getppid") as getppid, mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            self.assertIsNone(runtime._resolve_osc_target())
+        run.assert_not_called()
+        getppid.assert_not_called()
+
+        with self.isolated_env(), mock.patch.object(
+            runtime.os, "getppid"
+        ) as getppid, mock.patch.object(runtime.subprocess, "run") as run:
+            self.assertIsNone(runtime._resolve_osc_target())
+        run.assert_not_called()
+        getppid.assert_not_called()
+
+    def test_explicit_override_wins_and_none_disables_emission(self) -> None:
+        """An explicit target overrides isolation; empty or `none` disables it.
+
+        Failure means tests or users cannot redirect the status channel, or a
+        disabled channel silently falls back to probing the host.
+        resident-fact: status: THE_PILOT_OSC_TARGET 优先于一切隔离，空值与
+        `none` 表示不输出。
+        """
+        with self.isolated_env(
+            THE_PILOT_OSC_TARGET=str(self.root / "osc.log"),
+            THE_PILOT_GEMINI_DIR=str(self.root / "gemini"),
+        ):
+            self.assertEqual(
+                runtime._resolve_osc_target(), (self.root / "osc.log", True)
+            )
+        for value in ("", "   ", "none", "NONE"):
+            with self.subTest(value=value):
+                with self.isolated_env(
+                    THE_PILOT_OSC_TARGET=value, ORCA_PANE_KEY="pane-1"
+                ):
+                    self.assertIsNone(runtime._resolve_osc_target())
+
+    def test_explicit_file_target_receives_frames_with_private_mode(self) -> None:
+        """The explicit target appends raw frames and creates missing parents.
+
+        Failure means the observable status sequence cannot be asserted under
+        test isolation without touching a host terminal.
+        resident-fact: status: 显式文件目标按帧追加且权限为 0600。
+        """
+        target = self.root / "nested" / "osc.log"
+        log = self.root / "state" / "pilot.log"
+        with self.isolated_env(THE_PILOT_OSC_TARGET=str(target)), mock.patch.object(
+            runtime, "STATE_DIR", log.parent
+        ), mock.patch.object(runtime, "LOG_PATH", log):
+            self.assertTrue(runtime.emit_osc_7501(runtime.OSC_7501_DONE))
+            self.assertTrue(
+                runtime.emit_osc_7501(runtime.OSC_7501_WAITING_QUESTION)
+            )
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            runtime.OSC_7501_DONE + runtime.OSC_7501_WAITING_QUESTION,
+        )
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_unwritable_explicit_target_is_logged_not_raised(self) -> None:
+        """A failed status write stays out of hook JSON and leaves a log record.
+
+        Failure means a status write error can break the hook's stdout JSON or
+        disappear without evidence.
+        resident-fact: status: 写入失败只记录 `osc_status_write_failed` 并返回
+        False。
+        """
+        target = self.root / "blocked"
+        target.mkdir()
+        log = self.root / "state" / "pilot.log"
+        with self.isolated_env(THE_PILOT_OSC_TARGET=str(target)), mock.patch.object(
+            runtime, "STATE_DIR", log.parent
+        ), mock.patch.object(runtime, "LOG_PATH", log):
+            self.assertFalse(runtime.emit_osc_7501(runtime.OSC_7501_DONE))
+        self.assertIn("osc_status_write_failed", log.read_text(encoding="utf-8"))
+
+    def test_production_target_must_be_an_owned_character_device(self) -> None:
+        """A non-tty path can never receive program status.
+
+        Failure means production could write escape sequences into a regular
+        file or a device owned by another user.
+        resident-fact: status: 生产目标只接受当前用户拥有的字符设备。
+        """
+        target = self.root / "regular"
+        target.write_text("", encoding="utf-8")
+        log = self.root / "state" / "pilot.log"
+        with self.isolated_env(), mock.patch.object(
+            runtime, "_resolve_osc_target", return_value=(target, False)
+        ), mock.patch.object(runtime, "STATE_DIR", log.parent), mock.patch.object(
+            runtime, "LOG_PATH", log
+        ):
+            self.assertFalse(runtime.emit_osc_7501(runtime.OSC_7501_DONE))
+        self.assertIn("osc_status_target_rejected", log.read_text(encoding="utf-8"))
+
+        with mock.patch.object(runtime, "_resolve_osc_target") as resolve:
+            self.assertFalse(runtime.emit_osc_7501(""))
+        resolve.assert_not_called()
 
 
 if __name__ == "__main__":
