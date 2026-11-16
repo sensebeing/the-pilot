@@ -15,8 +15,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ from functools import partial
 from unittest import mock
 
 from the_pilot import compiler as profile_compiler
+from the_pilot import installer
 from the_pilot.assets import runtime
 from the_pilot.profile import resolve_profile as resolve_user_profile, normalize_comma_alias
 from the_pilot.defaults import DEFAULT_SPECS, DELIVER_STRATEGIES, HARNESS_ORCHESTRATION_SENTENCE
@@ -620,6 +623,46 @@ class CompilerTest(unittest.TestCase):
                     profile_compiler.merge_orchestration_md(malformed, block)
                 with self.assertRaises(ValueError):
                     profile_compiler.strip_orchestration_md(malformed)
+
+    def test_orchestration_merge_migrates_one_legacy_section(self) -> None:
+        # Failure means an upgrade keeps the pre-managed orchestration section
+        # beside the managed block, so `,worker` updates one copy while the
+        # stale priority (including trailing item 6 prose) survives unnoticed.
+        block = profile_compiler.render_orchestration_block(
+            resolve_profile(self.base, preset=None)
+        )
+        heading = profile_compiler.LEGACY_ORCHESTRATION_HEADING
+        legacy = (
+            "# 我的全局规则\n\n始终使用中文。\n\n"
+            f"{heading}AGY > Claude Code）\n\n"
+            "5. 旧的交互闭环说明。\n\n"
+            "6. 旧版收尾说明必须被迁移掉。\n\n"
+            "## 其他章节\n\n这一段必须保留。\n"
+        )
+        merged = profile_compiler.merge_orchestration_md(legacy, block)
+        self.assertEqual(merged.count(profile_compiler.ORCHESTRATION_BEGIN), 1)
+        self.assertEqual(merged.count(profile_compiler.ORCHESTRATION_END), 1)
+        self.assertEqual(merged.count(heading), 1)
+        self.assertNotIn("6. 旧版收尾说明", merged)
+        self.assertIn("始终使用中文。", merged)
+        self.assertIn("## 其他章节\n\n这一段必须保留。", merged)
+        self.assertEqual(profile_compiler.merge_orchestration_md(merged, block), merged)
+        self.assertEqual(
+            profile_compiler.strip_orchestration_md(merged),
+            "# 我的全局规则\n\n始终使用中文。\n\n## 其他章节\n\n这一段必须保留。\n",
+        )
+
+        duplicated = legacy + "\n" + f"{heading}Codex > Claude Code）\n旧规则二。\n"
+        with self.assertRaises(ValueError):
+            profile_compiler.merge_orchestration_md(duplicated, block)
+
+        fenced = (
+            "# 我的全局规则\n\n```markdown\n"
+            f"{heading}AGY > Claude Code）\n```\n"
+        )
+        merged_fenced = profile_compiler.merge_orchestration_md(fenced, block)
+        self.assertIn(f"```markdown\n{heading}AGY > Claude Code）\n```", merged_fenced)
+        self.assertEqual(merged_fenced.count(profile_compiler.ORCHESTRATION_BEGIN), 1)
 
     def test_compiled_guidance_separates_synchronous_and_async_questions(self) -> None:
         # Failure means the guidance again conflates an in-turn synchronous
@@ -1979,9 +2022,14 @@ class EngineTest(unittest.TestCase):
                 self.assertEqual(report["drift"], [])
 
     def test_worker_global_guidance_updates_only_for_default_install(self) -> None:
-        # Failure means a sandbox switch edits global guidance, or default switching leaves stale CLI examples.
+        # Failure means a sandbox switch edits global guidance, a default switch
+        # rewrites markerless user prose, or the managed block keeps stale CLI
+        # examples after the worker order changes.
         gemini = self.root / "home" / ".gemini"
         apply_profile(self.root, gemini, "--preset", "recommended")
+        block = profile_compiler.render_orchestration_block(
+            read_json(gemini / PROFILE_REL)
+        )
         original = (
             "## Orca Orchestration：Claude Code > Codex）\n"
             "执行器优先级：Claude Code > Codex）\n"
@@ -2005,11 +2053,23 @@ class EngineTest(unittest.TestCase):
         self.assertEqual((gemini / PROFILE_REL).read_bytes(), profile_before)
         self.assertEqual((gemini / GEMINI_REL).read_bytes(), guidance_before)
         self.assertEqual(paths[0].read_text(encoding="utf-8"), original)
-        paths[1].write_text(original.replace("默认优先使用 ", "默认优先 "), encoding="utf-8")
+        for path in paths:
+            path.write_text(original, encoding="utf-8")
+        markerless = run_engine(
+            self.root, gemini, self.state, "worker", "codex",
+            extra_env={"THE_PILOT_GEMINI_DIR": None},
+        )
+        self.assertEqual(markerless.returncode, 0, markerless.stderr)
+        for path in paths:
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+        seeded = "保留其他用户规则\n\n" + block
+        for path in paths:
+            path.write_text(seeded, encoding="utf-8")
         actual = run_engine(self.root, gemini, self.state, "worker", "codex", extra_env={"THE_PILOT_GEMINI_DIR": None})
         self.assertEqual(actual.returncode, 0, actual.stderr)
         for path in paths:
             text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count(profile_compiler.ORCHESTRATION_BEGIN), 1)
             self.assertIn("Orca Orchestration：Codex > Claude Code", text)
             self.assertIn("--name <name> --agent codex", text)
             self.assertIn("次选 `--agent claude`", text)
@@ -3987,6 +4047,212 @@ class GlobalGuidanceTest(unittest.TestCase):
         upgraded = read_json(profile_path)
         self.assertEqual(upgraded["orchestration"]["coordinator_agent"], "agy")
 
+
+    def strip_managed_blocks(self) -> None:
+        for path in self.guidance:
+            path.write_text(
+                profile_compiler.strip_orchestration_md(path.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+
+    def seed_legacy_guidance(self) -> None:
+        heading = profile_compiler.LEGACY_ORCHESTRATION_HEADING
+        for path in self.guidance:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "# 用户规则\n\n保留段落。\n\n"
+                f"{heading}AGY > Claude Code）\n\n"
+                "5. 旧交互说明。\n\n6. 旧收尾说明。\n\n"
+                "## 用户后续章节\n\n也必须保留。\n",
+                encoding="utf-8",
+            )
+
+    def make_checkout(self) -> Path:
+        checkout = self.root / "checkout"
+        subprocess.run(
+            ["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True
+        )
+        for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+        launcher = checkout / "bin/pilot"
+        launcher.parent.mkdir()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
+            "from the_pilot.cli import main\n"
+            "raise SystemExit(main())\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "commit", "-m", "checkout"],
+            check=True,
+            capture_output=True,
+        )
+        return checkout
+
+    def test_legacy_unmanaged_heading_migrates_on_apply_and_worker_switch(self) -> None:
+        # Failure means an upgraded default install keeps the stale unmanaged
+        # orchestration section beside the managed block, so a later ,worker
+        # switch leaves two diverging owners and status hides the drift.
+        self.seed_legacy_guidance()
+        self.default_apply("--preset", "recommended")
+        for path in self.guidance:
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(
+                text.count(profile_compiler.LEGACY_ORCHESTRATION_HEADING), 1, text
+            )
+            self.assertNotIn("6. 旧收尾说明", text)
+            self.assertIn("保留段落。", text)
+            self.assertIn("## 用户后续章节\n\n也必须保留。", text)
+        result = run_default_engine(
+            self.root, self.gemini, self.state, "worker", "codex", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in self.guidance:
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(
+                text.count(profile_compiler.LEGACY_ORCHESTRATION_HEADING), 1, text
+            )
+            self.assertIn("Orca Orchestration：Codex > Claude Code", text)
+            self.assertNotIn("Orca Orchestration：AGY > Claude Code", text)
+        report = json.loads(run_setup_default(self.root, "status").stdout)
+        self.assertEqual(report["drift"], [], report["drift"])
+
+    def test_worker_switch_does_not_rewrite_markerless_global_files(self) -> None:
+        # Failure means the runtime still owns whole legacy files, editing user
+        # prose instead of reporting the unmanaged file as drift.
+        self.seed_guidance()
+        self.default_apply("--preset", "recommended")
+        self.strip_managed_blocks()
+        before = {path: path.read_text(encoding="utf-8") for path in self.guidance}
+        result = run_default_engine(
+            self.root, self.gemini, self.state, "worker", "codex", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in self.guidance:
+            self.assertEqual(path.read_text(encoding="utf-8"), before[path])
+        drift = json.loads(run_setup_default(self.root, "status").stdout)["drift"]
+        self.assertTrue(any(".claude/CLAUDE.md" in item for item in drift), drift)
+
+    def test_managed_writes_preserve_existing_file_mode(self) -> None:
+        # Failure means a default install widens a user's 0600 global guidance
+        # file to installer-artifact mode across apply, ,worker, or uninstall.
+        self.seed_guidance()
+        for path in self.guidance:
+            path.chmod(0o600)
+        self.default_apply("--preset", "recommended")
+        run_default_engine(self.root, self.gemini, self.state, "worker", "codex", "--json")
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, original in self.guidance.items():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_managed_writes_preserve_symlinked_guidance_targets(self) -> None:
+        # Failure means the default install replaces a user's symlinked dotfile
+        # with a regular file instead of rewriting its resolved target.
+        targets: dict[Path, Path] = {}
+        for path, original in self.guidance.items():
+            target = self.root / "dotfiles" / path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(original, encoding="utf-8")
+            target.chmod(0o600)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+            targets[path] = target
+        self.default_apply("--preset", "recommended")
+        run_default_engine(self.root, self.gemini, self.state, "worker", "codex", "--json")
+        for path, target in targets.items():
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertIn(
+                profile_compiler.ORCHESTRATION_BEGIN,
+                target.read_text(encoding="utf-8"),
+            )
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, target in targets.items():
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), self.guidance[path])
+
+    def test_uninstall_keeps_empty_pre_existing_guidance_file(self) -> None:
+        # Failure means uninstall deletes a user-created empty dotfile that the
+        # installer never created.
+        for path in self.guidance:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        self.default_apply("--preset", "recommended")
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in self.guidance:
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+
+    def test_explicit_default_gemini_dir_owns_global_guidance(self) -> None:
+        # Failure means `--gemini-dir $HOME/.gemini` is misclassified as a
+        # sandbox, so a re-apply, status, or uninstall silently skips the blocks.
+        self.seed_guidance()
+        apply_profile(self.root, self.gemini, "--preset", "recommended")
+        for path in self.guidance:
+            self.assertIn(
+                profile_compiler.ORCHESTRATION_BEGIN,
+                path.read_text(encoding="utf-8"),
+            )
+        report = json.loads(run_setup(self.root, self.gemini, "status").stdout)
+        self.assertEqual(report["drift"], [], report["drift"])
+        result = run_setup(self.root, self.gemini, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, original in self.guidance.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_bare_self_update_without_checkout_syncs_global_guidance(self) -> None:
+        # Failure means a default install updated without a local checkout
+        # skips the managed blocks, leaving stale priority guidance behind.
+        self.seed_guidance()
+        self.default_apply("--preset", "recommended")
+        self.strip_managed_blocks()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.home),
+                "THE_PILOT_GEMINI_DIR": "",
+                "ORCA_AUTOPILOT_GEMINI_DIR": "",
+            },
+        ), mock.patch.object(
+            installer, "_discover_checkout", return_value=(None, False)
+        ):
+            args = installer.build_parser().parse_args(
+                ["self-update", "--local-only", "--json"]
+            )
+            report = installer.self_update(args)
+        self.assertEqual(report["status"], "skipped_no_source", report)
+        for path in self.guidance:
+            self.assertIn(
+                profile_compiler.ORCHESTRATION_BEGIN,
+                path.read_text(encoding="utf-8"),
+            )
+
+    def test_self_update_with_checkout_syncs_global_guidance(self) -> None:
+        # Failure means the checkout re-apply passes --gemini-dir explicitly and
+        # is then mistaken for a sandbox, skipping the managed blocks.
+        self.seed_guidance()
+        self.default_apply("--preset", "recommended")
+        self.strip_managed_blocks()
+        checkout = self.make_checkout()
+        result = run_setup_default(
+            self.root, "self-update", "--local-only", "--checkout-dir", str(checkout)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in self.guidance:
+            self.assertIn(
+                profile_compiler.ORCHESTRATION_BEGIN,
+                path.read_text(encoding="utf-8"),
+            )
+        report = json.loads(run_setup_default(self.root, "status").stdout)
+        self.assertEqual(report["drift"], [], report["drift"])
 
 if __name__ == "__main__":
     unittest.main()

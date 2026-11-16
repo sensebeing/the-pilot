@@ -11,6 +11,8 @@ from .defaults import AGENT_LABELS, COORDINATOR_AGENTS, GEMINI_BEGIN, GEMINI_END
 from .project import ProfileError, project_specs
 from .profile import _copy_mapping, validate_profile
 
+LEGACY_ORCHESTRATION_HEADING = "## 子 Agent 与多任务编排规范（Orca Orchestration："
+
 
 @dataclass(frozen=True)
 class CompiledBundle:
@@ -143,7 +145,7 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
         executor += f"，其次使用 {AGENT_LABELS[secondary]}（`--agent {secondary}`）"
     secondary_hint = f"次选 `--agent {secondary}`；" if secondary else ""
     review_priority = " > ".join(AGENT_LABELS[item] for item in review_agents)
-    return f"""## 子 Agent 与多任务编排规范（Orca Orchestration：{priority}）
+    return f"""{LEGACY_ORCHESTRATION_HEADING}{priority}）
 
 必须遵循 `~/.agents/skills/orchestration/SKILL.md`：编排前执行 `orca skills get orchestration`（按需加载 coordinator-loop、placement-and-remote、recovery-and-cleanup 等 references），并遵守 5 项准则：
 
@@ -167,11 +169,24 @@ def render_orchestration_block(profile: dict[str, Any]) -> str:
 
 
 def merge_orchestration_md(existing: str, block: str) -> str:
-    """Replace our managed orchestration block, preserving unrelated prose."""
+    """Replace our managed orchestration block, migrating one legacy section."""
     text = existing or ""
     bounds = _orchestration_block_bounds(text)
     rendered = block if block.endswith("\n") else block + "\n"
     if bounds is None:
+        legacy = _legacy_orchestration_heading_positions(text)
+        if len(legacy) > 1:
+            raise ValueError(
+                "Agent 全局指引存在多处未托管的「## 子 Agent 与多任务编排规范"
+                "（Orca Orchestration：」章节，无法安全迁移；请只保留一处后重试"
+            )
+        if legacy:
+            start = legacy[0]
+            end = _markdown_section_end(text, start)
+            prefix = text[:start].rstrip("\n")
+            suffix = text[end:].lstrip("\n")
+            parts = [part for part in (prefix, rendered.rstrip("\n"), suffix.rstrip("\n")) if part]
+            return "\n\n".join(parts) + "\n"
         if not text.strip():
             return rendered
         return text.rstrip("\n") + "\n\n" + rendered
@@ -209,6 +224,41 @@ def _orchestration_block_bounds(text: str) -> tuple[int, int] | None:
             "Agent 全局指引的 THE_PILOT_ORCHESTRATION 托管标记必须恰好各出现一次且顺序正确"
         )
     return begins[0], ends[0] + len(ORCHESTRATION_END)
+
+
+def _legacy_orchestration_heading_positions(text: str) -> list[int]:
+    """Return offsets of the pre-managed orchestration heading outside fences."""
+    positions: list[int] = []
+    fence: str | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if fence is None:
+            if stripped.startswith(("```", "~~~")):
+                fence = stripped[:3]
+            elif line.startswith(LEGACY_ORCHESTRATION_HEADING):
+                positions.append(offset)
+        elif stripped.startswith(fence):
+            fence = None
+        offset += len(line)
+    return positions
+
+
+def _markdown_section_end(text: str, start: int) -> int:
+    """Return where the level-2 section starting at ``start`` ends, outside fences."""
+    fence: str | None = None
+    offset = start
+    for index, line in enumerate(text[start:].splitlines(keepends=True)):
+        stripped = line.strip()
+        if index and fence is None and (line.startswith("# ") or line.startswith("## ")):
+            return offset
+        if fence is None:
+            if stripped.startswith(("```", "~~~")):
+                fence = stripped[:3]
+        elif stripped.startswith(fence):
+            fence = None
+        offset += len(line)
+    return len(text)
 
 
 def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:

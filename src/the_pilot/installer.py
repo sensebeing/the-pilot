@@ -17,6 +17,7 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -325,7 +326,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
 
     merged_gemini = profile_compiler.merge_gemini_md(current_gemini, bundle.gemini_block)
     merged_hooks = profile_compiler.merge_hooks_json(hooks, str(engine_path))
-    global_guidance = _merged_global_guidance(args, bundle.profile_json)
+    global_guidance = _merged_global_guidance(args, bundle.profile_json, gemini_dir)
     stale_scenes = [
         name
         for name in BUILTIN_SCENE_FILES
@@ -347,7 +348,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     if merged_hooks != hooks or not hooks_path.is_file():
         atomic_write_text(hooks_path, json_text(merged_hooks))
     for guidance_path, guidance_text in global_guidance:
-        atomic_write_text(guidance_path, guidance_text)
+        atomic_write_user_file(guidance_path, guidance_text)
     for name in stale_scenes:
         (scenes_dir / name).unlink()
 
@@ -387,26 +388,28 @@ def _installed_path(gemini_dir: Path, name: str) -> Path:
     return legacy if legacy.exists() else canonical
 
 
-def default_install_home(args: argparse.Namespace) -> Path | None:
-    """Return the home dir of an unredirected default install, else ``None``.
+def default_install_home(args: argparse.Namespace, gemini_dir: Path) -> Path | None:
+    """Return the home dir of the resolved default install, else ``None``.
 
-    Only the default ``$HOME/.gemini`` install owns the agent products' global
-    guidance. An explicit ``--gemini-dir`` or the environment override marks a
-    sandboxed or isolated install, which must never read or write the real
-    ``~/.claude`` or ``~/.codex`` files.
+    Only the install rooted at ``$HOME/.gemini`` owns the agent products'
+    global guidance. The decision is made from the resolved install root, so
+    every entry point (apply, status, uninstall, self-update, auto-upgrade)
+    classifies the same installation identically. A redirected root such as an
+    explicit ``--gemini-dir /tmp/sandbox`` or the environment override is a
+    sandboxed install, which must never read or write the real ``~/.claude``
+    or ``~/.codex`` files.
     """
-    if getattr(args, "gemini_dir", None):
+    home = Path(os.path.expanduser(getattr(args, "home_dir", "~"))).resolve()
+    if gemini_dir.resolve() != (home / ".gemini").resolve():
         return None
-    if _env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR"):
-        return None
-    return Path(os.path.expanduser(getattr(args, "home_dir", "~"))).resolve()
+    return home
 
 
 def _merged_global_guidance(
-    args: argparse.Namespace, profile: dict[str, Any]
+    args: argparse.Namespace, profile: dict[str, Any], gemini_dir: Path
 ) -> list[tuple[Path, str]]:
     """Render the managed orchestration block into existing agent files."""
-    home_dir = default_install_home(args)
+    home_dir = default_install_home(args, gemini_dir)
     if home_dir is None:
         return []
     block = profile_compiler.render_orchestration_block(profile)
@@ -426,10 +429,10 @@ def _merged_global_guidance(
 
 
 def _stripped_global_guidance(
-    args: argparse.Namespace,
+    args: argparse.Namespace, gemini_dir: Path
 ) -> tuple[list[tuple[Path, str]], list[str]]:
     """Remove the managed orchestration block from existing agent files."""
-    home_dir = default_install_home(args)
+    home_dir = default_install_home(args, gemini_dir)
     if home_dir is None:
         return [], []
     removals: list[tuple[Path, str]] = []
@@ -450,10 +453,10 @@ def _stripped_global_guidance(
 
 
 def _global_guidance_drift(
-    args: argparse.Namespace, profile: dict[str, Any]
+    args: argparse.Namespace, profile: dict[str, Any], gemini_dir: Path
 ) -> list[str]:
     """Report agent files whose managed orchestration block is stale."""
-    home_dir = default_install_home(args)
+    home_dir = default_install_home(args, gemini_dir)
     if home_dir is None:
         return []
     block = profile_compiler.render_orchestration_block(profile)
@@ -586,7 +589,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
 
     existing_config = read_json_object(config_path, "config.json") or {}
     bundle = profile_compiler.compile_bundle(profile, project=project)
-    report["drift"].extend(_global_guidance_drift(args, bundle.profile_json))
+    report["drift"].extend(_global_guidance_drift(args, bundle.profile_json, gemini_dir))
     report.update(
         {
             "mode": bundle.profile_json["pilot"]["mode"],
@@ -1063,7 +1066,7 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         or (legacy_dir / LEGACY_ENGINE_NAME).is_file()
     )
     removed: list[str] = []
-    global_guidance, global_labels = _stripped_global_guidance(args)
+    global_guidance, global_labels = _stripped_global_guidance(args, gemini_dir)
     hooks = read_json_object(hooks_path, "hooks.json")
     if hooks is not None and (HOOK_GROUP in hooks or LEGACY_HOOK_GROUP in hooks):
         for group in (HOOK_GROUP, LEGACY_HOOK_GROUP):
@@ -1081,10 +1084,7 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         removed.append("GEMINI.md:managed-block")
 
     for guidance_path, guidance_text in global_guidance:
-        if guidance_text:
-            atomic_write_text(guidance_path, guidance_text)
-        else:
-            guidance_path.unlink()
+        atomic_write_user_file(guidance_path, guidance_text)
     removed.extend(global_labels)
 
     for path, label in (
@@ -1268,6 +1268,18 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
                 os.unlink(temp_name)
             except OSError:
                 pass
+
+
+def atomic_write_user_file(path: Path, content: str) -> None:
+    """Atomically rewrite an existing user-owned file in place.
+
+    Follows symlinks so the link itself survives, preserves the existing
+    permission bits, and fails closed on a missing target instead of creating a
+    file the user never had.
+    """
+    target = path.resolve(strict=True)
+    mode = stat.S_IMODE(target.stat().st_mode)
+    atomic_write_text(target, content, mode=mode)
 
 
 def has_pilot_hook_group(hooks_path: Path) -> bool:
