@@ -10,6 +10,7 @@ resident-fact: admission: 只有同回合已回答的同步提问才放行预填
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -4733,6 +4734,143 @@ class OscTargetResolutionTest(unittest.TestCase):
         record = log.read_text(encoding="utf-8")
         self.assertIn("osc_status_write_failed", record)
         self.assertIn("short_osc_write", record)
+
+    def test_transient_eagain_after_partial_write_drains_the_frame(self) -> None:
+        """A full PTY output buffer delays bytes instead of truncating the frame.
+
+        Failure means a multi-KB agy redraw at turn end makes the status frame
+        drop with `EAGAIN` instead of draining once the slave is writable.
+        resident-fact: status: 非阻塞 PTY 的瞬时 `EAGAIN` 在
+        `OSC_WRITE_TIMEOUT_SECONDS` 内经 `select` 等待可写并补齐整帧。
+        """
+        target = self.root / "osc.log"
+        log = self.root / "state" / "pilot.log"
+        frame = runtime.OSC_7501_DONE
+        data = frame.encode("utf-8")
+        chunks: list[bytes] = []
+        attempts: list[bytes] = []
+        selected: list[tuple] = []
+
+        def fake_write(fd, payload):
+            attempts.append(payload)
+            if len(attempts) == 1:
+                chunks.append(payload[:4])
+                return 4
+            if len(attempts) == 2:
+                raise BlockingIOError(
+                    errno.EAGAIN, "Resource temporarily unavailable"
+                )
+            chunks.append(payload)
+            return len(payload)
+
+        def fake_select(readable, writable, exceptional, timeout):
+            selected.append((readable, writable, exceptional, timeout))
+            return ([], writable, [])
+
+        with self.isolated_env(THE_PILOT_OSC_TARGET=str(target)), mock.patch.object(
+            runtime, "STATE_DIR", log.parent
+        ), mock.patch.object(runtime, "LOG_PATH", log), mock.patch.object(
+            runtime.os, "write", side_effect=fake_write
+        ) as write, mock.patch.object(
+            runtime.select, "select", side_effect=fake_select
+        ):
+            self.assertTrue(runtime.emit_osc_7501(frame))
+        self.assertEqual(b"".join(chunks), data)
+        self.assertEqual(attempts[2], data[4:])
+        self.assertEqual(write.call_count, 3)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][1], [write.call_args_list[0].args[0]])
+        self.assertGreater(selected[0][3], 0)
+        self.assertLessEqual(selected[0][3], runtime.OSC_WRITE_TIMEOUT_SECONDS)
+        self.assertFalse(log.exists())
+
+    def test_persistent_eagain_fails_closed_and_closes_the_descriptor(self) -> None:
+        """When the PTY never drains, the frame fails closed and frees the fd.
+
+        Failure means a full slave can spin the hook or leak a descriptor
+        instead of recording `osc_status_write_failed` and returning False.
+        resident-fact: status: `select` 超时仍不可写时重新抛出 `EAGAIN`、关闭
+        描述符、记录 `osc_status_write_failed` 并返回 False。
+        """
+        target = self.root / "osc.log"
+        log = self.root / "state" / "pilot.log"
+        opened: list[int] = []
+        selected: list[tuple] = []
+
+        def fake_write(fd, payload):
+            opened.append(fd)
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        def fake_select(readable, writable, exceptional, timeout):
+            selected.append((readable, writable, exceptional, timeout))
+            return ([], [], [])
+
+        with self.isolated_env(THE_PILOT_OSC_TARGET=str(target)), mock.patch.object(
+            runtime, "STATE_DIR", log.parent
+        ), mock.patch.object(runtime, "LOG_PATH", log), mock.patch.object(
+            runtime.os, "write", side_effect=fake_write
+        ), mock.patch.object(runtime.select, "select", side_effect=fake_select):
+            self.assertFalse(runtime.emit_osc_7501(runtime.OSC_7501_DONE))
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][1], [opened[0]])
+        self.assertGreater(selected[0][3], 0)
+        self.assertLessEqual(selected[0][3], runtime.OSC_WRITE_TIMEOUT_SECONDS)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+        record = log.read_text(encoding="utf-8")
+        self.assertIn("osc_status_write_failed", record)
+        self.assertIn("Resource temporarily unavailable", record)
+
+    def test_nested_shell_wrappers_resolve_only_through_three_hops(self) -> None:
+        """Nested shims still reach agy; runaway shell chains resolve to None.
+
+        Failure means a doubly wrapped hook loses the pane status, or a shell
+        chain without agy is mistaken for the owning terminal.
+        resident-fact: status: 祖先链最多跨过 3 层 shell wrapper，之后第一个
+        非 shell 进程必须是 `agy`，否则解析为 None。
+        """
+
+        def resolve_with(responses: dict[int, str]):
+            def fake_run(command, **kwargs):
+                stdout = responses.get(int(command[2]))
+                if stdout is None:
+                    return subprocess.CompletedProcess(command, 1, "", "")
+                return self.ps_result(stdout)
+
+            with self.isolated_env(ORCA_PANE_KEY="pane-1"), mock.patch.object(
+                runtime.os, "getppid", return_value=5150
+            ), mock.patch.object(runtime.subprocess, "run", side_effect=fake_run):
+                return runtime._resolve_osc_target()
+
+        self.assertEqual(
+            resolve_with(
+                {
+                    5150: "  5140 ttys010 /bin/sh\n",
+                    5140: "  5130 ttys010 /bin/bash\n",
+                    5130: "  5100 ttys042 /opt/homebrew/bin/agy\n",
+                }
+            ),
+            (Path("/dev/ttys042"), False),
+        )
+        self.assertIsNone(
+            resolve_with(
+                {
+                    5150: "  5140 ttys010 /bin/sh\n",
+                    5140: "  5130 ttys010 /bin/bash\n",
+                    5130: "  5120 ttys010 /bin/zsh\n",
+                    5120: "  5100 ttys010 /bin/dash\n",
+                }
+            )
+        )
+        self.assertIsNone(
+            resolve_with(
+                {
+                    5150: "  5140 ttys010 /bin/sh\n",
+                    5140: "  5130 ttys010 /bin/bash\n",
+                    5130: "  5100 ttys042 /usr/bin/python3\n",
+                }
+            )
+        )
 
 
 class GlobalGuidanceTest(unittest.TestCase):

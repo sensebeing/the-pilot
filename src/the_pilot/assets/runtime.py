@@ -16,10 +16,12 @@ personal paths are hard-coded.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import select
 import signal
 import stat
 from contextlib import contextmanager
@@ -120,6 +122,9 @@ OSC_7501_WORKING = "\x1b]7501;state=working:app=antigravity\x07"
 OSC_7501_DONE = "\x1b]7501;state=done:app=antigravity\x07"
 OSC_7501_WAITING_QUESTION = "\x1b]7501;state=blocked:kind=question:app=antigravity\x07"
 SHELL_WRAPPER_NAMES = frozenset({"sh", "dash", "bash", "zsh"})
+# A non-blocking PTY slave accepts status bytes only while its output ring
+# buffer has room; drain transient backpressure for this long, then fail.
+OSC_WRITE_TIMEOUT_SECONDS = 0.25
 class HookExecutionError(RuntimeError):
     """A hook refused to act because its installed configuration is unusable."""
 
@@ -1606,7 +1611,9 @@ def _resolve_osc_target() -> tuple[Path, bool] | None:
 
     Antigravity allocates child PTYs for subprocesses, so `os.ctermid()` inside
     this hook names the wrong terminal. Only the ancestor `agy` process's `ps`
-    tty column points at Orca's pane. Tests and non-Orca hosts resolve to None:
+    tty column points at Orca's pane; nested shell shims (`sh -> bash -> agy`)
+    are walked for up to three hops before that non-shell ancestor is required
+    to be `agy`. Tests and non-Orca hosts resolve to None:
     an explicit override always wins, then Gemini-dir isolation stays inert
     (never probing `ps` or writing host TTYs), then the Orca pane environment
     gates the ancestor walk.
@@ -1625,13 +1632,13 @@ def _resolve_osc_target() -> tuple[Path, bool] | None:
     ):
         return None
     pid = os.getppid()
-    for hop in range(2):
+    for hop in range(4):
         process = _ps_process(pid)
         if process is None:
             return None
         ppid, tty, comm = process
         executable = Path(comm.strip().lstrip("-")).name
-        if hop == 0 and executable in SHELL_WRAPPER_NAMES:
+        if hop < 3 and executable in SHELL_WRAPPER_NAMES:
             if ppid <= 1:
                 return None
             pid = ppid
@@ -1650,6 +1657,36 @@ def _open_override_target(target: Path) -> int:
             return os.open(target, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
     target.parent.mkdir(parents=True, exist_ok=True)
     return os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+
+
+def _write_osc_bytes(fd: int, data: bytes) -> None:
+    """Write one frame, draining transient PTY backpressure until the deadline.
+
+    A non-blocking tty slave raises `EAGAIN` while its output ring buffer is
+    full (1 KiB on macOS), so a status frame can arrive exactly when agy is
+    flushing a TUI redraw. Wait for writability instead of dropping the frame,
+    but never spin or block the hook past `OSC_WRITE_TIMEOUT_SECONDS`.
+    """
+    deadline = time.monotonic() + OSC_WRITE_TIMEOUT_SECONDS
+    written = 0
+    while written < len(data):
+        try:
+            count = os.write(fd, data[written:])
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable:
+                raise
+            continue
+        if count <= 0:
+            raise OSError("short_osc_write")
+        written += count
 
 
 def emit_osc_7501(frame: str) -> bool:
@@ -1678,12 +1715,7 @@ def emit_osc_7501(frame: str) -> bool:
                 if not stat.S_ISCHR(opened.st_mode) or opened.st_uid != os.getuid():
                     log_event("osc_status_target_rejected", target=str(target))
                     return False
-            written = 0
-            while written < len(data):
-                count = os.write(fd, data[written:])
-                if count <= 0:
-                    raise OSError("short_osc_write")
-                written += count
+            _write_osc_bytes(fd, data)
         finally:
             os.close(fd)
     except (OSError, ValueError) as exc:
@@ -2009,7 +2041,10 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
     Orca treating the agent as working (the turn continues or a new turn was
     already submitted), `done` releases orchestration mail, and
     `blocked:kind=question` makes Orca hold mail while the agent waits behind a
-    picker or an unconfirmed prefilled draft.
+    picker or an unconfirmed prefilled draft. That hold decides mail delivery
+    only while this hook is the pane's sole OSC 7501 emitter: agy's built-in
+    emitter, when active, writes its own `done` after the Stop hooks return and
+    supersedes the frame returned here.
     """
     termination = str(payload.get("terminationReason") or "")
     fully_idle = payload.get("fullyIdle")
