@@ -692,6 +692,33 @@ class CompilerTest(unittest.TestCase):
             "同步提问直接调 `ask_question`（不写标签），异步待答输出 `scene=NONE`",
             plan_scene,
         )
+        # Failure means diagnosis can skip design/review and trigger coding;
+        # both universal and project guidance must preserve progression and the
+        # same authorization boundary at every stage.
+        for scene in (plan_scene, profile_compiler.compile_bundle(
+            resolve_user_profile(self.base, preset="recommended")
+        ).scenes["01-plan-and-orchestrate.md"]):
+            steps = [scene.index(f"**进度 {step}") for step in ("①", "②", "③")]
+            self.assertEqual(steps, sorted(steps))
+            for clause in (
+                "按当前实际进度单步递进，严禁跳步合并",
+                "严禁直接编排子工作区改代码",
+                "产出详细的工程架构修复/收敛方案",
+                "严禁未经方案 review 直接启动实施",
+                "方案级最简架构 Review",
+                "按已审定方案通过 Orca 编排子工作区推进实施",
+                "进度 ① → ② → ③ 均按",
+                "A 类及已确认边界内的 B 类 `gate=auto` 单步递进",
+                "B 类方案/裁决未确认 `gate=pause`",
+                "对方案做最简架构 review 后先停下等我确认再进入实施",
+            ):
+                self.assertIn(clause, scene)
+            self.assertNotIn("跳过方案复审", scene)
+            self.assertNotIn("进度 ①、② 默认 `gate=auto`", scene)
+        self.assertIn("B 类方案/裁决未确认标 `gate=pause`", universal)
+        self.assertIn("已确认边界内 `gate=auto` 单步递进", universal)
+        self.assertIn("定位 → 出详细方案 → 方案级架构 review → 编排实施", universal)
+        self.assertIn("不得跳过方案设计或方案复审", universal)
         self.assertLess(len(bundle.gemini_block.encode("utf-8")), 20000)
         for preset in sorted(DEFAULT_SPECS["presets"]):
             for strategy in DELIVER_STRATEGIES:

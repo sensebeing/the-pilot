@@ -147,18 +147,18 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
     review_priority = " > ".join(AGENT_LABELS[item] for item in review_agents)
     return f"""{LEGACY_ORCHESTRATION_HEADING}{priority}）
 
-必须遵循 `~/.agents/skills/orchestration/SKILL.md`：编排前执行 `orca skills get orchestration`（按需加载 coordinator-loop、placement-and-remote、recovery-and-cleanup 等 references），并遵守 5 项准则：
+编排前执行 `orca skills get orchestration`，遵循 `~/.agents/skills/orchestration/SKILL.md` 及按需 references：
 
-1. **主-子会话职责分离（Tier-1 AGY 主会话设计且 Review，Tier-2 子会话实施）**：
-   - **Tier-1 主会话（Coordinator，提示词不含 Orca Task ID / Dispatch ID preamble）**：固定为原生 **{coordinator_label}**（`antigravity`；直接 `agy --dangerously-skip-permissions` 启动，账户池由 Orca 与 `agy-switch` 管理，禁止 `magpie agy` 包装；新建顶层工作区须先把路径登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`）；**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障、审查或设计须结合近期同链路修改史与端到端调用拓扑，**从整个架构去看，是否应该有更简洁、更加根本的修复方案**，严禁只修表象、枚举黑白名单或叠局部重试/特判；除极简单小改动可顺手处理外，实现统一经 Orca `orchestration` 交子工作区/子会话。
+1. **职责分离（Tier-1 设计与 Review，Tier-2 实施）**：
+   - **Tier-1 主会话（Coordinator，提示词不含 Orca Task ID / Dispatch ID preamble）**：固定为原生 **{coordinator_label}**（`antigravity`；直接 `agy --dangerously-skip-permissions` 启动，账户池由 Orca 与 `agy-switch` 管理，禁止 `magpie agy` 包装；新建顶层工作区须先把路径登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`）；**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障/设计结合近期同链路历史与端到端拓扑，找最简根治方案，禁止表象补丁、黑白名单、局部重试/特判；除极简单改动外，实施交 Orca 子会话。
    - **Tier-2 子会话（Dispatched Worker，提示词含 Orca live Task ID / Dispatch ID preamble）**：由 `orca orchestration worker-start` 以 `claude`/`codex` 启动，在分配分支修改、定向验证并提交，用 `worker_done` 汇报，不向下套娃；架构级分歧回传主会话。
-2. **统一用 Orca Orchestration 替代内置 Subagent（执行器优先级：{priority}）**：有代码实施或并行任务时**禁用内置 `invoke_subagent`** 与无监督裸终端移交，统一经 `orca orchestration`：先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定受控 Run；{executor}。Task spec 自包含（Target、Contracts、Files、Boundaries、Ownership、Acceptance）并声明「分支开发、未经主会话 Review 通过不得合入或推送 `main`」。
-3. **工作区层级与跨仓回调（禁止平级工作区）**：同工作区用 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）；同仓子工作区用 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须显式 `--parent-worktree active` 或 `path:<当前路径>`），确保挂为**子工作区**；跨仓并需回传用 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，由 `worker_done` 唤醒主会话。仅用户明确要求独立长期 Tier-1 工作区时才用 `--no-parent` 建顶层工作区（原生 {coordinator_label} 任主会话）；若需回执，绑定 Dealer thread 或 `orca orchestration send` 回调，**严禁无监督移交后失联**；否则**严禁 `--worktree new-top-level`/`--no-parent`** 建平行顶层工作区。
+2. **Orca 编排（执行器优先级：{priority}）**：实施/并行任务**禁用内置 `invoke_subagent`** 及无监督裸终端移交；先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定受控 Run；{executor}。Task spec 自包含（Target、Contracts、Files、Boundaries、Ownership、Acceptance）并声明「分支开发、未经主会话 Review 通过不得合入或推送 `main`」。
+3. **工作区层级与跨仓回调（禁止平级工作区）**：同工作区用 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）；同仓子工作区用 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须显式 `--parent-worktree active` 或 `path:<当前路径>`），挂为**子工作区**；跨仓并需回传用 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，由 `worker_done` 唤醒主会话。仅用户明确要求独立长期 Tier-1 时才用 `--no-parent` 建顶层工作区（原生 {coordinator_label} 任主会话）；若需回执，绑定 Dealer thread 或 `orca orchestration send` 回调，**严禁无监督移交后失联**；否则**严禁 `--worktree new-top-level`/`--no-parent`** 建平行顶层工作区。
 4. **分支隔离**：子会话在独立功能分支修改、定向验证并提交；初版实施及打回阶段**严禁自行合入或推送 `main`**（Task spec 必须声明）；仅主会话 Code Review 判定「审查通过」后才可合入 `main` 并推送。
 5. **交互闭环与收尾**：
    - 主会话用 `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 阻塞等待，用 `reply`/`send` 处理问答与指导，`--ack` 确认消费。
    - `worker_done` 后必须亲自对分支结果做**彻底 Code Review**：先从整个架构判断是否有更简洁、更根本的修复方案，并对照工程质量规范（`peq.*`、唯一真源、无循环依赖、无函数内联导入、无行内抑制注释、边界职责、测试覆盖与门禁脚本）核查真实 diff。（独立架构审查优先级：**`{review_priority}`**。）
-   - 未达标时用 `worker-show` 取得已验证终端，再建整改 Task 并 `worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回原终端；通过后用同终端 follow-up 通知合入 `main` 并推送。全部结算后 `worker-release` 释放 worker（**严禁 `orca terminal close` 替代**），用 `worker-list --terminal-state reclaimable` 确认无遗留终端并清理子工作区与已合入分支。"""
+   - 未达标用 `worker-show` 取已验证终端，建整改 Task 后 `worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回原终端；通过后用同终端 follow-up 通知合入 `main` 并推送。结算后 `worker-release`（**严禁 `orca terminal close` 替代**），用 `worker-list --terminal-state reclaimable` 确认无遗留终端并清理子工作区与已合入分支。"""
 
 
 def render_orchestration_block(profile: dict[str, Any]) -> str:
@@ -265,10 +265,10 @@ def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
     max_turns = profile["pilot"]["max_consecutive_auto_turns"]
     if scene_count:
         routing = (
-            f"每个回合结束时，按下方 {scene_count} 个正交场景的触发条件路由"
-            "（需等外部输入或已结案则输出 `scene=NONE`），并构造"
+            f"回合结束按下方 {scene_count} 个场景路由"
+            "（需等外部输入或已结案则输出 `scene=NONE`），构造"
             "**一句自然、贴合上下文、不重复已完成动作**的下一步指令"
-            "（展示文本与预填文本 100% 同源一致）。"
+            "（展示与预填同源）。"
         )
     else:
         routing = (
@@ -277,22 +277,20 @@ def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
         )
     return f"""## 个人研发状态机与 Turn Pilot 规范（Agent 单一语义 Owner 三步判断模型）
 
-仅对**主会话（Coordinator，不含 Orca Task ID / Dispatch ID preamble）**生效，子会话静默忽略。模式以本机 `profile.json` 为唯一真源，可用 `,mode status|gate|confirm|off` 切换；`gate` 连续自动推进上限 {max_turns} 轮。引擎只做机械预填与回车，**意图分类、场景路由与 `gate=auto|pause` 由主会话按三步模型裁决**：
+仅对**主会话（Coordinator，无 Orca Task ID / Dispatch ID preamble）**生效，子会话忽略。模式真源 `profile.json`，用 `,mode status|gate|confirm|off` 切换；`gate` 连续自动推进上限 {max_turns} 轮。引擎仅预填与回车，**主会话裁决意图、场景与 `gate=auto|pause`**：
 
-1. **第一步：任务性质二分类（要不要问、要不要停下审方案）**：
+1. **第一步：任务性质二分类**：
    - **前置铁律**：先查同链路近 7~14 天修复史与端到端拓扑，判断唯一 owner 和最简根治路径；复发不得叠黑白名单、局部重试或表象补丁。
-   - **A 类 — 确定性收敛**：正确行为与边界已由产品设计、模块契约、`peq.*`、事实或当前明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界；含单点及跨内部服务根因修复、已授权或合同内冗余清理、工具参数/回执修正、并发/超时治理、批量问题族和质量收敛。直接 `gate=auto`，不重复提问。
-   - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按 AGENTS.md 与 `peq.architecture-simplicity` 说明不变量与替代保护，最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；同回合获答后按确认边界收敛，首版完整方案未确认标 `gate=pause`。获准后复审/交付/结案 `gate=auto`，prod 发布、未授权真实 E2E 除外。
-   - **简化边界**：历史提交/合同不能豁免最简架构。说明真实不变量、复发成因及唯一 owner 的确定性替代保护；未经授权改变安全门禁、跨模块/内外部合同或状态机边界须先确认，已授权范围内直接推进。
-2. **第二步：场景路由与 Prompt 构造（所见即所填：真源 `~/.gemini/config/the-pilot/scenes/*.md`）**：{routing}
-3. **第三步：输出可见建议与唯一隐藏标签**：可见建议行必须打印在正文中（绝不能只藏在 HTML 注释里）；推荐 `**下一步建议：**` 后跟 `- **,1（主推）**：<主推文本>` 与 `- **,2（备选）**：<备选文本>`，对称使用 `,1`/`,2`：
-   - 主推行（二选一）：`💡 **下一步建议 ,1（已自动预填，按 Enter 或输 ,1 发送；输 ,2 切备选）**：<主推文本>`；或 `- **,1（主推）**：<主推文本>`。
-   - 备选行（可选）：`- **,2（备选）**：<备选文本>`；第三选项用 `- **,3（备选）**：<备选文本>`。
-   - 正文中的 `,1` / `,2` 仅供人类阅读。回复末尾唯一的结构化 JSON 标签是唯一执行真源，由 `json.loads` 解析：`<!-- pilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（无备选时省略 "2"）。主推必须非空，候选只从标签读取，不解析或交叉校验 Markdown；使用合法 JSON 转义保留文本。
-   - 场景名缺失/未知/多标签、gate 缺失或非法时按暂停处理；标签不合法、重复或字段冲突时清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认实施的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。异步提问未答或结案输出 `<!-- pilot: {{"scene": "NONE"}} -->`（兼容 `<!-- pilot: scene=NONE -->`）。
-   - 暂停/确认回合中，用户可随时输入 `,1 [补充说明]` 触发主推（与 `,2 [补充说明]` 完全对称）。
+   - **A 类 — 确定性收敛**：正确行为与边界已由产品设计、模块契约、`peq.*`、事实或当前明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界；含内部根因修复、授权内冗余清理、工具回执、并发/超时及质量收敛。`gate=auto` 按实际进度逐步推进（定位 → 出详细方案 → 方案级架构 review → 编排实施），不得跳过方案设计或方案复审，不重复提问。
+   - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按 AGENTS.md 与 `peq.architecture-simplicity` 说明不变量与替代保护，最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；所有进度均沿用此边界：B 类方案/裁决未确认标 `gate=pause`，已确认边界内 `gate=auto` 单步递进，prod 发布、未授权真实 E2E 除外。
+   - **简化边界**：历史提交/合同不能豁免最简架构；说明不变量、复发成因及唯一 owner 的替代保护，授权边界按 A/B 分类，不重复裁决。
+2. **第二步：场景与 Prompt（真源 `~/.gemini/config/the-pilot/scenes/*.md`）**：{routing}
+3. **第三步：正文可见建议与唯一隐藏标签**：正文必须显示 `- **,1（主推）**：<主推文本>`，可选 `- **,2（备选）**：<备选文本>`、`- **,3（备选）**：<备选文本>`，不可只藏在注释里。
+   - 正文仅供阅读；回复末尾唯一 JSON 标签是执行真源，由 `json.loads` 解析：`<!-- pilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（无备选时省略 "2"）。主推非空；候选只读标签，不解析或交叉校验 Markdown；文本须合法 JSON 转义。
+   - 场景缺失/未知/多标签或 gate 缺失/非法则暂停；标签非法、重复或字段冲突则清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认边界内的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。异步提问未答或结案输出 `<!-- pilot: {{"scene": "NONE"}} -->`（兼容 `<!-- pilot: scene=NONE -->`）。
+   - 暂停/确认时可输入 `,1 [补充说明]` 触发主推，与 `,2 [补充说明]` 对称。
 
-场景全文由 `scenes/*.md` 唯一持有；改动后运行 `pilot sync` 刷新本段。"""
+场景全文真源 `scenes/*.md`；改动后 `pilot sync`。"""
 
 
 def render_scenes_block(scenes: dict[str, str]) -> str:
