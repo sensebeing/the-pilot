@@ -62,7 +62,6 @@ STATE_DIR = Path(
     or str(PILOT_DIR / "state")
 ).expanduser()
 LOG_PATH = STATE_DIR / "pilot.log"
-AUTO_UPDATE_INTERVAL_SECONDS = 6 * 3600
 # The installer gives its own ``apply`` child 30 s; this outer deadline must be
 # longer so a legitimate repair always finishes before the hook may kill it.
 PROJECT_SYNC_TIMEOUT_SECONDS = 45
@@ -327,7 +326,7 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
     command = [pilot_bin, "self-update", "--project-only"]
     if workspace:
         command.extend(["--workspace", workspace])
-    command.extend(["--home-dir", str(Path.home()), "--gemini-dir", str(GEMINI_DIR), "--json"])
+    command.extend(["--gemini-dir", str(GEMINI_DIR), "--json"])
     completed = _run_project_sync(command)
     if completed is None:
         log_event("project_auto_sync_failed", workspace=workspace, error="project_sync_incomplete")
@@ -357,53 +356,20 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
     return True
 
 
-def maybe_trigger_auto_update() -> None:
-    if _env_value("THE_PILOT_DISABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_DISABLE_AUTO_UPDATE") == "1":
-        return
-    if (_env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
-            and _env_value("THE_PILOT_ENABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE") != "1"):
-        return
-    metadata_path = STATE_DIR / "auto_update.json"
-    metadata, metadata_status, metadata_err = load_json(metadata_path)
-    if metadata_status == "corrupt":
-        log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
-        return
-    if metadata_status == "missing":
-        metadata = {}
-    try:
-        if time.time() - float(metadata.get("last_checked_at") or 0) < AUTO_UPDATE_INTERVAL_SECONDS:
-            return
-    except (TypeError, ValueError):
-        pass
+def request_background_update() -> None:
     pilot_bin = _pilot_binary()
     if not pilot_bin:
         return
-    with _file_lock(STATE_DIR / "auto_update.lock"):
-        metadata, metadata_status, metadata_err = load_json(metadata_path)
-        if metadata_status == "corrupt":
-            log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
-            return
-        if metadata_status == "missing":
-            metadata = {}
-        try:
-            cooldown = time.time() - float(metadata.get("last_checked_at") or 0)
-        except (TypeError, ValueError):
-            cooldown = AUTO_UPDATE_INTERVAL_SECONDS
-        if cooldown < AUTO_UPDATE_INTERVAL_SECONDS:
-            return
-        try:
-            subprocess.Popen([pilot_bin, "self-update", "--gemini-dir", str(GEMINI_DIR), "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        except OSError as exc:
-            metadata["status"] = "failed"
-            metadata["error"] = str(exc)
-            metadata["last_failed_at"] = time.time()
-            save_json(metadata_path, metadata)
-            log_event("auto_update_spawn_failed", path=pilot_bin, error=str(exc))
-            return
-        metadata["last_checked_at"] = time.time()
-        if not save_json(metadata_path, metadata):
-            return
-        log_event("auto_update_spawned", path=pilot_bin)
+    try:
+        result = subprocess.run(
+            [pilot_bin, "self-update", "--background", "--gemini-dir", str(GEMINI_DIR), "--json"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_event("auto_update_request_failed", error=str(exc))
+        return
+    if result.returncode != 0:
+        log_event("auto_update_request_failed", error=(result.stderr or result.stdout).strip()[-300:])
 
 
 def load_profile() -> tuple[dict[str, Any] | None, str, str]:
@@ -1724,6 +1690,45 @@ def emit_osc_7501(frame: str) -> bool:
     return True
 
 
+def _sync_and_maybe_reexec(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    # The supervised child uses the updated engine without starting another
+    # repair that its parent could interrupt when the re-exec times out.
+    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1":
+        return None
+    if not maybe_sync_project_overlay(payload):
+        return None
+    updated_engine = PILOT_DIR / "runtime.py"
+    try:
+        if not updated_engine.is_file():
+            return None
+        if hashlib.sha256(updated_engine.read_bytes()).hexdigest() == _RUNNING_SCRIPT_SHA256:
+            return None
+        result = subprocess.run(
+            [sys.executable, str(updated_engine), "hook", "--event", event],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env={**os.environ, "THE_PILOT_REEXEC": "1"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_event("engine_reexec_failed", error=str(exc))
+        raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-300:]
+        log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
+        raise HookExecutionError("engine_reexec_failed", detail)
+    try:
+        output = json.loads(result.stdout)
+    except ValueError as exc:
+        log_event("engine_reexec_failed", error=str(exc))
+        raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
+    if not isinstance(output, dict):
+        log_event("engine_reexec_failed", error="output_not_object")
+        raise HookExecutionError("engine_reexec_invalid_output", "hook output must be a JSON object")
+    return output
+
+
 def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     conversation_id = str(payload.get("conversationId") or "")
     if not conversation_id:
@@ -1739,46 +1744,9 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
-    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
-        # Exactly one process per turn owns project synchronization. The
-        # re-executed engine runs under a short supervisor timeout, so it must
-        # never start a repair that its supervisor could abandon by killing it.
-        sync_confirmed = maybe_sync_project_overlay(payload)
-        if sync_confirmed:
-            updated_engine = PILOT_DIR / "runtime.py"
-            try:
-                changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
-            except OSError:
-                changed = False
-            if changed:
-                try:
-                    result = subprocess.run(
-                        [sys.executable, str(updated_engine), *sys.argv[1:]],
-                        input=json.dumps(payload, ensure_ascii=False),
-                        text=True,
-                        capture_output=True,
-                        timeout=10,
-                        env={**os.environ, "THE_PILOT_REEXEC": "1"},
-                    )
-                except (OSError, subprocess.SubprocessError) as exc:
-                    log_event("engine_reexec_failed", error=str(exc))
-                    raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
-                if result.returncode != 0:
-                    detail = (result.stderr or result.stdout).strip()[-300:]
-                    log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
-                    raise HookExecutionError("engine_reexec_failed", detail)
-                try:
-                    output = json.loads(result.stdout) if result.stdout.strip() else {}
-                except ValueError as exc:
-                    log_event("engine_reexec_failed", error=str(exc))
-                    raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
-                if not isinstance(output, dict):
-                    log_event("engine_reexec_failed", error="output_not_object")
-                    raise HookExecutionError(
-                        "engine_reexec_invalid_output", "hook output must be a JSON object"
-                    )
-                return output
-    maybe_trigger_auto_update()
+    reexec_output = _sync_and_maybe_reexec("PreInvocation", payload)
+    if reexec_output is not None:
+        return reexec_output
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
     config, config_status, config_err = load_config()
@@ -2075,6 +2043,16 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
     if not user_turn:
         log_event("stop_turn_identity_missing", cid=conversation_id)
         return {"decision": "allow"}, OSC_7501_DONE
+
+    reexec_output = _sync_and_maybe_reexec("Stop", payload)
+    if reexec_output is not None:
+        result = reexec_output.get("result")
+        osc_frame = reexec_output.get("osc_frame")
+        if not isinstance(result, dict) or not isinstance(osc_frame, str):
+            raise HookExecutionError(
+                "engine_reexec_invalid_output", "Stop re-exec must return a hook result and OSC frame"
+            )
+        return result, osc_frame
     with state_lock(conversation_id):
         state = load_state(conversation_id)
         profile, profile_status, profile_err = load_profile()
@@ -2369,6 +2347,7 @@ def command_sync() -> int:
             return 2
     log_event("scenes_synced")
     print("已按 scenes/*.md 刷新 GEMINI.md 场景段。")
+    request_background_update()
     return 0
 
 
@@ -2531,7 +2510,8 @@ def command_set(target: str, template: str) -> int:
             return 2
         log_event("template_set", target=target, key=canonical, command_id=command_id)
         print(f"已更新 `{canonical}` 的模板；下一次 apply/upgrade 会保留该覆盖。")
-        return 0
+    request_background_update()
+    return 0
 
 
 def command_log(limit: int) -> int:
@@ -2575,8 +2555,12 @@ def run_hook(event: str) -> int:
     except Exception as exc:
         log_event("hook_failed", hook_event=event, error=repr(exc))
         return _hook_failure(event, "internal_error", repr(exc))
-    print(json.dumps(result, ensure_ascii=False), flush=True)
-    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1" and osc_frame:
+    reexecuted = _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1"
+    # The parent publishes the decision and writes the child's exact frame
+    # using its connection to the pane. Only the private Stop pipe gets this receipt.
+    output = {"result": result, "osc_frame": osc_frame} if reexecuted and event == "Stop" else result
+    print(json.dumps(output, ensure_ascii=False), flush=True)
+    if not reexecuted and osc_frame:
         emit_osc_7501(osc_frame)
     return 0
 
@@ -2598,11 +2582,12 @@ def command_worker(target: str, as_json: bool) -> int:
         else:
             print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
         return 2
-    success, workers, updated = (
-        (True, current_worker_agents(profile), [])
-        if target == "status"
-        else set_worker_agents(target)
-    )
+    if target == "status":
+        success, workers, updated = True, current_worker_agents(profile), []
+    else:
+        success, workers, updated = set_worker_agents(target)
+        if success:
+            request_background_update()
     report = {"ok": success, "worker_agents": workers, "updated_files": updated}
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -2631,6 +2616,7 @@ def command_mode(target: str) -> int:
         if profile_status != "ok" or profile is None:
             print(f"profile.json 损坏：{profile_err}", file=sys.stderr)
             return 2
+        request_background_update()
     print(f"Pilot mode: {current_mode(profile)}")
     return 0
 
@@ -2670,9 +2656,7 @@ def main(argv: list[str] | None = None) -> int:
         return command_sync()
     if args.command == "set":
         return command_set(args.target, args.template)
-    if args.command == "log":
-        return command_log(args.limit)
-
+    return command_log(args.limit)
 
 
 if __name__ == "__main__":

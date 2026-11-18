@@ -15,6 +15,316 @@ from the_pilot.assets import runtime
 
 
 class AutoUpdateTest(unittest.TestCase):
+    def make_checkout(self, home: Path) -> Path:
+        checkout = home / "the-pilot"
+        checkout.mkdir(parents=True)
+        source = Path(__file__).parents[1]
+        for folder in ("src", "bin", "skills"):
+            shutil.copytree(source / folder, checkout / folder, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copyfile(source / ".gitignore", checkout / ".gitignore")
+        subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
+        for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+        self.commit_checkout(checkout, "baseline")
+        return checkout
+
+    def commit_checkout(self, checkout: Path, message: str) -> str:
+        git = ["git", "-C", str(checkout)]
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-m", message], check=True, capture_output=True)
+        return subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+
+    def test_installed_package_uses_newer_main_for_imports_and_cli(self):
+        """A proven clean main checkout supplies newer code to imports and CLI calls."""
+        for vcs_metadata in (True, False):
+            with self.subTest(vcs_metadata=vcs_metadata), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                home, gemini = root / "home", root / "gemini"
+                checkout = self.make_checkout(home)
+                package = checkout / "src/the_pilot"
+                site_packages = root / "venv/lib/python3.12/site-packages"
+                boot_package = site_packages / "the_pilot"
+                shutil.copytree(package, boot_package)
+                base = subprocess.check_output(
+                    ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+                ).strip()
+                (package / "cli.py").write_text(
+                    "import json, os, sys\n"
+                    "print(json.dumps([__file__, os.environ['THE_PILOT_DELEGATED'], sys.argv[1:]]))\n"
+                )
+                head = self.commit_checkout(checkout, "new CLI")
+                state = gemini / "config/the-pilot/state"
+                state.mkdir(parents=True)
+                metadata = {"last_local_sync_at": time.time(), "last_checked_at": time.time()}
+                if vcs_metadata:
+                    direct_url = site_packages / "the_pilot-0.1.0.dist-info/direct_url.json"
+                    direct_url.parent.mkdir()
+                    direct_url.write_text(json.dumps({"vcs_info": {"commit_id": base}}))
+                else:
+                    metadata["installed_sha"] = head
+                (state / "auto_update.json").write_text(json.dumps(metadata))
+                env = {
+                    "PATH": os.environ["PATH"], "HOME": str(home), "PYTHONPATH": str(site_packages),
+                    "THE_PILOT_ENABLE_AUTO_UPDATE": "1", "THE_PILOT_GEMINI_DIR": str(gemini),
+                }
+                paths = subprocess.check_output(
+                    [sys.executable, "-c",
+                     "from the_pilot import defaults, installer; "
+                     "print(defaults.__file__); print(installer.SCRIPTS_DIR); print(installer.PACKAGE_DIR)"],
+                    cwd=root, env=env, text=True,
+                ).splitlines()
+                self.assertEqual(paths, [str(package / "defaults.py"), str(package), str(boot_package)])
+                args = ["status", f"--gemini-dir={gemini}", "--json"]
+                cli = subprocess.run(
+                    [sys.executable, "-c",
+                     "from the_pilot import cli; import os, sys; "
+                     "os.environ['HOME'] = sys.argv[1]; sys.exit(cli.main(sys.argv[2:]))",
+                     str(home), *args],
+                    cwd=root, env={
+                        **env, "HOME": str(root / "other-home"),
+                        "THE_PILOT_GEMINI_DIR": str(root / "other-gemini"),
+                    },
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(json.loads(cli.stdout), [str(package / "cli.py"), "1", args])
+
+    def test_project_only_repairs_artifact_drift_at_matching_source_digest(self):
+        """A modified managed GEMINI.md block is repaired even when the engine is current."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, gemini = root / "home", root / "gemini"
+            checkout = self.make_checkout(home)
+            installer.apply(installer.build_parser().parse_args([
+                "apply", "--gemini-dir", str(gemini), "--no-project", "--json",
+            ]))
+            gemini_md = gemini / "config/GEMINI.md"
+            original = gemini_md.read_text()
+            gemini_md.write_text("User-owned notes\n")
+            state = gemini / "config/the-pilot/state"
+            state.mkdir()
+            digest = installer._compute_source_tree_digest(checkout / "src/the_pilot")
+            (state / "auto_update.json").write_text(json.dumps({"runtime_tree_digest": digest}))
+            args = installer.build_parser().parse_args([
+                "self-update", "--project-only", "--home-dir", str(home),
+                "--gemini-dir", str(gemini), "--json",
+            ])
+            with mock.patch.dict(os.environ, {"HOME": str(root / "process-home"), "THE_PILOT_GEMINI_DIR": str(gemini)}):
+                report = installer.self_update(args)
+            self.assertIsNone(report["error"])
+            self.assertEqual(report["local_source_status"], "updated")
+            self.assertIn(original, gemini_md.read_text())
+            self.assertIn("User-owned notes", gemini_md.read_text())
+
+    def test_read_only_cli_commands_do_not_schedule_updates(self):
+        """Inspection leaves update metadata absent even when automatic maintenance is enabled."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            gemini = home / ".gemini"
+            checkout = self.make_checkout(home)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                installer.apply(installer.build_parser().parse_args([
+                    "apply", "--gemini-dir", str(gemini), "--no-project", "--json",
+                ]))
+            env = {
+                "HOME": str(home), "PATH": os.environ["PATH"],
+                "THE_PILOT_GEMINI_DIR": str(gemini), "THE_PILOT_ENABLE_AUTO_UPDATE": "1",
+                "THE_PILOT_BIN": str(checkout / "bin/pilot"),
+            }
+            state_dir = gemini / "config/the-pilot/state"
+            for args in (("probe",), ("status",), ("distill",), ("worker", "status"), ("mode",), ("log",)):
+                with self.subTest(args=args):
+                    subprocess.run(
+                        [sys.executable, str(checkout / "bin/pilot"), *args],
+                        cwd=root, env=env, check=True, capture_output=True, timeout=10,
+                    )
+                    self.assertFalse((state_dir / "auto_update.json").exists())
+                    self.assertFalse((state_dir / "auto_update.lock").exists())
+
+    def test_redirected_self_update_keeps_global_tool_and_skills_outside_scope(self):
+        """A redirected installation repairs its own artifacts until a home override is explicit."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, gemini = root / "home", root / "gemini"
+            checkout = self.make_checkout(home)
+            global_skills = home / ".claude/skills"
+            global_skills.mkdir(parents=True)
+            local_skills = gemini / "config/skills"
+            local_skills.mkdir(parents=True)
+            uv = root / "uv"
+            uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/uv-args"\n')
+            uv.chmod(0o755)
+            env = {"HOME": str(home), "PATH": f"{root}:{os.environ['PATH']}"}
+            subprocess.run(
+                [sys.executable, str(checkout / "bin/pilot"), "apply", "--gemini-dir", str(gemini), "--no-project"],
+                cwd=root, env=env, check=True, capture_output=True, timeout=10,
+            )
+            self.assertFalse((gemini / "config/the-pilot/state/auto_update.lock").exists())
+            command = [sys.executable, str(checkout / "bin/pilot"), "self-update",
+                       "--local-only", "--gemini-dir", str(gemini), "--json"]
+            subprocess.run(command, cwd=root, env=env, check=True, capture_output=True, timeout=10)
+            self.assertTrue((local_skills / "the-pilot").is_symlink())
+            self.assertFalse((global_skills / "the-pilot").exists())
+            self.assertFalse((home / "uv-args").exists())
+
+            subprocess.run([*command, "--home-dir", str(home)], cwd=root, env=env, check=True, capture_output=True, timeout=10)
+            self.assertTrue((global_skills / "the-pilot").is_symlink())
+            self.assertIn("install\n--force", (home / "uv-args").read_text())
+
+    def test_cli_background_checks_keep_local_and_remote_cooldowns_separate(self):
+        """Stale local code can repair immediately without postponing its remote check."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            gemini = home / ".gemini"
+            checkout = self.make_checkout(home)
+            launcher = home / ".local/bin/pilot"
+            launcher.parent.mkdir(parents=True)
+            launcher.touch()
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            metadata_path = state / "auto_update.json"
+            last_checked_at = time.time() - 60
+            metadata_path.write_text(json.dumps({"last_checked_at": last_checked_at}))
+            env = {
+                "HOME": str(home), "PATH": os.environ["PATH"],
+                "THE_PILOT_ENABLE_AUTO_UPDATE": "1",
+            }
+            original_popen = subprocess.Popen
+
+            def spawn(command, **kwargs):
+                if command[0] == sys.executable:
+                    return mock.Mock()
+                return original_popen(command, **kwargs)
+
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(installer, "_in_test_harness", return_value=False), \
+                    mock.patch.object(installer.shutil, "which", return_value="/fake/uv"), \
+                    mock.patch.object(installer.subprocess, "Popen", side_effect=spawn) as popen:
+                self.assertEqual(installer.maybe_trigger_background_auto_update(gemini), "spawned_local_sync")
+                self.assertEqual(
+                    popen.call_args.args[0],
+                    [sys.executable, str(checkout / "bin/pilot"), "self-update", "--local-only",
+                     "--gemini-dir", str(gemini), "--json"],
+                )
+                metadata = json.loads(metadata_path.read_text())
+                self.assertEqual(metadata["last_checked_at"], last_checked_at)
+                self.assertEqual(installer.maybe_trigger_background_auto_update(gemini), "cooldown")
+
+                sha = subprocess.check_output(
+                    ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], text=True
+                ).strip()
+                metadata.update(
+                    installed_sha=sha,
+                    installed_tree_digest=installer._compute_source_tree_digest(checkout / "src/the_pilot"),
+                    last_checked_at=time.time() - installer.AUTO_UPDATE_INTERVAL_SECONDS - 1,
+                )
+                metadata_path.write_text(json.dumps(metadata))
+                self.assertEqual(installer.maybe_trigger_background_auto_update(gemini), "spawned_remote_check")
+                self.assertNotIn("--local-only", popen.call_args.args[0])
+                self.assertGreater(json.loads(metadata_path.read_text())["last_checked_at"], last_checked_at)
+
+    def test_self_update_installs_missing_uv_launcher_at_default_home(self):
+        """Current install metadata cannot mask a missing launcher at the default home."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            gemini = home / ".gemini"
+            checkout = self.make_checkout(home)
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            (state / "auto_update.json").write_text(json.dumps({
+                "installed_sha": subprocess.check_output(
+                    ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], text=True
+                ).strip(),
+                "installed_tree_digest": installer._compute_source_tree_digest(checkout / "src/the_pilot"),
+            }))
+            uv = root / "uv"
+            uv.write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$@" > "$HOME/uv-args"\n'
+                'mkdir -p "$HOME/.local/bin"\n'
+                'touch "$HOME/.local/bin/pilot"\n'
+            )
+            uv.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, str(checkout / "bin/pilot"), "self-update",
+                 "--local-only", "--gemini-dir", str(gemini), "--json"],
+                cwd=root, env={"HOME": str(home), "PATH": f"{root}:{os.environ['PATH']}"},
+                text=True, capture_output=True, check=True,
+            )
+            self.assertEqual(json.loads(result.stdout)["status"], "up_to_date")
+            self.assertTrue((home / ".local/bin/pilot").is_file())
+            self.assertEqual((home / "uv-args").read_text().splitlines(), ["tool", "install", "--force", str(checkout)])
+
+    def test_stop_reexecs_updated_engine_on_the_same_turn(self):
+        """An eligible Stop syncs once and preserves the updated engine's hook and pane decisions."""
+        question = {"name": "ask_question", "args": {"questions": '[{"question":"Which?"}]'}}
+        cases = (
+            ("continue", {"content": "请确认以下 2 个问题："}, "continue", ""),
+            ("waiting", {"content": "Choose", "tool_calls": [question]}, "allow", runtime.OSC_7501_WAITING_QUESTION),
+            ("stale", {"content": "Done"}, "allow", ""),
+            ("settled", {"content": "Done"}, "allow", runtime.OSC_7501_DONE),
+        )
+        for case, planner_step, decision, osc in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                gemini = root / "gemini"
+                installer.apply(installer.build_parser().parse_args([
+                    "apply", "--gemini-dir", str(gemini), "--no-project", "--json",
+                ]))
+                engine = gemini / "config/the-pilot/runtime.py"
+                child = root / "child.py"
+                source = engine.read_text()
+                child.write_text(source.replace(
+                    "    raise SystemExit(main())",
+                    "    assert os.environ['THE_PILOT_REEXEC'] == '1'\n"
+                    "    assert sys.argv[1:] == ['hook', '--event', 'Stop']\n"
+                    "    with (Path.home().parent / 'reexecs').open('a') as count: count.write('reexec\\n')\n"
+                    "    raise SystemExit(main())",
+                ))
+                shim = root / "pilot-shim.py"
+                shim.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import os, pathlib, shutil, sys\n"
+                    "assert sys.argv[1:3] == ['self-update', '--project-only']\n"
+                    "root = pathlib.Path(os.environ['HOME']).parent\n"
+                    "with (root / 'syncs').open('a') as syncs: syncs.write('sync\\n')\n"
+                    "shutil.copyfile(root / 'child.py', pathlib.Path(os.environ['THE_PILOT_GEMINI_DIR']) / 'config/the-pilot/runtime.py')\n"
+                    "print('{\"local_source_status\":\"updated\"}')\n"
+                )
+                shim.chmod(0o755)
+                transcript = root / "transcript.jsonl"
+                steps = [{"type": "USER_INPUT", "content": "start"}, {"type": "PLANNER_RESPONSE", **planner_step}]
+                transcript.write_text("".join(json.dumps(step) + "\n" for step in steps))
+                payload = {
+                    "conversationId": "stop-reexec", "transcriptPath": str(transcript),
+                    "terminationReason": "NO_TOOL_CALL", "fullyIdle": True,
+                }
+                osc_target = root / "osc"
+                state = gemini / "config/the-pilot/state"
+                if case == "stale":
+                    with mock.patch.object(runtime, "STATE_DIR", state):
+                        self.assertTrue(runtime.save_state(
+                            "stop-reexec", {"current_user_turn_id": "newer-turn", "delivery_status": "none"}
+                        ))
+                result = subprocess.run(
+                    [sys.executable, str(engine), "hook", "--event", "Stop"],
+                    input=json.dumps(payload), text=True, capture_output=True, check=True,
+                    env={
+                        "PATH": os.environ["PATH"], "HOME": str(root / "home"),
+                        "THE_PILOT_GEMINI_DIR": str(gemini), "THE_PILOT_BIN": str(shim),
+                        "THE_PILOT_DISABLE_AUTO_UPDATE": "1", "THE_PILOT_OSC_TARGET": str(osc_target),
+                    },
+                )
+                output = json.loads(result.stdout)
+                self.assertEqual(output["decision"], decision)
+                if decision == "allow":
+                    self.assertEqual(output, {"decision": "allow"})
+                self.assertEqual((root / "syncs").read_text(), "sync\n")
+                self.assertEqual((root / "reexecs").read_text(), "reexec\n")
+                self.assertEqual(osc_target.read_text() if osc_target.exists() else "", osc)
+
     def test_project_only_skips_older_clean_worktree_but_updates_dirty_or_newer(self):
         """Overlay sync compares normalized committed content and protects newer installs."""
         with tempfile.TemporaryDirectory() as root:
@@ -143,12 +453,58 @@ class AutoUpdateTest(unittest.TestCase):
         """The six hour TTL prevents duplicate background self-update processes."""
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
-            state = root / "state"
-            state.mkdir()
-            (state / "auto_update.json").write_text(json.dumps({"last_checked_at": runtime.time.time()}))
-            with mock.patch.object(runtime, "STATE_DIR", state), mock.patch.dict(os.environ, {"THE_PILOT_BIN": "/bin/true", "THE_PILOT_GEMINI_DIR": "", "THE_PILOT_DISABLE_AUTO_UPDATE": ""}), mock.patch.object(runtime.subprocess, "Popen") as popen:
-                runtime.maybe_trigger_auto_update()
+            gemini = root / ".gemini"
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            (state / "auto_update.json").write_text(json.dumps({"last_checked_at": time.time()}))
+            env = {"HOME": str(root), "THE_PILOT_ENABLE_AUTO_UPDATE": "1"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(installer, "_discover_checkout", return_value=(None, False)), \
+                    mock.patch.object(installer.subprocess, "Popen") as popen:
+                self.assertEqual(installer.maybe_trigger_background_auto_update(gemini), "none")
                 popen.assert_not_called()
+
+    def test_direct_runtime_does_not_wait_for_an_active_updater(self):
+        """Background maintenance never holds a runtime command behind an active local repair."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            gemini = home / ".gemini"
+            checkout = self.make_checkout(home)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                installer.apply(installer.build_parser().parse_args([
+                    "apply", "--gemini-dir", str(gemini), "--no-project", "--json",
+                ]))
+            pilot_dir = gemini / "config/the-pilot"
+            state = pilot_dir / "state"
+            request = root / "request"
+            launcher = root / "pilot"
+            launcher.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "with Path(os.environ['REQUEST']).open('a') as out:\n"
+                "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "os.execv(sys.executable, [sys.executable, os.environ['CHECKOUT_PILOT'], *sys.argv[1:]])\n"
+            )
+            launcher.chmod(0o755)
+            env = {
+                "PATH": os.environ["PATH"], "HOME": str(home),
+                "THE_PILOT_GEMINI_DIR": str(gemini), "THE_PILOT_BIN": str(launcher),
+                "THE_PILOT_ENABLE_AUTO_UPDATE": "1",
+                "REQUEST": str(request), "CHECKOUT_PILOT": str(checkout / "bin/pilot"),
+            }
+            with installer._file_lock(state / "auto_update.lock"):
+                result = subprocess.run(
+                    [sys.executable, str(pilot_dir / "runtime.py"), "mode", "confirm"],
+                    capture_output=True, text=True, check=True, timeout=3, env=env,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse((state / "auto_update.json").exists())
+            self.assertEqual(
+                [json.loads(line) for line in request.read_text().splitlines()],
+                [["self-update", "--background", "--gemini-dir", str(gemini), "--json"]],
+            )
 
     def test_parser_exposes_self_update_contract(self):
         """The CLI exposes checkout and home overrides for isolated update tests."""
@@ -255,17 +611,21 @@ class AutoUpdateTest(unittest.TestCase):
         """A failed Popen records failure and leaves last_checked_at available for retry."""
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
-            state = root / "state"
-            old = time.time() - runtime.AUTO_UPDATE_INTERVAL_SECONDS - 1
-            state.mkdir()
+            gemini = root / ".gemini"
+            state = gemini / "config/the-pilot/state"
+            old = time.time() - installer.AUTO_UPDATE_INTERVAL_SECONDS - 1
+            state.mkdir(parents=True)
             (state / "auto_update.json").write_text(json.dumps({"last_checked_at": old}))
-            with mock.patch.object(runtime, "STATE_DIR", state), mock.patch.object(runtime, "LOG_PATH", state / "pilot.log"), mock.patch.dict(os.environ, {"THE_PILOT_BIN": sys.executable, "THE_PILOT_GEMINI_DIR": "", "THE_PILOT_ENABLE_AUTO_UPDATE": "1", "THE_PILOT_DISABLE_AUTO_UPDATE": ""}), mock.patch.object(runtime.subprocess, "Popen", side_effect=OSError("spawn")):
-                runtime.maybe_trigger_auto_update()
+            env = {"HOME": str(root), "THE_PILOT_ENABLE_AUTO_UPDATE": "1"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(installer, "_discover_checkout", return_value=(None, False)), \
+                    mock.patch.object(installer.subprocess, "Popen", side_effect=OSError("spawn")):
+                with self.assertRaisesRegex(installer.SetupError, "Could not start Pilot auto-update"):
+                    installer.maybe_trigger_background_auto_update(gemini)
                 record = json.loads((state / "auto_update.json").read_text())
                 self.assertEqual(record["last_checked_at"], old)
                 self.assertEqual(record["status"], "failed")
                 self.assertEqual(record["error"], "spawn")
-                runtime.maybe_trigger_auto_update()
             self.assertIn("auto_update_spawn_failed", (state / "pilot.log").read_text())
 
     def test_overlay_sync_uses_real_installer_and_v2_template(self):
@@ -433,7 +793,8 @@ class AutoUpdateTest(unittest.TestCase):
             metadata = {"last_checked_at": time.time()}
             (state / "auto_update.json").write_text(json.dumps(metadata))
             args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
-            with mock.patch.object(installer.shutil, "which", return_value=None):
+            update_env = {"THE_PILOT_ENABLE_AUTO_UPDATE": "1", "THE_PILOT_DISABLE_AUTO_UPDATE": "0"}
+            with mock.patch.dict(os.environ, update_env), mock.patch.object(installer.shutil, "which", return_value=None):
                 unmanaged_report = installer.self_update(args)
             self.assertIsNone(unmanaged_report["error"])
             self.assertEqual(unmanaged_report["cli_status"], "skipped_unmanaged")
@@ -447,7 +808,7 @@ class AutoUpdateTest(unittest.TestCase):
                     spawned.append(list(command))
                     return mock.Mock()
                 return real_popen(command, **kwargs)
-            with mock.patch.object(installer.shutil, "which", return_value="/fake/uv"), \
+            with mock.patch.dict(os.environ, update_env), mock.patch.object(installer.shutil, "which", return_value="/fake/uv"), \
                     mock.patch.object(installer.subprocess, "Popen", side_effect=fake_popen):
                 report = installer.self_update(args)
             self.assertEqual(report["cli_status"], "spawned_local_sync")

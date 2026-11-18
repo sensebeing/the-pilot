@@ -11,10 +11,10 @@
 - `cli.py`: installer versus runtime command routing only.
 
 Dependencies flow from the CLI to installer, compiler, profile, project and
-defaults; distill reuses profile, project and compiler helpers for read-only
+defaults. Distill reuses profile, project and compiler helpers for read-only
 validation and scene parsing. Runtime operations execute the installed standalone
-asset. Importing the package does not discover a project, read a user
-configuration or initialize a runtime.
+asset. Package bootstrap can load code from a verified checkout using Git
+provenance and update metadata. Project discovery remains an installer operation.
 
 `project=None` means universal defaults. Library callers pass an overlay to both
 `resolve_profile(base, project=overlay)` and `compile_bundle(profile, project=overlay)`.
@@ -22,4 +22,22 @@ Only installer operations perform discovery. Inputs are copied, never mutated.
 
 ### Automatic updates
 
-`pilot self-update` serializes source updates, global skill symlink synchronization, and runtime recompilation while preserving `profile.json` and `project.json`. Persisted `installed_sha` and `installed_tree_digest` keep the uv tool bundle aligned even when a checkout was pulled outside the updater. The runtime performs a zero-cooldown local checkout check before a turn and, when the installed engine changes, re-executes the updated standalone `autopilot.py` once so the current turn uses the new runtime; its detached `--local-only` repair skips remote pull and preserves the six-hour remote-check timestamp, and `pilot status --json` exposes the persisted result.
+`pilot self-update` serializes source updates, global skill symlink synchronization,
+and runtime recompilation while preserving `profile.json` and `project.json`.
+The CLI can use a newer clean `~/the-pilot` main checkout immediately. Persisted
+`installed_sha` and `installed_tree_digest` keep the uv tool bundle aligned with
+the checkout, including after an external pull or a missing launcher.
+
+The PreInvocation and eligible Stop hooks request a local project sync before
+evaluating the turn. This sync can repair drifted installed artifacts even when
+the runtime matches the checkout. If the engine changes, the hook runs the
+updated standalone `runtime.py` once for the current event. A detached
+`--local-only` repair preserves the six-hour remote-check timestamp.
+`pilot status --json` exposes the persisted result.
+
+The installer alone schedules maintenance. Successful install and runtime
+mutations can request it, as can eligible hook syncs. Inspection commands
+read the current install and update status. A redirected Gemini root can
+repair its own artifacts and Gemini skill links. Home-wide tool and skill
+maintenance requires the default Gemini root or an explicit
+`self-update --home-dir` override.

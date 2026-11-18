@@ -18,3 +18,7 @@ def main(argv: list[str]) -> int:
         print(f"Pilot is not installed at {root}; run pilot apply first.", file=sys.stderr)
         return 2
     return subprocess.run([sys.executable, str(engine), *argv]).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
