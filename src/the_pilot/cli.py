@@ -9,10 +9,7 @@ def main(argv: list[str] | None = None) -> int:
     if delegated is not None:
         return delegated
     if args and args[0] in {"worker", "mode", "hook", "sync", "set", "log"}:
-        code = runtime.main(args)
-        if args[0] != "hook":
-            installer.maybe_trigger_background_auto_update(args)
-        return code
+        return runtime.main(args)
     return installer.main(args)
 
 

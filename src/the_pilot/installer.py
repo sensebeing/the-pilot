@@ -116,8 +116,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": True, **result}, ensure_ascii=False, indent=2))
     else:
         print_human(args.command, result)
-    if args.command != "self-update":
-        maybe_trigger_background_auto_update(raw_args)
+    if args.command == "apply":
+        try:
+            maybe_trigger_background_auto_update(gemini_dir_for(args))
+        except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
+            print(f"Pilot auto-update: {exc}", file=sys.stderr)
     return 0
 
 
@@ -190,10 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser = subparsers.add_parser("self-update", help="更新 CLI、技能链接与已安装运行时")
     add_common_arguments(update_parser)
     update_parser.add_argument("--checkout-dir", help="本地 the-pilot checkout（测试或开发覆盖）")
-    update_parser.add_argument("--home-dir", default=str(Path.home()), help="技能链接根目录")
+    update_parser.add_argument("--home-dir", help="技能链接根目录")
     update_parser.add_argument("--workspace", help="workspace directory for project overlay synchronization")
-    update_parser.add_argument("--project-only", action="store_true", help="仅同步 workspace project overlay")
-    update_parser.add_argument("--local-only", action="store_true", help="仅同步本地 checkout，不执行远端检查")
+    update_mode = update_parser.add_mutually_exclusive_group()
+    update_mode.add_argument("--project-only", action="store_true", help="仅同步 workspace project overlay")
+    update_mode.add_argument("--local-only", action="store_true", help="仅同步本地 checkout，不执行远端检查")
+    update_mode.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
 
     uninstall_parser = subparsers.add_parser("uninstall", help="移除本工具写入的文件与 Hook 组")
     add_common_arguments(uninstall_parser)
@@ -409,11 +414,10 @@ def default_install_home(gemini_dir: Path) -> Path | None:
     global guidance. The decision is made from the resolved install root and
     the resolved user home, so every entry point (apply, status, uninstall,
     self-update, auto-upgrade, runtime ``,worker``) classifies the same
-    installation identically. ``self-update --home-dir`` is the skill-link
-    root, not an install-scope signal. A redirected root such as an explicit
-    ``--gemini-dir /tmp/sandbox`` or the environment override is a sandboxed
-    install, which must never read or write the real ``~/.claude`` or
-    ``~/.codex`` files.
+    installation identically. A redirected root such as ``--gemini-dir
+    /tmp/sandbox`` does not own the real ``~/.claude`` or ``~/.codex`` guidance
+    files. An explicit ``self-update --home-dir`` authorizes tool and skill
+    maintenance for that home while leaving guidance ownership tied to Gemini.
     """
     home = Path.home().resolve()
     if gemini_dir.resolve() != (home / ".gemini").resolve():
@@ -685,9 +689,12 @@ def _discover_checkout(explicit: str | None, *, home_dir: Path | None = None) ->
         return path, True
     real_home = Path.home().resolve()
     custom_home = home_dir is not None and home_dir.expanduser().resolve() != real_home
-    candidates = [home_dir.expanduser() / "the-pilot"] if custom_home else []
-    if not _in_test_harness() or os.environ.get("THE_PILOT_ENABLE_AUTO_UPDATE", "").strip() == "1":
-        candidates.extend([SCRIPTS_DIR.parents[1], real_home / "the-pilot"])
+    if custom_home:
+        candidates = [home_dir.expanduser() / "the-pilot"]
+    elif not _in_test_harness() or os.environ.get("THE_PILOT_ENABLE_AUTO_UPDATE", "").strip() == "1":
+        candidates = [real_home / "the-pilot", SCRIPTS_DIR.parents[1]]
+    else:
+        candidates = []
     for path in candidates:
         if (path / ".git").exists():
             return path, False
@@ -776,7 +783,7 @@ def _is_same_git_repo(path_a: Path, path_b: Path) -> bool:
 
 
 def _checkout_state(checkout: Path, timeout: int) -> str:
-    git = ["git", "-C", str(checkout)]
+    git = ["git", "--no-optional-locks", "-C", str(checkout)]
     if subprocess_run([*git, "status", "--porcelain"], timeout).strip():
         return "skipped_dirty_checkout"
     if subprocess_run([*git, "branch", "--show-current"], timeout).strip() != "main":
@@ -892,11 +899,9 @@ def maybe_delegate_to_checkout(
         return None
     child_env = _with_package_on_pythonpath(eff_env, package)
     child_env["THE_PILOT_DELEGATED"] = "1"
-    proc = subprocess.run([sys.executable, "-m", "the_pilot.cli", *argv], env=child_env, check=False)
-    maybe_trigger_background_auto_update(
-        argv, home_dir=home, gemini_dir=gemini, env=eff_env, force_local_sync=True,
-    )
-    return proc.returncode
+    return subprocess.run(
+        [sys.executable, "-m", "the_pilot.cli", *argv], env=child_env, check=False,
+    ).returncode
 
 
 def _cooldown_elapsed(metadata: dict[str, Any], key: str, interval: int) -> bool:
@@ -906,86 +911,82 @@ def _cooldown_elapsed(metadata: dict[str, Any], key: str, interval: int) -> bool
         return True
 
 
-def _spawn_background_update(
-    command: list[str],
-    metadata_path: Path,
-    metadata: dict[str, Any],
-    timestamp_key: str,
+def _log_auto_update(state_dir: Path, event: str, **details: Any) -> None:
+    with (state_dir / LOG_NAME).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event, **details,
+        }, ensure_ascii=False) + "\n")
+
+
+def _clean_local_source(checkout: Path | None) -> tuple[Path, str, str] | None:
+    if checkout is None or _checkout_state(checkout, 2) != "clean_main":
+        return None
+    sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 2).strip()
+    return checkout, sha, _compute_source_tree_digest(checkout / "src/the_pilot")
+
+
+def _schedule_background_update(
+    gemini_dir: Path,
+    state_dir: Path,
+    maintenance_home: Path,
+    local_source: tuple[Path, str, str] | None,
     *,
-    env: Mapping[str, str] | None = None,
-) -> None:
-    subprocess.Popen(
-        command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    metadata[timestamp_key] = time.time()
-    atomic_write_text(metadata_path, json_text(metadata))
-
-
-def _background_update_args(home_dir: Path, gemini_dir: Path) -> list[str]:
-    return ["--gemini-dir", str(gemini_dir), "--home-dir", str(home_dir), "--json"]
-
-
-def _local_sync_command(checkout: Path, home_dir: Path, gemini_dir: Path) -> list[str]:
-    return [
-        sys.executable, str(checkout / "bin/pilot"), "self-update", "--local-only",
-        *_background_update_args(home_dir, gemini_dir),
-    ]
-
-
-def maybe_trigger_background_auto_update(
-    argv: list[str] | None = None,
-    *,
-    home_dir: str | Path | None = None,
-    gemini_dir: str | Path | None = None,
-    env: Mapping[str, str] | None = None,
-    force_local_sync: bool = False,
-) -> bool:
-    eff_env = os.environ if env is None else env
-    if not _automatic_update_allowed(eff_env) or (argv and argv[0] in {"self-update", "hook"}):
-        return False
-    home = home_dir if home_dir is not None else _argv_option(argv or [], "--home-dir")
-    gemini = gemini_dir if gemini_dir is not None else _argv_option(argv or [], "--gemini-dir")
-    resolved_home = Path(home).expanduser().resolve() if home else Path.home().resolve()
-    resolved_gemini = _resolve_gemini_dir(gemini, resolved_home, eff_env)
-    state_dir = _state_dir_for(resolved_gemini / PILOT_SUBDIR, env=eff_env)
+    allow_remote: bool,
+) -> str:
+    """Choose and record one updater while the caller holds auto_update.lock."""
     metadata_path = state_dir / "auto_update.json"
-    checkout = resolved_home / "the-pilot"
-    try:
-        with _file_lock(state_dir / "auto_update.lock", blocking=False) as locked:
-            if not locked:
-                return False
-            metadata = _load_json_object(metadata_path)
-            local_sync = False
-            if (checkout / ".git").exists() and _checkout_state(checkout, 5) == "clean_main":
-                local_sync = force_local_sync
-                if not local_sync and _manages_uv_tool(resolved_home):
-                    sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 5).strip()
-                    digest = _compute_source_tree_digest(checkout / "src/the_pilot")
-                    local_sync = _uv_tool_stale(resolved_home, sha, digest, metadata, managed=True)
-            if local_sync:
-                key, interval = "last_local_sync_at", LOCAL_SYNC_INTERVAL_SECONDS
-                command = _local_sync_command(checkout, resolved_home, resolved_gemini)
-                child_env = eff_env
+    metadata = _load_json_object(metadata_path)
+    update_args = ["--gemini-dir", str(gemini_dir), "--json"]
+    if maintenance_home != default_install_home(gemini_dir):
+        update_args.extend(["--home-dir", str(maintenance_home)])
+    command = None
+    child_env = os.environ
+    status = "none"
+    if local_source is not None:
+        checkout, sha, digest = local_source
+        managed = _manages_uv_tool(maintenance_home)
+        stale = _uv_tool_stale(maintenance_home, sha, digest, metadata, managed=managed)
+        if stale and not managed:
+            status = "skipped_unmanaged"
+        elif managed and (stale or os.environ.get("THE_PILOT_DELEGATED") == "1"):
+            if _cooldown_elapsed(metadata, "last_local_sync_at", LOCAL_SYNC_INTERVAL_SECONDS):
+                command = [sys.executable, str(checkout / "bin/pilot"), "self-update", "--local-only", *update_args]
+                status, timestamp = "spawned_local_sync", "last_local_sync_at"
             else:
-                key, interval = "last_checked_at", AUTO_UPDATE_INTERVAL_SECONDS
-                command = [
-                    sys.executable, "-m", "the_pilot.cli", "self-update",
-                    *_background_update_args(resolved_home, resolved_gemini),
-                ]
-                child_env = _with_package_on_pythonpath(eff_env, SCRIPTS_DIR)
-            if not _cooldown_elapsed(metadata, key, interval):
-                return False
-            try:
-                _spawn_background_update(command, metadata_path, metadata, key, env=child_env)
-            except OSError as exc:
-                metadata.update(status="failed", error=str(exc), last_failed_at=time.time())
-                atomic_write_text(metadata_path, json_text(metadata))
-                return False
-            return True
-    except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
-        print(f"Pilot auto-update: {exc}", file=sys.stderr)
-        return False
+                status = "cooldown"
+    if command is None and allow_remote and _cooldown_elapsed(metadata, "last_checked_at", AUTO_UPDATE_INTERVAL_SECONDS):
+        command = [sys.executable, "-m", "the_pilot.cli", "self-update", *update_args]
+        child_env = _with_package_on_pythonpath(os.environ, SCRIPTS_DIR)
+        status, timestamp = "spawned_remote_check", "last_checked_at"
+    if command is None:
+        return status
+    try:
+        subprocess.Popen(
+            command, env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError as exc:
+        metadata.update(status="failed", error=str(exc), last_failed_at=time.time())
+        atomic_write_text(metadata_path, json_text(metadata))
+        _log_auto_update(state_dir, "auto_update_spawn_failed", error=str(exc))
+        raise SetupError(f"Could not start Pilot auto-update: {exc}") from exc
+    metadata[timestamp] = time.time()
+    atomic_write_text(metadata_path, json_text(metadata))
+    return status
+
+
+def maybe_trigger_background_auto_update(gemini_dir: Path) -> str:
+    maintenance_home = default_install_home(gemini_dir)
+    if maintenance_home is None or not _automatic_update_allowed(os.environ):
+        return "none"
+    state_dir = _state_dir_for(gemini_dir / PILOT_SUBDIR)
+    with _file_lock(state_dir / "auto_update.lock", blocking=False) as locked:
+        if not locked:
+            return "busy"
+        checkout, _ = _discover_checkout(None, home_dir=maintenance_home)
+        return _schedule_background_update(
+            gemini_dir, state_dir, maintenance_home, _clean_local_source(checkout), allow_remote=True,
+        )
 
 
 def _find_ancestor_overlay(start: Path) -> Path | None:
@@ -1127,6 +1128,18 @@ def _has_installed_artifact_drift(checkout: Path, checkout_digest: str, gemini_d
 
 def self_update(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
+    if getattr(args, "background", False):
+        return {
+            "status": maybe_trigger_background_auto_update(gemini_dir),
+            "source_status": "scheduled_check",
+        }
+    requested_home = getattr(args, "home_dir", None)
+    maintenance_home = Path(requested_home).expanduser().resolve() if requested_home else default_install_home(gemini_dir)
+    checkout_override = getattr(args, "checkout_dir", None)
+    home_dir = maintenance_home or Path.home()
+    check_remote = not getattr(args, "local_only", False) and (
+        maintenance_home is not None or bool(checkout_override)
+    )
     pilot_dir = gemini_dir / PILOT_SUBDIR
     state_dir = _state_dir_for(pilot_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1141,55 +1154,38 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             "cli_status": "none",
             "error": None,
         }
-        home_dir = Path(args.home_dir).expanduser()
         with _file_lock(state_dir / "auto_update.lock"):
             try:
                 project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, pilot_dir)
                 result["status"] = result["project_status"] = project_status
-                checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
-                if checkout is not None and _installed_path(gemini_dir, "profile.json").is_file():
-                    if _checkout_state(checkout, 2) == "clean_main":
-                        checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
-                        metadata_path = state_dir / "auto_update.json"
-                        existing = _load_json_object(metadata_path)
-                        sha = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 2).strip()
-                        source_engine = checkout / "src/the_pilot/assets" / ENGINE_NAME
-                        installed_engine = pilot_dir / ENGINE_NAME
-                        runtime_differs = (
-                            existing.get("runtime_tree_digest") != checkout_digest
-                            or (source_engine.is_file() and (not installed_engine.is_file() or source_engine.read_bytes() != installed_engine.read_bytes()))
-                        )
-                        if runtime_differs or _has_installed_artifact_drift(checkout, checkout_digest, gemini_dir):
-                            _checkout_artifact_command(checkout, "apply", gemini_dir, "--upgrade")
-                            result["local_source_status"] = "updated"
-                            result["head_sha"] = sha
-                            existing["runtime_tree_digest"] = checkout_digest
-                            atomic_write_text(metadata_path, json_text(existing))
-                        manages_uv_tool = _manages_uv_tool(home_dir, explicit=explicit)
-                        uv_or_skills_stale = _uv_tool_stale(
-                            home_dir, sha, checkout_digest, existing, managed=manages_uv_tool,
-                        )
-                        if uv_or_skills_stale:
-                            if manages_uv_tool:
-                                if _cooldown_elapsed(existing, "last_local_sync_at", LOCAL_SYNC_INTERVAL_SECONDS):
-                                    try:
-                                        _spawn_background_update(
-                                            _local_sync_command(checkout, home_dir, gemini_dir),
-                                            metadata_path, existing, "last_local_sync_at",
-                                        )
-                                        result["cli_status"] = "spawned_local_sync"
-                                    except OSError as exc:
-                                        result["cli_status"] = "spawn_failed"
-                                        result["error"] = str(exc)
-                                else:
-                                    result["cli_status"] = "cooldown"
-                            else:
-                                result["cli_status"] = "skipped_unmanaged"
+                checkout, explicit = _discover_checkout(checkout_override, home_dir=home_dir)
+                local_source = _clean_local_source(checkout)
+                if local_source is not None and _installed_path(gemini_dir, "profile.json").is_file():
+                    checkout, sha, checkout_digest = local_source
+                    metadata_path = state_dir / "auto_update.json"
+                    existing = _load_json_object(metadata_path)
+                    source_engine = checkout / "src/the_pilot/assets" / ENGINE_NAME
+                    installed_engine = pilot_dir / ENGINE_NAME
+                    runtime_differs = (
+                        existing.get("runtime_tree_digest") != checkout_digest
+                        or (source_engine.is_file() and (not installed_engine.is_file() or source_engine.read_bytes() != installed_engine.read_bytes()))
+                    )
+                    if runtime_differs or _has_installed_artifact_drift(checkout, checkout_digest, gemini_dir):
+                        _checkout_artifact_command(checkout, "apply", gemini_dir, "--upgrade")
+                        result["local_source_status"] = "updated"
+                        result["head_sha"] = sha
+                        existing["runtime_tree_digest"] = checkout_digest
+                        atomic_write_text(metadata_path, json_text(existing))
+                if maintenance_home is not None and not explicit and _automatic_update_allowed(os.environ):
+                    result["cli_status"] = _schedule_background_update(
+                        gemini_dir, state_dir, maintenance_home, local_source,
+                        allow_remote=not requested_home,
+                    )
             except (SetupError, OSError, subprocess.SubprocessError, ValueError) as exc:
                 result["error"] = str(exc)
         return result
     report: dict[str, Any] = {
-        "last_checked_at": None if getattr(args, "local_only", False) else time.time(), "last_updated_at": None,
+        "last_checked_at": time.time() if check_remote else None, "last_updated_at": None,
         "status": "failed", "source_status": "failed", "project_status": "none",
         "head_sha": None, "synced_skills": [], "error": None,
     }
@@ -1199,15 +1195,14 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             for key in ("last_updated_at", "installed_sha", "installed_tree_digest", "runtime_tree_digest", "last_local_sync_at"):
                 if key in existing_metadata:
                     report[key] = existing_metadata[key]
-            if getattr(args, "local_only", False):
+            if not check_remote:
                 report["last_checked_at"] = existing_metadata.get("last_checked_at")
             checkout_digest: str | None = None
             report["project_status"] = _sync_workspace_overlay(
                 getattr(args, "workspace", None), gemini_dir, pilot_dir
             )
-            home_dir = Path(args.home_dir).expanduser()
-            checkout, explicit = _discover_checkout(getattr(args, "checkout_dir", None), home_dir=home_dir)
-            manages_uv_tool = _manages_uv_tool(home_dir, explicit=explicit)
+            checkout, explicit = _discover_checkout(checkout_override, home_dir=home_dir)
+            manages_uv_tool = maintenance_home is not None and _manages_uv_tool(home_dir, explicit=explicit)
             if checkout is not None:
                 checkout_state = _checkout_state(checkout, 20)
                 report["source_status"] = checkout_state
@@ -1215,31 +1210,25 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     before_sha = subprocess_run(
                         ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
                     ).strip()
-                    if not getattr(args, "local_only", False):
+                    if check_remote:
                         subprocess_run(["git", "-C", str(checkout), "pull", "--ff-only"], 20)
                     after_sha = subprocess_run(
                         ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20
                     ).strip()
                     checkout_digest = _compute_source_tree_digest(checkout / "src/the_pilot")
-                    uv_needs_reinstall = (
-                        after_sha != before_sha
-                        or _uv_tool_stale(
-                            home_dir, after_sha, checkout_digest, existing_metadata, managed=manages_uv_tool,
-                        )
-                    )
                     if after_sha != before_sha:
                         report["source_status"] = "updated"
                     else:
                         report["source_status"] = "up_to_date"
-                    installed_ok = not uv_needs_reinstall
-                    if manages_uv_tool and uv_needs_reinstall:
-                        subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
-                        installed_ok = True
-                    if installed_ok:
+                    if manages_uv_tool:
+                        if after_sha != before_sha or _uv_tool_stale(
+                            home_dir, after_sha, checkout_digest, existing_metadata, managed=True,
+                        ):
+                            subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
                         report["installed_sha"] = after_sha
                         report["installed_tree_digest"] = checkout_digest
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
-            elif not getattr(args, "local_only", False) and manages_uv_tool:
+            elif check_remote and manages_uv_tool:
                 uv_out = subprocess_run(["uv", "tool", "upgrade", "the-pilot"], 30)
                 report["source_status"] = (
                     "up_to_date" if "nothing to upgrade" in uv_out.lower() else "updated"
@@ -1248,11 +1237,13 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 report["source_status"] = "skipped_no_source"
 
             if checkout is not None:
+                parents = [gemini_dir / "config/skills"]
+                if maintenance_home is not None:
+                    parents.extend([maintenance_home / ".agents/skills", maintenance_home / ".claude/skills"])
                 for skill_name in ("the-pilot", "the-pilot-setup"):
                     source = checkout / "skills" / skill_name
                     if not source.exists():
                         continue
-                    parents = (home_dir / ".agents/skills", home_dir / ".claude/skills", gemini_dir / "config/skills")
                     for parent in parents:
                         target = parent / skill_name
                         if not parent.is_dir() or (target.exists() and not target.is_symlink()):
@@ -1289,9 +1280,8 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             report["error"] = str(exc)
             report["status"] = "failed"
         atomic_write_text(state_dir / "auto_update.json", json_text(report))
-        log_path = state_dir / LOG_NAME
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": "auto_update_failed" if report["status"] == "failed" else "auto_update_completed", **report}, ensure_ascii=False) + "\n")
+        event = "auto_update_failed" if report["status"] == "failed" else "auto_update_completed"
+        _log_auto_update(state_dir, event, **report)
         if report["status"] == "failed":
             raise SetupError(str(report["error"]))
     return report

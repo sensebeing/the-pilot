@@ -34,3 +34,10 @@ the runtime matches the checkout. If the engine changes, the hook runs the
 updated standalone `runtime.py` once for the current event. A detached
 `--local-only` repair preserves the six-hour remote-check timestamp.
 `pilot status --json` exposes the persisted result.
+
+The installer alone schedules maintenance. Successful install and runtime
+mutations can request it, as can eligible hook syncs. Inspection commands
+read the current install and update status. A redirected Gemini root can
+repair its own artifacts and Gemini skill links. Home-wide tool and skill
+maintenance requires the default Gemini root or an explicit
+`self-update --home-dir` override.
