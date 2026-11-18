@@ -39,7 +39,7 @@ class ProjectTest(unittest.TestCase):
         self.base = json.loads((ROOT / "src/the_pilot/assets/profile.default.json").read_text())
         self.project = json.loads((FIXTURES / "alter-service.json").read_text())
         self.env = dict(os.environ, HOME=str(self.root / "home"),
-                        THE_PILOT_GEMINI_DIR=str(self.gemini))
+                        THE_PILOT_GEMINI_DIR=str(self.gemini), THE_PILOT_DISABLE_AUTO_UPDATE="1")
 
     def cli(self, *args, cwd=None, ok=True):
         result = subprocess.run([sys.executable, str(ROOT / "bin/pilot"), *args,

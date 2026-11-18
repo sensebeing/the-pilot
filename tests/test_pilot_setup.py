@@ -105,6 +105,7 @@ def base_env(root: Path) -> dict[str, str]:
         "HOME": str(root / "home"),
         "PATH": f"{root / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": str(root / "tmp"),
+        "THE_PILOT_DISABLE_AUTO_UPDATE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "LANG": "en_US.UTF-8",
     }

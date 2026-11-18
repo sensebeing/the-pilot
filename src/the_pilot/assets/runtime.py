@@ -378,7 +378,9 @@ def maybe_trigger_auto_update() -> None:
     pilot_bin = _pilot_binary()
     if not pilot_bin:
         return
-    with _file_lock(STATE_DIR / "auto_update.lock"):
+    with _file_lock(STATE_DIR / "auto_update.lock", blocking=False) as locked:
+        if not locked:
+            return
         metadata, metadata_status, metadata_err = load_json(metadata_path)
         if metadata_status == "corrupt":
             log_event("auto_update_metadata_corrupt", path=str(metadata_path), error=metadata_err)
@@ -1353,12 +1355,18 @@ def state_lock_path(conversation_id: str) -> Path:
 
 
 @contextmanager
-def _file_lock(path: Path):
+def _file_lock(path: Path, *, blocking: bool = True):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            yield
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if blocking:
+                raise
+            yield False
+            return
+        try:
+            yield True
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -1724,6 +1732,45 @@ def emit_osc_7501(frame: str) -> bool:
     return True
 
 
+def _sync_and_maybe_reexec(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    # The supervised child uses the updated engine without starting another
+    # repair that its parent could interrupt when the re-exec times out.
+    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1":
+        return None
+    if not maybe_sync_project_overlay(payload):
+        return None
+    updated_engine = PILOT_DIR / "runtime.py"
+    try:
+        if not updated_engine.is_file():
+            return None
+        if hashlib.sha256(updated_engine.read_bytes()).hexdigest() == _RUNNING_SCRIPT_SHA256:
+            return None
+        result = subprocess.run(
+            [sys.executable, str(updated_engine), "hook", "--event", event],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env={**os.environ, "THE_PILOT_REEXEC": "1"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_event("engine_reexec_failed", error=str(exc))
+        raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-300:]
+        log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
+        raise HookExecutionError("engine_reexec_failed", detail)
+    try:
+        output = json.loads(result.stdout)
+    except ValueError as exc:
+        log_event("engine_reexec_failed", error=str(exc))
+        raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
+    if not isinstance(output, dict):
+        log_event("engine_reexec_failed", error="output_not_object")
+        raise HookExecutionError("engine_reexec_invalid_output", "hook output must be a JSON object")
+    return output
+
+
 def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     conversation_id = str(payload.get("conversationId") or "")
     if not conversation_id:
@@ -1739,45 +1786,9 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_first_invocation_of_turn(steps):
         return {}
 
-    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1":
-        # Exactly one process per turn owns project synchronization. The
-        # re-executed engine runs under a short supervisor timeout, so it must
-        # never start a repair that its supervisor could abandon by killing it.
-        sync_confirmed = maybe_sync_project_overlay(payload)
-        if sync_confirmed:
-            updated_engine = PILOT_DIR / "runtime.py"
-            try:
-                changed = updated_engine.is_file() and hashlib.sha256(updated_engine.read_bytes()).hexdigest() != _RUNNING_SCRIPT_SHA256
-            except OSError:
-                changed = False
-            if changed:
-                try:
-                    result = subprocess.run(
-                        [sys.executable, str(updated_engine), *sys.argv[1:]],
-                        input=json.dumps(payload, ensure_ascii=False),
-                        text=True,
-                        capture_output=True,
-                        timeout=10,
-                        env={**os.environ, "THE_PILOT_REEXEC": "1"},
-                    )
-                except (OSError, subprocess.SubprocessError) as exc:
-                    log_event("engine_reexec_failed", error=str(exc))
-                    raise HookExecutionError("engine_reexec_failed", str(exc)) from exc
-                if result.returncode != 0:
-                    detail = (result.stderr or result.stdout).strip()[-300:]
-                    log_event("engine_reexec_failed", returncode=result.returncode, error=detail)
-                    raise HookExecutionError("engine_reexec_failed", detail)
-                try:
-                    output = json.loads(result.stdout) if result.stdout.strip() else {}
-                except ValueError as exc:
-                    log_event("engine_reexec_failed", error=str(exc))
-                    raise HookExecutionError("engine_reexec_invalid_output", str(exc)) from exc
-                if not isinstance(output, dict):
-                    log_event("engine_reexec_failed", error="output_not_object")
-                    raise HookExecutionError(
-                        "engine_reexec_invalid_output", "hook output must be a JSON object"
-                    )
-                return output
+    reexec_output = _sync_and_maybe_reexec("PreInvocation", payload)
+    if reexec_output is not None:
+        return reexec_output
     maybe_trigger_auto_update()
     worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
@@ -2075,6 +2086,18 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
     if not user_turn:
         log_event("stop_turn_identity_missing", cid=conversation_id)
         return {"decision": "allow"}, OSC_7501_DONE
+
+    reexec_output = _sync_and_maybe_reexec("Stop", payload)
+    if reexec_output is not None:
+        result = reexec_output.get("result")
+        osc_frame = reexec_output.get("osc_frame")
+        if not isinstance(result, dict) or not isinstance(osc_frame, str):
+            raise HookExecutionError(
+                "engine_reexec_invalid_output", "Stop re-exec must return a hook result and OSC frame"
+            )
+        return result, osc_frame
+    maybe_trigger_auto_update()
+
     with state_lock(conversation_id):
         state = load_state(conversation_id)
         profile, profile_status, profile_err = load_profile()
@@ -2575,8 +2598,12 @@ def run_hook(event: str) -> int:
     except Exception as exc:
         log_event("hook_failed", hook_event=event, error=repr(exc))
         return _hook_failure(event, "internal_error", repr(exc))
-    print(json.dumps(result, ensure_ascii=False), flush=True)
-    if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") != "1" and osc_frame:
+    reexecuted = _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1"
+    # The parent publishes the decision and writes the child's exact frame
+    # using its connection to the pane. Only the private Stop pipe gets this receipt.
+    output = {"result": result, "osc_frame": osc_frame} if reexecuted and event == "Stop" else result
+    print(json.dumps(output, ensure_ascii=False), flush=True)
+    if not reexecuted and osc_frame:
         emit_osc_7501(osc_frame)
     return 0
 
@@ -2658,21 +2685,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "worker":
-        return command_worker(args.target, args.json)
-    if args.command == "mode":
-        return command_mode(args.target)
     if args.command == "hook":
         return run_hook(args.event)
-    if args.command == "status":
-        return command_status(args.json)
-    if args.command == "sync":
-        return command_sync()
-    if args.command == "set":
-        return command_set(args.target, args.template)
-    if args.command == "log":
-        return command_log(args.limit)
-
+    if args.command == "worker":
+        code = command_worker(args.target, args.json)
+    elif args.command == "mode":
+        code = command_mode(args.target)
+    elif args.command == "status":
+        code = command_status(args.json)
+    elif args.command == "sync":
+        code = command_sync()
+    elif args.command == "set":
+        code = command_set(args.target, args.template)
+    else:
+        code = command_log(args.limit)
+    maybe_trigger_auto_update()
+    return code
 
 
 if __name__ == "__main__":
