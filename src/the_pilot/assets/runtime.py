@@ -1469,7 +1469,11 @@ def resolve_terminal(workspace_path: str, explicit_handle: str = "") -> str:
     except ValueError as exc:
         log_event("terminal_list_invalid", error=str(exc))
         return ""
-    terminals = ((payload.get("result") or {}).get("terminals") or []) if isinstance(payload, dict) else []
+    result_data = payload.get("result") if isinstance(payload, dict) else None
+    terminals = result_data.get("terminals") if isinstance(result_data, dict) else None
+    if not isinstance(terminals, list):
+        log_event("terminal_list_invalid", reason="missing_terminals")
+        return ""
     candidates = [
         item
         for item in terminals
@@ -1500,29 +1504,42 @@ def resolve_terminal(workspace_path: str, explicit_handle: str = "") -> str:
     return str(matched[0].get("handle") or "")
 
 
-def send_to_terminal(handle: str, text: str, enter: bool, *, wait_submit_seconds: float = 0.0) -> str:
-    args = ["terminal", "send", "--terminal", handle, "--text", text, "--json"]
-    observe_submission = enter and wait_submit_seconds > 0
+def _start_terminal_send(
+    handle: str, text: str, enter: bool, *, wait_submit_seconds: float = 0.0
+) -> subprocess.Popen[str]:
+    args = [orca_binary(), "terminal", "send", "--terminal", handle, "--text", text, "--json"]
     if enter:
         args.append("--enter")
-    if observe_submission:
-        args.extend(["--wait-submit", f"{wait_submit_seconds:g}"])
+        if wait_submit_seconds > 0:
+            args.extend(["--wait-submit", f"{wait_submit_seconds:g}"])
+    return subprocess.Popen(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def _wait_for_terminal_receipt(
+    process: subprocess.Popen[str], handle: str, enter: bool, *, wait_submit_seconds: float = 0.0
+) -> str:
+    observe_submission = enter and wait_submit_seconds > 0
     timeout = wait_submit_seconds + 5.0 if observe_submission else 5.0
-    result = run_orca(args, timeout=timeout)
-    if result is None:
-        log_event("send_unknown", handle=handle, enter=enter, reason="no_result")
-        return "unknown"
-    if result.returncode != 0:
+    with process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            process.kill()
+            log_event("send_unknown", handle=handle, enter=enter, error=str(exc))
+            return "unknown"
+    if process.returncode != 0:
         log_event(
             "send_rejected",
             handle=handle,
             enter=enter,
-            returncode=result.returncode,
-            stderr=result.stderr[-500:],
+            returncode=process.returncode,
+            stderr=stderr[-500:],
         )
         return "rejected"
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(stdout)
     except ValueError as exc:
         log_event("send_receipt_invalid", handle=handle, error=str(exc))
         return "unknown"
@@ -1531,13 +1548,14 @@ def send_to_terminal(handle: str, text: str, enter: bool, *, wait_submit_seconds
     accepted = receipt.get("accepted") if isinstance(receipt, dict) else None
     if accepted is True:
         log_event("send_receipt", handle=handle, enter=enter, accepted=True)
-        prompt = receipt.get("prompt")
-        if observe_submission and isinstance(prompt, dict):
-            observation = prompt.get("observation")
-            stages = prompt.get("stages")
-            if observation == "permission" or (
-                observation == "supported"
-                and not (isinstance(stages, list) and "turn_started" in stages)
+        if observe_submission:
+            prompt = receipt.get("prompt")
+            stages = prompt.get("stages") if isinstance(prompt, dict) else None
+            if not (
+                isinstance(prompt, dict)
+                and prompt.get("observation") == "supported"
+                and isinstance(stages, list)
+                and "turn_started" in stages
             ):
                 return "unconfirmed"
         return "accepted"
@@ -1546,6 +1564,15 @@ def send_to_terminal(handle: str, text: str, enter: bool, *, wait_submit_seconds
         return "rejected"
     log_event("send_receipt_invalid", handle=handle, reason="missing_accepted")
     return "unknown"
+
+
+def send_to_terminal(handle: str, text: str, enter: bool, *, wait_submit_seconds: float = 0.0) -> str:
+    try:
+        process = _start_terminal_send(handle, text, enter, wait_submit_seconds=wait_submit_seconds)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log_event("send_unknown", handle=handle, enter=enter, error=str(exc))
+        return "unknown"
+    return _wait_for_terminal_receipt(process, handle, enter, wait_submit_seconds=wait_submit_seconds)
 
 
 def injection(message: str) -> dict[str, Any]:
@@ -2027,12 +2054,10 @@ def _osc_frame_for_delivery_status(status: str) -> str:
 def _load_stop_settings() -> tuple[
     dict[str, Any], dict[str, dict[str, Any]], tuple[str, str] | None
 ]:
-    # Callers hold the session lock. The installation lock covers the snapshot
-    # only, and is released before any Orca operation.
-    with _file_lock(PILOT_DIR / ".pilot.lock"):
-        profile, profile_status, profile_err = load_profile()
-        scenes, scene_errors = scan_scenes()
-        failure = _installed_config_failure(profile_status, profile_err, scene_errors=scene_errors)
+    """Read installed Stop settings while the caller holds the profile lock."""
+    profile, profile_status, profile_err = load_profile()
+    scenes, scene_errors = scan_scenes()
+    failure = _installed_config_failure(profile_status, profile_err, scene_errors=scene_errors)
     return profile or {}, scenes, failure
 
 
@@ -2041,25 +2066,6 @@ class AutoSubmitAdmission(NamedTuple):
     gate: str
     handle: str
     reason: str
-
-
-def _auto_submit_policy(
-    profile: dict[str, Any],
-    scenes: dict[str, dict[str, Any]],
-    *,
-    scene: str,
-    gate_action: str,
-    previous_count: int,
-) -> AutoSubmitAdmission:
-    mode = current_mode(profile)
-    gate = resolve_gate(scene, gate_action, scenes)
-    if scene not in scenes:
-        return AutoSubmitAdmission(mode, gate, "", "scene_missing")
-    if mode != "gate" or gate != "auto":
-        return AutoSubmitAdmission(mode, gate, "", "auto_disabled")
-    if previous_count >= max_consecutive_turns(profile):
-        return AutoSubmitAdmission(mode, gate, "", "auto_turn_limit")
-    return AutoSubmitAdmission(mode, gate, "", "")
 
 
 def _admit_auto_submit(
@@ -2073,13 +2079,16 @@ def _admit_auto_submit(
     explicit_handle: str,
 ) -> AutoSubmitAdmission:
     """Apply the same policy and terminal binding to queueing and sending."""
-    policy = _auto_submit_policy(
-        profile, scenes, scene=scene, gate_action=gate_action, previous_count=previous_count,
-    )
-    if policy.reason:
-        return policy
+    mode = current_mode(profile)
+    gate = resolve_gate(scene, gate_action, scenes)
+    if scene not in scenes:
+        return AutoSubmitAdmission(mode, gate, "", "scene_missing")
+    if mode != "gate" or gate != "auto":
+        return AutoSubmitAdmission(mode, gate, "", "auto_disabled")
+    if previous_count >= max_consecutive_turns(profile):
+        return AutoSubmitAdmission(mode, gate, "", "auto_turn_limit")
     handle = resolve_terminal(workspace_path, explicit_handle)
-    return policy._replace(handle=handle, reason="" if handle else "no_terminal")
+    return AutoSubmitAdmission(mode, gate, handle, "" if handle else "no_terminal")
 
 
 def _pending_auto_submit(state: dict[str, Any], turn_id: str) -> bool:
@@ -2089,9 +2098,11 @@ def _pending_auto_submit(state: dict[str, Any], turn_id: str) -> bool:
 def _delivery_transcript_progress(transcript_path: str, user_turn: str, turn_id: str) -> str:
     steps, complete = read_steps(transcript_path)
     if not complete:
-        return "incomplete"
-    if turn_user_identity(steps) != user_turn or turn_identity(steps) != turn_id:
-        return "advanced"
+        return "transcript_incomplete"
+    if turn_user_identity(steps) != user_turn:
+        return "new_user_turn"
+    if turn_identity(steps) != turn_id:
+        return "transcript_changed"
     return "current"
 
 
@@ -2137,13 +2148,15 @@ def _settle_auto_submit(
     turn_id: str,
     event: str,
     status: str,
+    emit_status: bool = True,
     **fields: str,
 ) -> None:
     state["delivery_status"] = status
     if session_path(conversation_id).is_file():
         save_state(conversation_id, state)
     log_event(event, cid=conversation_id, scene=state.get("scene"), turn_id=turn_id, **fields)
-    emit_osc_7501(_osc_frame_for_delivery_status(status))
+    if emit_status:
+        emit_osc_7501(_osc_frame_for_delivery_status(status))
 
 
 def deliver_pending_auto_submit(
@@ -2151,7 +2164,7 @@ def deliver_pending_auto_submit(
     *,
     turn_id: str,
     workspace_path: str,
-    explicit_handle: str,
+    pinned_handle: str,
     transcript_path: str,
     parent_pid: int,
 ) -> int:
@@ -2160,7 +2173,9 @@ def deliver_pending_auto_submit(
     if stop_exited:
         time.sleep(_delivery_env_seconds("THE_PILOT_DELIVER_DELAY_MS", DELIVERY_SETTLE_SECONDS, units_per_second=1000))
     wait_submit_seconds = _delivery_env_seconds("THE_PILOT_WAIT_SUBMIT_SECONDS", DELIVERY_WAIT_SUBMIT_SECONDS)
-    with state_lock(conversation_id):
+    # The handoff shares both writer locks with PreInvocation and profile
+    # mutations. Orca's observation of the result runs outside both locks.
+    with state_lock(conversation_id), _file_lock(PILOT_DIR / ".pilot.lock"):
         state = load_state(conversation_id)
         if state is None or not _pending_auto_submit(state, turn_id):
             return 0
@@ -2169,17 +2184,16 @@ def deliver_pending_auto_submit(
         if not primary or not user_turn:
             return 0
         progress = _delivery_transcript_progress(transcript_path, user_turn, turn_id)
-        if progress == "advanced":
-            return 0
-
         previous_count = max(0, int(state.get("consecutive_auto_turns") or 1) - 1)
         scene = str(state.get("scene") or "")
         gate_action = str(state.get("gate_action") or "")
         handle = ""
-        if not stop_exited:
+        if progress != "current":
+            reason = progress
+        elif not stop_exited:
             reason = "stop_still_running"
-        elif progress == "incomplete":
-            reason = "transcript_incomplete"
+        elif not pinned_handle.strip():
+            reason = "no_terminal"
         else:
             profile, scenes, failure = _load_stop_settings()
             if failure is not None:
@@ -2187,46 +2201,56 @@ def deliver_pending_auto_submit(
             else:
                 admission = _admit_auto_submit(
                     profile, scenes, scene=scene, gate_action=gate_action,
-                    previous_count=previous_count, workspace_path=workspace_path, explicit_handle=explicit_handle,
+                    previous_count=previous_count, workspace_path=workspace_path,
+                    explicit_handle=pinned_handle,
                 )
                 handle, reason = admission.handle, admission.reason
-        if handle:
-            # Listing terminals can block while agy or the installer updates
-            # the witnesses. Check them again without another external call.
+            # Antigravity writes its transcript independently of Pilot's locks.
+            # Check the turn again after the potentially slow terminal lookup.
             progress = _delivery_transcript_progress(transcript_path, user_turn, turn_id)
-            if progress == "advanced":
-                return 0
-            if progress == "incomplete":
-                reason = "transcript_incomplete"
-            else:
-                profile, scenes, failure = _load_stop_settings()
-                reason = failure[0] if failure else _auto_submit_policy(
-                    profile, scenes, scene=scene, gate_action=gate_action, previous_count=previous_count,
-                ).reason
+            if progress != "current":
+                reason = progress
         if reason:
             no_terminal = reason == "no_terminal"
             _rollback_auto_submit(state, previous_count, settled_turn_id=turn_id if no_terminal else "")
             _settle_auto_submit(
                 conversation_id, state, turn_id=turn_id, status="none",
                 event="auto_submit_no_terminal" if no_terminal else "auto_submit_cancelled", reason=reason,
+                emit_status=reason != "new_user_turn",
             )
             return 0
 
-    outcome = send_to_terminal(handle, primary, enter=True, wait_submit_seconds=wait_submit_seconds)
+        try:
+            process = _start_terminal_send(handle, primary, enter=True, wait_submit_seconds=wait_submit_seconds)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            _rollback_auto_submit(state, previous_count)
+            _settle_auto_submit(
+                conversation_id, state, turn_id=turn_id, status="rejected",
+                event="auto_submit_rejected", reason="send_spawn_failed", error=str(exc),
+            )
+            return 0
+
+    outcome = _wait_for_terminal_receipt(process, handle, enter=True, wait_submit_seconds=wait_submit_seconds)
 
     with state_lock(conversation_id):
         state = load_state(conversation_id)
         if state is None:
             return 0
+        if outcome == "unconfirmed":
+            started_by_pre = (
+                state.get("delivery_status") == "none"
+                and state.get("last_settled_turn_id") == turn_id
+                and str(state.get("current_user_turn_id") or "") not in {"", "missing", user_turn}
+            )
+            if started_by_pre or _delivery_transcript_progress(
+                transcript_path, user_turn, turn_id
+            ) == "new_user_turn":
+                outcome = "accepted"
         if not _pending_auto_submit(state, turn_id):
-            if outcome in {"accepted", "unconfirmed"}:
+            if outcome == "accepted":
                 log_event("auto_submitted", cid=conversation_id, scene=scene, turn_id=turn_id)
             return 0
 
-        if outcome == "unconfirmed" and _delivery_transcript_progress(
-            transcript_path, user_turn, turn_id
-        ) == "advanced":
-            outcome = "accepted"
         if outcome == "accepted":
             status, event = "accepted", "auto_submitted"
         elif outcome == "rejected":
@@ -2241,7 +2265,7 @@ def deliver_pending_auto_submit(
 
 def _spawn_auto_delivery(
     conversation_id: str, *, turn_id: str, workspace_path: str,
-    explicit_handle: str, transcript_path: str,
+    handle: str, transcript_path: str,
 ) -> bool:
     try:
         env = os.environ.copy()
@@ -2257,11 +2281,10 @@ def _spawn_auto_delivery(
             "--cid", conversation_id,
             "--turn-id", turn_id,
             "--workspace", workspace_path,
+            "--terminal", handle,
             "--transcript", transcript_path,
             "--parent-pid", str(stop_pid),
         ]
-        if explicit_handle:
-            args.extend(["--terminal", explicit_handle])
         subprocess.Popen(
             args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
@@ -2325,7 +2348,8 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         return result, osc_frame
     with state_lock(conversation_id):
         state = load_state(conversation_id)
-        profile, scenes, failure = _load_stop_settings()
+        with _file_lock(PILOT_DIR / ".pilot.lock"):
+            profile, scenes, failure = _load_stop_settings()
         if failure is not None:
             # Never deliver against unusable installed inputs. Only a readable
             # session can be cleared; a corrupt one is left as evidence.
@@ -2491,7 +2515,7 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 return {"decision": "allow"}, OSC_7501_DONE
             if _spawn_auto_delivery(
                 conversation_id, turn_id=turn_id, workspace_path=workspace_path,
-                explicit_handle=explicit_handle, transcript_path=str(payload.get("transcriptPath") or ""),
+                handle=admission.handle, transcript_path=str(payload.get("transcriptPath") or ""),
             ):
                 return {"decision": "allow"}, _osc_frame_for_delivery_status("pending")
             _rollback_auto_submit(state, previous_count, previous_text=previous_text, settled_turn_id=previous_turn_id)
@@ -2894,7 +2918,7 @@ def build_parser() -> argparse.ArgumentParser:
     deliver.add_argument("--cid", required=True)
     deliver.add_argument("--turn-id", required=True)
     deliver.add_argument("--workspace", required=True)
-    deliver.add_argument("--terminal", default="")
+    deliver.add_argument("--terminal", required=True)
     deliver.add_argument("--transcript", required=True)
     deliver.add_argument("--parent-pid", type=int, required=True)
     status = subparsers.add_parser("status", help="查看模式、场景与 Hook 状态")
@@ -2919,7 +2943,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "deliver":
         return deliver_pending_auto_submit(
             args.cid, turn_id=args.turn_id, workspace_path=args.workspace,
-            explicit_handle=args.terminal, transcript_path=args.transcript, parent_pid=args.parent_pid,
+            pinned_handle=args.terminal, transcript_path=args.transcript, parent_pid=args.parent_pid,
         )
     if args.command == "status":
         return command_status(args.json)

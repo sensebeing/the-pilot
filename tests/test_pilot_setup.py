@@ -81,9 +81,10 @@ if args[:2] == ["terminal", "list"]:
             queued.touch()
     worktree = os.environ.get("FAKE_WORKTREE_PATH", str(root / "ws"))
     count = int(os.environ.get("FAKE_TERMINAL_COUNT", "1"))
+    primary_handle = "term_replacement" if (root / "terminal-replaced").exists() else "term_test"
     terminals = [
         {
-            "handle": "term_test" if index == 0 else f"term_test_{index}",
+            "handle": primary_handle if index == 0 else f"term_test_{index}",
             "agentIdentity": "antigravity",
             "connected": not (root / "terminal-disconnected").exists(),
             "writable": True,
@@ -102,13 +103,18 @@ elif args[:2] == ["terminal", "send"]:
             sys.exit("Stop was still alive when Enter was sent")
     receipt = {"accepted": os.environ.get("FAKE_SEND_ACCEPTED", "1") != "0"}
     observation = os.environ.get("FAKE_PROMPT_OBSERVATION")
-    if observation:
+    if observation == "malformed":
+        receipt["prompt"] = {"observation": "supported", "stages": "turn_started"}
+    elif observation and observation != "missing":
         receipt["prompt"] = {"observation": observation, "stages": ["input_accepted"]}
+    elif observation != "missing" and "--wait-submit" in args:
+        receipt["prompt"] = {"observation": "supported", "stages": ["input_accepted", "turn_started"]}
     transcript_path = os.environ.get("FAKE_SEND_TRANSCRIPT")
     if transcript_path:
         with Path(transcript_path).open("a", encoding="utf-8") as transcript:
             text = args[args.index("--text") + 1]
-            transcript.write(json.dumps({"type": "USER_INPUT", "content": text}) + "\\n")
+            step_type = os.environ.get("FAKE_SEND_STEP_TYPE", "USER_INPUT")
+            transcript.write(json.dumps({"type": step_type, "content": text}) + "\\n")
         if os.environ.get("FAKE_SEND_AWAIT_PRE") == "1":
             (root / "prompt-arrived").touch()
             deadline = time.monotonic() + 4
@@ -1898,13 +1904,15 @@ sys.stdin.read()
         resident-fact: status: a single unconfirmed send with no transcript
         progress freezes delivery and reports blocked:question.
         """
-        for observation in ("supported", "permission"):
+        for observation in ("supported", "permission", "missing", "unsupported", "malformed"):
             with self.subTest(observation=observation):
                 cid = f"unconfirmed-{observation}"
                 target = self.root / f"osc-{cid}"
                 previous_sends = len(send_calls(self.root))
                 result = self.stop(cid, suggestion("继续推进"), extra_env={
                     "FAKE_PROMPT_OBSERVATION": observation,
+                    "FAKE_SEND_TRANSCRIPT": self.root / f"transcript-{cid}.jsonl",
+                    "FAKE_SEND_STEP_TYPE": "CHECKPOINT",
                     "THE_PILOT_OSC_TARGET": target,
                 })
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1918,7 +1926,10 @@ sys.stdin.read()
         resident-fact: admission: queued delivery uses the current mode,
         installation, transcript, and terminal binding at the send boundary.
         """
-        for change in ("off", "confirm", "scene", "uninstalled", "disconnected", "transcript"):
+        for change in (
+            "off", "confirm", "scene", "uninstalled", "disconnected", "replaced", "transcript",
+            "checkpoint", "new-user",
+        ):
             with self.subTest(change=change):
                 cid = f"cancel-{change}"
                 target = self.root / f"osc-{cid}"
@@ -1934,22 +1945,32 @@ sys.stdin.read()
                     elif change == "uninstalled":
                         result = run_setup(self.root, self.gemini, "uninstall")
                         self.assertEqual(result.returncode, 0, result.stderr)
-                    elif change == "disconnected":
-                        (self.root / "terminal-disconnected").touch()
-                    else:
+                    elif change in ("disconnected", "replaced"):
+                        (self.root / f"terminal-{change}").touch()
+                    elif change == "transcript":
                         with transcript.open("ab") as handle:
                             handle.write(b'{"type": "USER_INPUT", "content": "\xff"}')
+                    else:
+                        step_type = "CHECKPOINT" if change == "checkpoint" else "USER_INPUT"
+                        write_transcript(self.root, transcript.name, [
+                            {"type": step_type, "content": "another step"},
+                        ], append=True)
                     self.assertEqual(send_calls(self.root), [])
                 state = wait_for_delivery(self.state, cid)
                 self.assertEqual(state["delivery_status"], "none")
                 self.assertEqual(state["consecutive_auto_turns"], 0)
                 self.assertEqual(state["auto_submitted_text"], "")
                 self.assertEqual(send_calls(self.root), [])
-                self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE)
+                if change in ("checkpoint", "new-user"):
+                    self.assertEqual(state["last_settled_turn_id"], "")
+                if change == "new-user":
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE)
                 if change in ("off", "confirm", "scene", "uninstalled"):
                     apply_profile(self.root, self.gemini, "--preset", "recommended")
-                if change == "disconnected":
-                    (self.root / "terminal-disconnected").unlink()
+                if change in ("disconnected", "replaced"):
+                    (self.root / f"terminal-{change}").unlink()
 
     def test_manual_input_supersedes_queued_auto_delivery(self) -> None:
         """Failure means queued Enter can overwrite a user who already took over.
@@ -1981,13 +2002,13 @@ sys.stdin.read()
         self.assertEqual(send_calls(self.root), [])
         self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
 
-    def test_mode_change_during_terminal_lookup_cancels_auto_delivery(self) -> None:
-        """Failure means a slow Orca lookup can leave the send using stale mode.
+    def test_locked_handoff_cancels_if_transcript_changes_during_terminal_lookup(self) -> None:
+        """Failure means a mutation can slip into the handoff or an obsolete turn can send.
 
-        resident-fact: admission: changes during terminal resolution take
-        effect before the queued delivery is permitted to press Enter.
+        resident-fact: admission: the handoff owns both mutation locks and
+        checks transcript changes that arrive during terminal validation.
         """
-        cid = "mode-during-lookup"
+        cid = "transcript-during-lookup"
         target = self.root / "osc-lookup"
         result = self.stop(cid, suggestion("继续推进"), wait_delivery=False, extra_env={
             "FAKE_LIST_AWAIT_RELEASE": "1", "THE_PILOT_OSC_TARGET": target,
@@ -1998,8 +2019,14 @@ sys.stdin.read()
             self.assertLess(time.monotonic(), deadline, "Delivery did not resolve the terminal")
             time.sleep(0.01)
         try:
-            result = run_engine(self.root, self.gemini, self.state, "mode", "off")
-            self.assertEqual(result.returncode, 0, result.stderr)
+            for lock_path in (
+                state_path(self.state, cid).with_suffix(".lock"),
+                (self.gemini / PROFILE_REL).parent / ".pilot.lock",
+            ):
+                with lock_path.open("r", encoding="utf-8") as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            write_transcript(self.root, f"transcript-{cid}.jsonl", [{"type": "CHECKPOINT"}], append=True)
         finally:
             (self.root / "release-deliver-list").touch()
         self.assertEqual(wait_for_delivery(self.state, cid)["delivery_status"], "none")
