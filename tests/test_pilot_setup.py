@@ -23,9 +23,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-
-
+from contextlib import contextmanager
 from functools import partial
 from unittest import mock
 
@@ -57,19 +57,36 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 root = Path(__ROOT__)
 with (root / "orca-calls.jsonl").open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
 args = sys.argv[1:]
 if args[:2] == ["terminal", "list"]:
+    if os.environ.get("FAKE_REQUIRE_STOP_EXIT") == "1":
+        stop_pid = root / "stop-pid"
+        if not stop_pid.exists():
+            stop_pid.write_text(str(os.getppid()), encoding="utf-8")
+    if os.environ.get("FAKE_LIST_AWAIT_RELEASE") == "1":
+        queued = root / "stop-list-seen"
+        if queued.exists():
+            (root / "deliver-list-started").touch()
+            deadline = time.monotonic() + 3
+            while not (root / "release-deliver-list").exists():
+                if time.monotonic() >= deadline:
+                    sys.exit("Delivery terminal lookup was not released")
+                time.sleep(0.01)
+        else:
+            queued.touch()
     worktree = os.environ.get("FAKE_WORKTREE_PATH", str(root / "ws"))
     count = int(os.environ.get("FAKE_TERMINAL_COUNT", "1"))
+    primary_handle = "term_replacement" if (root / "terminal-replaced").exists() else "term_test"
     terminals = [
         {
-            "handle": "term_test" if index == 0 else f"term_test_{index}",
+            "handle": primary_handle if index == 0 else f"term_test_{index}",
             "agentIdentity": "antigravity",
-            "connected": True,
+            "connected": not (root / "terminal-disconnected").exists(),
             "writable": True,
             "worktreePath": worktree,
         }
@@ -77,11 +94,38 @@ if args[:2] == ["terminal", "list"]:
     ]
     print(json.dumps({"ok": True, "result": {"terminals": terminals}}, ensure_ascii=False))
 elif args[:2] == ["terminal", "send"]:
+    if os.environ.get("FAKE_REQUIRE_STOP_EXIT") == "1":
+        try:
+            os.kill(int((root / "stop-pid").read_text(encoding="utf-8")), 0)
+        except ProcessLookupError:
+            pass
+        else:
+            sys.exit("Stop was still alive when Enter was sent")
+    receipt = {"accepted": os.environ.get("FAKE_SEND_ACCEPTED", "1") != "0"}
+    observation = os.environ.get("FAKE_PROMPT_OBSERVATION")
+    if observation == "malformed":
+        receipt["prompt"] = {"observation": "supported", "stages": "turn_started"}
+    elif observation and observation != "missing":
+        receipt["prompt"] = {"observation": observation, "stages": ["input_accepted"]}
+    elif observation != "missing" and "--wait-submit" in args:
+        receipt["prompt"] = {"observation": "supported", "stages": ["input_accepted", "turn_started"]}
+    transcript_path = os.environ.get("FAKE_SEND_TRANSCRIPT")
+    if transcript_path:
+        with Path(transcript_path).open("a", encoding="utf-8") as transcript:
+            text = args[args.index("--text") + 1]
+            step_type = os.environ.get("FAKE_SEND_STEP_TYPE", "USER_INPUT")
+            transcript.write(json.dumps({"type": step_type, "content": text}) + "\\n")
+        if os.environ.get("FAKE_SEND_AWAIT_PRE") == "1":
+            (root / "prompt-arrived").touch()
+            deadline = time.monotonic() + 4
+            while not (root / "pre-returned").exists():
+                if time.monotonic() >= deadline:
+                    sys.exit("PreInvocation could not finish while awaiting the receipt")
+                time.sleep(0.01)
     if os.environ.get("FAKE_SEND_RESULT") == "invalid":
         print("not-json")
     else:
-        accepted = os.environ.get("FAKE_SEND_ACCEPTED", "1") != "0"
-        print(json.dumps({"ok": True, "result": {"send": {"accepted": accepted}}}, ensure_ascii=False))
+        print(json.dumps({"ok": True, "result": {"send": receipt}}, ensure_ascii=False))
 else:
     print(json.dumps({"ok": False}))
 """
@@ -106,6 +150,7 @@ def base_env(root: Path) -> dict[str, str]:
         "PATH": f"{root / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": str(root / "tmp"),
         "THE_PILOT_DISABLE_AUTO_UPDATE": "1",
+        "THE_PILOT_DELIVER_DELAY_MS": "0",
         "PYTHONDONTWRITEBYTECODE": "1",
         "LANG": "en_US.UTF-8",
     }
@@ -185,8 +230,9 @@ def run_engine(
     *args: str,
     stdin: str = "",
     extra_env: dict | None = None,
+    wait_delivery: bool = True,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         [sys.executable, str(gemini / ENGINE_REL), *args],
         input=stdin,
         capture_output=True,
@@ -194,6 +240,11 @@ def run_engine(
         env=engine_env(root, gemini, state, extra_env),
         timeout=30,
     )
+    if wait_delivery and result.returncode == 0 and args == ("hook", "--event", "Stop"):
+        cid = json.loads(stdin).get("conversationId")
+        if cid:
+            wait_for_delivery(state, cid)
+    return result
 
 
 def run_default_engine(
@@ -296,6 +347,26 @@ def state_path(state: Path, conversation_id: str) -> Path:
 def read_state(state: Path, conversation_id: str) -> dict:
     path = state_path(state, conversation_id)
     return read_json(path) if path.is_file() else {}
+
+
+def wait_for_delivery(state: Path, cid: str) -> dict:
+    deadline = time.monotonic() + 8
+    lock_path = state_path(state, cid).with_suffix(".lock")
+    while lock_path.is_file():
+        with lock_path.open("r", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                session = read_state(state, cid)
+            except (OSError, ValueError):
+                return {}
+            if not isinstance(session, dict):
+                return {}
+            if session.get("delivery_status") != "pending":
+                return session
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Delivery is still pending for {cid}")
+        time.sleep(0.01)
+    return read_state(state, cid)
 
 
 class CompilerTest(unittest.TestCase):
@@ -1596,6 +1667,7 @@ class EngineTest(unittest.TestCase):
         *,
         steps: list[dict] | None = None,
         extra_env: dict | None = None,
+        wait_delivery: bool = True,
     ) -> subprocess.CompletedProcess:
         transcript_path = self.root / f"transcript-{conversation_id}.jsonl"
         if steps is not None:
@@ -1628,6 +1700,7 @@ class EngineTest(unittest.TestCase):
                 workspacePaths=[str(self.workspace)],
             ),
             extra_env=extra_env,
+            wait_delivery=wait_delivery,
         )
 
     def stop_decision(
@@ -1748,6 +1821,255 @@ class EngineTest(unittest.TestCase):
         state = read_state(self.state, "c-auto")
         self.assertEqual(state["consecutive_auto_turns"], 1)
         self.assertEqual(state["auto_submitted_text"], "")
+
+    @contextmanager
+    def queued_auto_delivery(self, cid: str, *, extra_env: dict | None = None):
+        """Hold the re-exec Stop parent until the test releases its stdin."""
+        text = suggestion("继续推进")
+        transcript = write_transcript(self.root, f"transcript-{cid}.jsonl", [
+            {"type": "USER_INPUT", "content": "开始"},
+            {"type": "PLANNER_RESPONSE", "content": text},
+        ])
+        wrapper = """
+import subprocess
+import sys
+
+result = subprocess.run(sys.argv[1:], input=sys.stdin.readline(), text=True,
+                        capture_output=True, timeout=10)
+if result.returncode:
+    sys.exit(result.stderr)
+print(result.stdout, end="", flush=True)
+sys.stdin.read()
+"""
+        with subprocess.Popen(
+            [sys.executable, "-c", wrapper, sys.executable, str(self.gemini / ENGINE_REL),
+             "hook", "--event", "Stop"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=engine_env(self.root, self.gemini, self.state, {
+                **(extra_env or {}), "THE_PILOT_REEXEC": "1",
+            }),
+        ) as stop:
+            stop.stdin.write(payload(
+                cid, transcriptPath=str(transcript), terminationReason="NO_TOOL_CALL",
+                fullyIdle=True, workspacePaths=[str(self.workspace)],
+            ) + "\n")
+            stop.stdin.flush()
+            try:
+                receipt = stop.stdout.readline()
+                self.assertTrue(receipt, "Re-executed Stop exited without a decision")
+                self.assertEqual(json.loads(receipt), {"result": {"decision": "allow"}, "osc_frame": ""})
+                self.assertEqual(read_state(self.state, cid)["delivery_status"], "pending")
+                yield transcript
+            finally:
+                stdout, stderr = stop.communicate(timeout=10)
+                self.assertEqual(stop.returncode, 0, stdout + stderr)
+
+    def test_auto_delivery_sends_once_after_stop_exits(self) -> None:
+        """Failure means Enter can land during Stop teardown or be sent twice.
+
+        resident-fact: settlement: the only Enter follows the Stop process exit
+        and waits for Orca to observe submission.
+        """
+        result = self.stop("post-stop", suggestion("继续推进"), extra_env={
+            "FAKE_REQUIRE_STOP_EXIT": "1",
+            "THE_PILOT_WAIT_SUBMIT_SECONDS": "1.5",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(read_state(self.state, "post-stop")["delivery_status"], "accepted")
+        send, = send_calls(self.root)
+        self.assertIn("--enter", send)
+        self.assertEqual(send[send.index("--wait-submit") + 1], "1.5")
+
+    def test_unconfirmed_receipt_accepts_transcript_progress_without_a_second_send(self) -> None:
+        """Failure means delayed input is either lost or triggers an extra Enter.
+
+        resident-fact: settlement: a newer transcript can confirm the single
+        send even when Orca observed only input acceptance.
+        """
+        cid = "delayed-input"
+        target = self.root / "osc-delayed"
+        result = self.stop(cid, suggestion("继续推进"), extra_env={
+            "FAKE_PROMPT_OBSERVATION": "supported",
+            "FAKE_SEND_TRANSCRIPT": self.root / f"transcript-{cid}.jsonl",
+            "THE_PILOT_OSC_TARGET": target,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(send_calls(self.root)), 1)
+        self.assertEqual(read_state(self.state, cid)["delivery_status"], "accepted")
+        self.assertFalse(target.exists())
+
+    def test_unconfirmed_auto_delivery_freezes_without_a_second_send(self) -> None:
+        """Failure means a stalled delivery leaves the pane working or resends.
+
+        resident-fact: status: a single unconfirmed send with no transcript
+        progress freezes delivery and reports blocked:question.
+        """
+        for observation in ("supported", "permission", "missing", "unsupported", "malformed"):
+            with self.subTest(observation=observation):
+                cid = f"unconfirmed-{observation}"
+                target = self.root / f"osc-{cid}"
+                previous_sends = len(send_calls(self.root))
+                result = self.stop(cid, suggestion("继续推进"), extra_env={
+                    "FAKE_PROMPT_OBSERVATION": observation,
+                    "FAKE_SEND_TRANSCRIPT": self.root / f"transcript-{cid}.jsonl",
+                    "FAKE_SEND_STEP_TYPE": "CHECKPOINT",
+                    "THE_PILOT_OSC_TARGET": target,
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(send_calls(self.root)), previous_sends + 1)
+                self.assertEqual(read_state(self.state, cid)["delivery_status"], "unknown")
+                self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WAITING_QUESTION)
+
+    def test_pending_auto_delivery_rechecks_admission_before_sending(self) -> None:
+        """Failure means stale authorization can still press Enter.
+
+        resident-fact: admission: queued delivery uses the current mode,
+        installation, transcript, and terminal binding at the send boundary.
+        """
+        for change in (
+            "off", "confirm", "scene", "uninstalled", "disconnected", "replaced", "transcript",
+            "checkpoint", "new-user",
+        ):
+            with self.subTest(change=change):
+                cid = f"cancel-{change}"
+                target = self.root / f"osc-{cid}"
+                with self.queued_auto_delivery(cid, extra_env={"THE_PILOT_OSC_TARGET": target}) as transcript:
+                    if change in ("off", "confirm"):
+                        result = run_engine(self.root, self.gemini, self.state, "mode", change)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    elif change == "scene":
+                        scene = self.gemini / SCENES_REL / "01-plan-and-orchestrate.md"
+                        scene.write_text(scene.read_text(encoding="utf-8").replace(
+                            "auto_in_gate_mode: true", "auto_in_gate_mode: false",
+                        ), encoding="utf-8")
+                    elif change == "uninstalled":
+                        result = run_setup(self.root, self.gemini, "uninstall")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    elif change in ("disconnected", "replaced"):
+                        (self.root / f"terminal-{change}").touch()
+                    elif change == "transcript":
+                        with transcript.open("ab") as handle:
+                            handle.write(b'{"type": "USER_INPUT", "content": "\xff"}')
+                    else:
+                        step_type = "CHECKPOINT" if change == "checkpoint" else "USER_INPUT"
+                        write_transcript(self.root, transcript.name, [
+                            {"type": step_type, "content": "another step"},
+                        ], append=True)
+                    self.assertEqual(send_calls(self.root), [])
+                state = wait_for_delivery(self.state, cid)
+                self.assertEqual(state["delivery_status"], "none")
+                self.assertEqual(state["consecutive_auto_turns"], 0)
+                self.assertEqual(state["auto_submitted_text"], "")
+                self.assertEqual(send_calls(self.root), [])
+                if change in ("checkpoint", "new-user"):
+                    self.assertEqual(state["last_settled_turn_id"], "")
+                if change == "new-user":
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE)
+                if change in ("off", "confirm", "scene", "uninstalled"):
+                    apply_profile(self.root, self.gemini, "--preset", "recommended")
+                if change in ("disconnected", "replaced"):
+                    (self.root / f"terminal-{change}").unlink()
+
+    def test_manual_input_supersedes_queued_auto_delivery(self) -> None:
+        """Failure means queued Enter can overwrite a user who already took over.
+
+        resident-fact: settlement: manual PreInvocation clears a queued
+        delivery and owns the pane status for the new turn.
+        """
+        cid = "manual-takeover"
+        target = self.root / "osc-takeover"
+        exited = self.root / "deliver-exited"
+        (self.root / "sitecustomize.py").write_text(
+            "import atexit, pathlib, sys\n"
+            "if sys.argv[1:2] == ['deliver']:\n"
+            f"    atexit.register(pathlib.Path({str(exited)!r}).touch)\n",
+            encoding="utf-8",
+        )
+        with self.queued_auto_delivery(cid, extra_env={
+            "THE_PILOT_OSC_TARGET": target, "PYTHONPATH": self.root,
+        }):
+            result = self.pre(cid, "我自己接手", extra_env={"THE_PILOT_OSC_TARGET": target})
+            self.assertEqual(result.returncode, 0, result.stderr)
+        deadline = time.monotonic() + 4
+        while not exited.exists():
+            self.assertLess(time.monotonic(), deadline, "Detached delivery did not exit")
+            time.sleep(0.01)
+        state = wait_for_delivery(self.state, cid)
+        self.assertEqual(state["delivery_status"], "cleared")
+        self.assertEqual(state["consecutive_auto_turns"], 0)
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
+
+    def test_locked_handoff_cancels_if_transcript_changes_during_terminal_lookup(self) -> None:
+        """Failure means a mutation can slip into the handoff or an obsolete turn can send.
+
+        resident-fact: admission: the handoff owns both mutation locks and
+        checks transcript changes that arrive during terminal validation.
+        """
+        cid = "transcript-during-lookup"
+        target = self.root / "osc-lookup"
+        result = self.stop(cid, suggestion("继续推进"), wait_delivery=False, extra_env={
+            "FAKE_LIST_AWAIT_RELEASE": "1", "THE_PILOT_OSC_TARGET": target,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deadline = time.monotonic() + 3
+        while not (self.root / "deliver-list-started").exists():
+            self.assertLess(time.monotonic(), deadline, "Delivery did not resolve the terminal")
+            time.sleep(0.01)
+        try:
+            for lock_path in (
+                state_path(self.state, cid).with_suffix(".lock"),
+                (self.gemini / PROFILE_REL).parent / ".pilot.lock",
+            ):
+                with lock_path.open("r", encoding="utf-8") as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            write_transcript(self.root, f"transcript-{cid}.jsonl", [{"type": "CHECKPOINT"}], append=True)
+        finally:
+            (self.root / "release-deliver-list").touch()
+        self.assertEqual(wait_for_delivery(self.state, cid)["delivery_status"], "none")
+        self.assertEqual(send_calls(self.root), [])
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_DONE)
+
+    def test_pre_invocation_settles_pending_auto_delivery_while_orca_waits(self) -> None:
+        """Failure means receipt waiting blocks PreInvocation or freezes its next Stop.
+
+        resident-fact: settlement: matching PreInvocation settles the in-flight
+        delivery while preserving the consecutive auto-turn count.
+        """
+        cid = "during-send"
+        target = self.root / "osc-in-flight"
+        result = self.stop(cid, suggestion("继续推进"), wait_delivery=False, extra_env={
+            "FAKE_PROMPT_OBSERVATION": "supported",
+            "FAKE_SEND_TRANSCRIPT": self.root / f"transcript-{cid}.jsonl",
+            "FAKE_SEND_AWAIT_PRE": "1",
+            "THE_PILOT_OSC_TARGET": target,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deadline = time.monotonic() + 4
+        while not (self.root / "prompt-arrived").exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        try:
+            self.assertEqual(read_state(self.state, cid)["delivery_status"], "pending")
+            result = self.pre(cid, "继续推进", steps=[{"type": "CHECKPOINT"}],
+                              extra_env={"THE_PILOT_OSC_TARGET": target})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            state = read_state(self.state, cid)
+            self.assertEqual(state["delivery_status"], "none")
+            self.assertEqual(state["consecutive_auto_turns"], 1)
+            self.assertEqual(state["auto_submitted_text"], "")
+        finally:
+            (self.root / "pre-returned").touch()
+        log = self.state / "pilot.log"
+        while not log.is_file() or '"event": "auto_submitted"' not in log.read_text(encoding="utf-8"):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertEqual(read_state(self.state, cid)["delivery_status"], "none")
+        self.assertEqual(len(send_calls(self.root)), 1)
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
 
     def test_gate_pause_prefills_without_enter(self) -> None:
         self.stop("c-pause", suggestion("继续推进实施", gate="pause"))
@@ -3377,35 +3699,42 @@ class EngineTest(unittest.TestCase):
         self.assertIn("terminal_workspace_missing", log)
 
     def test_duplicate_stop_for_same_turn_submits_once(self) -> None:
-        transcript = write_transcript(
-            self.root,
-            "same-turn.jsonl",
-            [
-                {"type": "USER_INPUT", "content": "开始"},
-                {
-                    "type": "PLANNER_RESPONSE",
-                    "content": suggestion("继续推进", gate="auto"),
-                },
-            ],
-        )
-        body = payload(
-            "c-duplicate",
-            transcriptPath=str(transcript),
-            terminationReason="NO_TOOL_CALL",
-            fullyIdle=True,
-            workspacePaths=[str(self.workspace)],
-        )
-        first = run_engine(
-            self.root, self.gemini, self.state, "hook", "--event", "Stop", stdin=body
-        )
-        second = run_engine(
-            self.root, self.gemini, self.state, "hook", "--event", "Stop", stdin=body
-        )
-        self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(len(send_calls(self.root)), 1)
-        log = (self.state / "pilot.log").read_text(encoding="utf-8")
-        self.assertIn("stop_delivery_frozen", log)
+        """Failure means a repeated Stop can repeat the Enter for the same turn.
+
+        resident-fact: settlement: both accepted and rejected sends consume
+        the unique delivery attempt for their Stop turn.
+        """
+        for accepted in ("1", "0"):
+            with self.subTest(accepted=accepted):
+                cid = f"same-turn-{accepted}"
+                transcript = write_transcript(
+                    self.root,
+                    f"transcript-{cid}.jsonl",
+                    [
+                        {"type": "USER_INPUT", "content": "开始"},
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "content": suggestion("继续推进", gate="auto"),
+                        },
+                    ],
+                )
+                body = payload(
+                    cid,
+                    transcriptPath=str(transcript),
+                    terminationReason="NO_TOOL_CALL",
+                    fullyIdle=True,
+                    workspacePaths=[str(self.workspace)],
+                )
+                previous_sends = len(send_calls(self.root))
+                for _ in range(2):
+                    result = run_engine(
+                        self.root, self.gemini, self.state, "hook", "--event", "Stop",
+                        stdin=body, extra_env={"FAKE_SEND_ACCEPTED": accepted},
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(send_calls(self.root)), previous_sends + 1)
+                expected_status = "accepted" if accepted == "1" else "rejected"
+                self.assertEqual(read_state(self.state, cid)["delivery_status"], expected_status)
 
     def test_unknown_delivery_freezes_until_manual_input(self) -> None:
         self.stop(
@@ -4941,6 +5270,29 @@ class OscTargetResolutionTest(unittest.TestCase):
                 }
             )
         )
+
+
+    def test_reexecuted_hook_can_resolve_its_original_pane(self) -> None:
+        """Failure means a re-exec can lose the pane for detached status updates.
+
+        resident-fact: status: an authorized re-exec can cross its one Python
+        parent while retaining the agy ancestor requirement.
+        """
+        processes = {
+            5150: (5140, "ttys010", "/usr/bin/python3"),
+            5140: (5130, "ttys010", "/bin/sh"),
+            5130: (5120, "ttys010", "/bin/bash"),
+            5120: (5100, "ttys010", "/bin/zsh"),
+            5100: (5000, "ttys042", "/opt/homebrew/bin/agy"),
+        }
+        for reexec, expected in (("0", None), ("1", (Path("/dev/ttys042"), False))):
+            with self.subTest(reexec=reexec), self.isolated_env(
+                HOME=str(self.root), ORCA_PANE_KEY="pane-1", THE_PILOT_REEXEC=reexec,
+                ORCA_AUTOPILOT_REEXEC="0",
+            ), mock.patch.object(runtime.os, "getppid", return_value=5150), mock.patch.object(
+                runtime, "_ps_process", side_effect=processes.get
+            ):
+                self.assertEqual(runtime._resolve_osc_target(), expected)
 
 
 class GlobalGuidanceTest(unittest.TestCase):
