@@ -87,11 +87,19 @@ At the end of each Coordinator turn (child worker sessions stay silent), the age
 
 | Scene | When it triggers | Default gate | Deliverable | Exit quality bar |
 | --- | --- | --- | --- | --- |
-| `plan-and-orchestrate` | Root-cause diagnosis / initial review is complete, a detailed plan awaits review, or a reviewed plan / explicit code-review fix awaits implementation. | `auto` (Class A or confirmed Class B)<br>`pause` (unconfirmed Class B) | Advance one step at a time: detailed plan after diagnosis / initial review → plan-level review for the simplest architecture and finalization → Orca child-worktree orchestration; never skip or combine steps or jump straight from diagnosis to coding. Define the unique owner, boundaries, and contracts. | Covers the real root cause, call topology, and verification path without surface patches. |
-| `architecture-re-review` | Any code in the task scope was implemented or modified during the turn (even if already merged). | `auto` | Whole-task architecture review of all code touched in the task, with any issues listed. | Unique owner, boundaries, contracts, and uncovered risks are all resolved. |
+| `plan-and-orchestrate` | Diagnosis or initial review is complete, a detailed plan awaits review, or an approved design or fix awaits implementation. | `auto` (Class A or confirmed Class B)<br>`pause` (unconfirmed Class B) | Advance through detailed planning, plan-level architecture review, and Orca child-worktree implementation one step at a time. Derive the minimal domain model from the business goal, with a single owner, core entities and state machines, atomic writes, and direct read projections. | Extensions fit authoritative lifecycles or projections. Simplifications and repairs remove redundant tables, split state machines, and cross-table side effects at their source. |
+| `architecture-re-review` | Any task code changed during the turn, including changes already merged. | `auto` | Reread Anchor 0 (the initial review, original requirements, or initial design). Inventory the resulting module's schema, state machines, subpackage responsibilities, triggers, and read/write paths. Check each against the business goal as if designing from scratch. | Reject parallel state machines, sidecar tables, and cosmetic simplifications. Resolve ownership, boundaries, contracts, and uncovered risks before delivery. |
 | `deliver-and-verify` | Architecture and engineering quality issues are zero, and branch merge, `dev` deploy, or E2E verification remains. | `auto` (pauses before prod `/ship`) | Authorized branch integration, environment deployment, and targeted verification evidence. | Every delivery step has matching verification results and explicit remaining-risk notes. |
 | `closeout-and-sync` | Review and delivery verification are done; docs, ledgers, alerts/feedback, or Orca worktrees remain. | `auto` | Docs synced, authorized obligations closed, and child workers/worktrees released. | Repository state is clean on `origin/main` and no orphan workers or worktrees remain. |
 | `NONE` | Waiting on `ask_question` user input, or all code, delivery, and closeout steps are finished. | No prefill | Nothing left to run. | All obligations settled. |
+
+Workers may adapt file organization while preserving the reviewed domain model.
+Use Orca `ask`/`reply` for architecture disagreements. Reject dual tables or state
+machines, sidecars outside core entities, and Python wrappers or formatting that
+substitute for structural convergence. Move tests tied to obsolete process
+tables to domain entrypoints and authoritative entity state. On `worker_done`,
+the Coordinator reviews both the diff and the resulting module against the
+business goal and Anchor 0.
 
 3. **Structured trailing JSON tag (zero regex)**:
    - Visible `,1` and `,2` lines are written in normal Markdown for you to read (inline backticks, code blocks, and symbols are unrestricted).

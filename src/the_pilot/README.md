@@ -20,6 +20,31 @@ provenance and update metadata. Project discovery remains an installer operation
 `resolve_profile(base, project=overlay)` and `compile_bundle(profile, project=overlay)`.
 Only installer operations perform discovery. Inputs are copied, never mutated.
 
+### Architecture workflow
+
+`defaults.py` defines the universal pipeline contracts and required scene clauses.
+Planning derives the post-change minimal domain model from the business goal,
+including a single owner, core entities and state machines, atomic writes, and
+direct read projections. An extension belongs in the authoritative entity's
+lifecycle or read projection. A simplification or repair removes redundant
+tables, split state machines, and cross-table side effects at their source.
+
+`compiler.py` includes the required clauses in rendered scenes even when a
+project overlay replaces a scene body. It also renders the Orca handoff
+instructions. Workers may adapt file organization and must preserve the
+reviewed model.
+The Coordinator uses `ask`/`reply` to resolve architecture disagreements without
+accepting dual tracks, sidecar tables or state machines, or Python wrappers and
+formatting as substitutes for structural convergence. Tests tied to obsolete
+process tables must move to domain entrypoints and authoritative entity state.
+
+On `worker_done`, the Coordinator reviews the diff and the resulting module.
+The `architecture-re-review` scene requires rereading Anchor 0 (the initial
+review, original requirements, or design), inventorying the current schema,
+state machines, subpackage responsibilities, triggers, and read/write paths,
+then checking each against the business goal from first principles. Send
+structural gaps back for rework before delivery.
+
 ### Automatic updates
 
 `pilot self-update` serializes source updates, global skill symlink synchronization,

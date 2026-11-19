@@ -7,7 +7,25 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
-from .defaults import AGENT_LABELS, COORDINATOR_AGENTS, GEMINI_BEGIN, GEMINI_END, HARNESS_ORCHESTRATION_SENTENCE, HOOK_GROUP, LEGACY_GEMINI_BEGIN, LEGACY_GEMINI_END, LEGACY_HOOK_GROUP, LEGACY_SCENES_BEGIN, LEGACY_SCENES_END, ORCHESTRATION_BEGIN, ORCHESTRATION_END, SCENES_BEGIN, SCENES_END, UNMANAGED_SCENES_MARKERS_ERROR
+from .defaults import (
+    AGENT_LABELS,
+    COORDINATOR_AGENTS,
+    GEMINI_BEGIN,
+    GEMINI_END,
+    HARNESS_ORCHESTRATION_SENTENCE,
+    HOOK_GROUP,
+    LEGACY_GEMINI_BEGIN,
+    LEGACY_GEMINI_END,
+    LEGACY_HOOK_GROUP,
+    LEGACY_SCENES_BEGIN,
+    LEGACY_SCENES_END,
+    ORCHESTRATION_BEGIN,
+    ORCHESTRATION_END,
+    REQUIRED_SCENE_CLAUSES,
+    SCENES_BEGIN,
+    SCENES_END,
+    UNMANAGED_SCENES_MARKERS_ERROR,
+)
 from .project import ProfileError, project_specs
 from .profile import _copy_mapping, validate_profile
 
@@ -147,18 +165,21 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
     review_priority = " > ".join(AGENT_LABELS[item] for item in review_agents)
     return f"""{LEGACY_ORCHESTRATION_HEADING}{priority}）
 
-编排前执行 `orca skills get orchestration`，遵循 `~/.agents/skills/orchestration/SKILL.md` 及按需 references：
+编排前执行 `orca skills get orchestration`，遵循技能及按需 references。
 
-1. **职责分离（Tier-1 设计与 Review，Tier-2 实施）**：
-   - **Tier-1 主会话（Coordinator，提示词不含 Orca Task ID / Dispatch ID preamble）**：固定为原生 **{coordinator_label}**（`antigravity`；直接 `agy --dangerously-skip-permissions` 启动，账户池由 Orca 与 `agy-switch` 管理，禁止 `magpie agy` 包装；新建顶层工作区须先把路径登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`）；**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障/设计结合近期同链路历史与端到端拓扑，找最简根治方案，禁止表象补丁、黑白名单、局部重试/特判；除极简单改动外，实施交 Orca 子会话。
-   - **Tier-2 子会话（Dispatched Worker，提示词含 Orca live Task ID / Dispatch ID preamble）**：由 `orca orchestration worker-start` 以 `claude`/`codex` 启动，在分配分支修改、定向验证并提交，用 `worker_done` 汇报，不向下套娃；架构级分歧回传主会话。
-2. **Orca 编排（执行器优先级：{priority}）**：实施/并行任务**禁用内置 `invoke_subagent`** 及无监督裸终端移交；先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定受控 Run；{executor}。Task spec 自包含（Target、Contracts、Files、Boundaries、Ownership、Acceptance）并声明「分支开发、未经主会话 Review 通过不得合入或推送 `main`」。
-3. **工作区层级与跨仓回调（禁止平级工作区）**：同工作区用 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）；同仓子工作区用 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须显式 `--parent-worktree active` 或 `path:<当前路径>`），挂为**子工作区**；跨仓并需回传用 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，由 `worker_done` 唤醒主会话。仅用户明确要求独立长期 Tier-1 时才用 `--no-parent` 建顶层工作区（原生 {coordinator_label} 任主会话）；若需回执，绑定 Dealer thread 或 `orca orchestration send` 回调，**严禁无监督移交后失联**；否则**严禁 `--worktree new-top-level`/`--no-parent`** 建平行顶层工作区。
-4. **分支隔离**：子会话在独立功能分支修改、定向验证并提交；初版实施及打回阶段**严禁自行合入或推送 `main`**（Task spec 必须声明）；仅主会话 Code Review 判定「审查通过」后才可合入 `main` 并推送。
-5. **交互闭环与收尾**：
-   - 主会话用 `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 阻塞等待，用 `reply`/`send` 处理问答与指导，`--ack` 确认消费。
-   - `worker_done` 后必须亲自对分支结果做**彻底 Code Review**：先从整个架构判断是否有更简洁、更根本的修复方案，并对照工程质量规范（`peq.*`、唯一真源、无循环依赖、无函数内联导入、无行内抑制注释、边界职责、测试覆盖与门禁脚本）核查真实 diff。（独立架构审查优先级：**`{review_priority}`**。）
-   - 未达标用 `worker-show` 取已验证终端，建整改 Task 后 `worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回原终端；通过后用同终端 follow-up 通知合入 `main` 并推送。结算后 `worker-release`（**严禁 `orca terminal close` 替代**），用 `worker-list --terminal-state reclaimable` 确认无遗留终端并清理子工作区与已合入分支。"""
+1. **职责分离**：
+   - **Tier-1 主会话（Coordinator，无 Orca Task ID / Dispatch ID preamble）**：原生 **{coordinator_label}**（`antigravity`），直接 `agy --dangerously-skip-permissions`，账户池由 Orca 与 `agy-switch` 管理，禁用 `magpie agy`。顶层工作区先登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`。**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障查同链路历史与端到端拓扑，禁叠黑白名单、局部重试或特判。
+   - **Tier-2 子会话（Dispatched Worker，有 Orca live Task ID / Dispatch ID preamble）**：除极简单改动，实施交 Orca worker。独立分支修改、定向验证、提交并报 `worker_done`；禁止嵌套派工。
+2. **Orca 编排（执行器优先级：{priority}）**：禁用 `invoke_subagent` 和无监督裸终端。先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定 Run。{executor}。Task spec 自包含 Target、Contracts、Files、Boundaries、Ownership、Acceptance，载明业务目标、Anchor 0、最简模型及「未经主会话 Review 不得合入或推送 `main`」。
+3. **工作区层级与回调**：
+   - 同工作区 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）。
+   - 同仓子工作区 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须指定 `--parent-worktree active` 或 `path:<当前路径>`）。
+   - 跨仓回传 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，`worker_done` 唤醒主会话。
+   - 禁止平级 `--worktree new-top-level`/`--no-parent`。仅用户明确要求独立长期 Tier-1 可用 `--no-parent`（原生 {coordinator_label}），需回执则绑定 Dealer thread 或 `orca orchestration send`。
+4. **交互与验收**：
+   - `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 等回执，`reply`/`send` 裁决和指导，`--ack` 确认消费。
+   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。独立架构审查优先级：**`{review_priority}`**。
+   - 未达标用 `worker-show` 取已验证终端，建整改 Task，`worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回；通过后同终端 follow-up 通知合入并推送 `main`。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
 
 
 def render_orchestration_block(profile: dict[str, Any]) -> str:
@@ -450,6 +471,9 @@ def _render_scene_file(name: str, profile: dict[str, Any], *, project: dict[str,
         "{{DELIVER_FALLBACK_PROMPT}}", deliver["fallback"]
     )
     body = str(spec["body"])
+    required_clause = REQUIRED_SCENE_CLAUSES.get(name)
+    if required_clause and required_clause not in body:
+        body = f"{required_clause}\n\n{body}"
     body = body.replace("{{DELIVER_STRATEGY_BINDING}}", deliver["binding"])
     body = body.replace("{{DELIVER_GUIDANCE}}", deliver["guidance"])
     body = body.replace("{{DELIVER_ALTERNATIVES}}", deliver["alternatives"])

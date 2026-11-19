@@ -302,6 +302,9 @@ class CompilerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.enterContext(mock.patch.dict(
+            os.environ, {"THE_PILOT_GEMINI_DIR": self.temp.name}
+        ))
         self.base = load_default_profile()
 
     def test_presets_cover_the_three_supported_profiles(self) -> None:
@@ -478,26 +481,6 @@ class CompilerTest(unittest.TestCase):
         self.assertLess(len(bundle.gemini_block.encode("utf-8")), 20000)
         self.assertIn("- **,1（主推）**：", bundle.gemini_block)
         self.assertNotIn("\n- 主推：", bundle.gemini_block)
-        for preset in sorted(DEFAULT_SPECS["presets"]):
-            for strategy in DELIVER_STRATEGIES:
-                for feedback in (False, True):
-                    with self.subTest(
-                        preset=preset, strategy=strategy, feedback=feedback
-                    ):
-                        compiled = compile_bundle(
-                            resolve_profile(
-                                self.base,
-                                preset=preset,
-                                overrides={
-                                    "scenes": {
-                                        "deliver_strategy": strategy,
-                                        "enable_feedback_email": feedback,
-                                        "guardrails": ["必须补测试", "不得新增账本"],
-                                    }
-                                },
-                            )
-                        ).gemini_block
-                        self.assertLess(len(compiled.encode("utf-8")), 19600)
         self.assertEqual(len(bundle.scenes), 4)
         for scene in bundle.scenes.values():
             self.assertIn("auto_in_gate_mode: true", scene)
@@ -564,6 +547,17 @@ class CompilerTest(unittest.TestCase):
             'worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent claude --setup run --json',
             "worker-start --worktree path:<子工作区路径> --terminal <handle>",
             "worker_done",
+            "仅文件组织可调整",
+            "不得降低最简领域模型",
+            "orca orchestration ask",
+            "`reply` 不得默许",
+            "双表/双状态机",
+            "Python 封装或排版",
+            "旁路表或状态机",
+            "领域入口与核心实体真值",
+            "对照业务目标与 Anchor 0 蓝图",
+            "真实 diff 与改动后模块全貌",
+            "重读起点、盘点现状、零基对账",
         ):
             self.assertIn(required, section)
         for initial, target in (
@@ -721,26 +715,71 @@ class CompilerTest(unittest.TestCase):
         self.assertIn("定位 → 出详细方案 → 方案级架构 review → 编排实施", universal)
         self.assertIn("不得跳过方案设计或方案复审", universal)
         self.assertLess(len(bundle.gemini_block.encode("utf-8")), 20000)
-        for preset in sorted(DEFAULT_SPECS["presets"]):
-            for strategy in DELIVER_STRATEGIES:
-                for feedback in (False, True):
-                    with self.subTest(
-                        preset=preset, strategy=strategy, feedback=feedback
-                    ):
-                        compiled = compile_bundle(
-                            resolve_profile(
-                                self.base,
-                                preset=preset,
-                                overrides={
-                                    "scenes": {
-                                        "deliver_strategy": strategy,
-                                        "enable_feedback_email": feedback,
-                                        "guardrails": ["必须补测试", "不得新增账本"],
-                                    }
-                                },
+
+    def test_compiled_scenes_require_zero_based_design_and_whole_module_review(self) -> None:
+        # Failure means the agent can miss the domain model or skip whole-module
+        # reconciliation, including when a project supplies its own scene prose.
+        for project in (None, PROJECT):
+            with self.subTest(project=(project or {}).get("projectId")):
+                profile = resolve_user_profile(self.base, preset="recommended", project=project)
+                bundle = profile_compiler.compile_bundle(profile, project=project)
+                plan = bundle.scenes["01-plan-and-orchestrate.md"]
+                review = bundle.scenes["02-architecture-re-review.md"]
+                for clause in (
+                    "从业务目标零基推导改动后最简领域模型",
+                    "唯一 owner、核心实体与状态机",
+                    "写入原子收敛、读取直接投影",
+                    "权威实体生命周期或读投影",
+                    "不得新增平行状态机或旁路流程表",
+                    "消除冗余表、拆分状态机与跨表副作用",
+                ):
+                    self.assertIn(clause, plan)
+                    self.assertIn(clause, bundle.gemini_block)
+                steps = (
+                    "① 显式重读起点文档（Anchor 0",
+                    "② 盘点改动后受影响模块全貌（Whole-Module Reality",
+                    "③ 从业务目标做零基对账",
+                )
+                offsets = [review.index(step) for step in steps]
+                self.assertEqual(offsets, sorted(offsets))
+                for clause in (
+                    "最初审查报告、原始业务需求或初版架构设计",
+                    "严禁仅看子计划、指标表或凭记忆",
+                    "存活表/Schema、状态机、子包职责、触发器、读写主链",
+                    "严禁只看本轮 diff",
+                    "每张表、每个状态机和调用链是否最简",
+                    "扩展另起旁路表/平行状态机",
+                    "只合函数不合表",
+                    "压代码排版凑数",
+                    "判未达标并打回源头重构",
+                    "三步复审通过且架构与质量问题清零后才可进入交付（含 `,2`）",
+                ):
+                    self.assertIn(clause, review)
+                    self.assertIn(clause, bundle.gemini_block)
+                if project is not None:
+                    self.assertIn("Dev 反馈/线上报警等修复任务", review)
+
+    def test_compiled_byte_budget_across_presets_and_strategies(self) -> None:
+        # Failure means generated instructions exceed the reserved GEMINI.md
+        # budget once two guardrails and optional feedback guidance are present.
+        for project, limit in ((None, 18_200), (PROJECT, 19_600 - 1)):
+            for preset in DEFAULT_SPECS["presets"]:
+                for strategy in DELIVER_STRATEGIES:
+                    for feedback in (False, True):
+                        with self.subTest(
+                            project=(project or {}).get("projectId"), preset=preset,
+                            strategy=strategy, feedback=feedback,
+                        ):
+                            profile = resolve_user_profile(
+                                self.base, preset=preset, project=project,
+                                overrides={"scenes": {
+                                    "deliver_strategy": strategy,
+                                    "enable_feedback_email": feedback,
+                                    "guardrails": ["必须补测试", "不得新增账本"],
+                                }},
                             )
-                        ).gemini_block
-                        self.assertLess(len(compiled.encode("utf-8")), 19600)
+                            bundle = profile_compiler.compile_bundle(profile, project=project)
+                            self.assertLessEqual(len(bundle.gemini_block.encode("utf-8")), limit)
 
     def test_gemini_merge_is_non_destructive_and_idempotent(self) -> None:
         block = compile_bundle(
