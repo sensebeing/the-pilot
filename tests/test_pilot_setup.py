@@ -725,6 +725,9 @@ class CompilerTest(unittest.TestCase):
                 bundle = profile_compiler.compile_bundle(profile, project=project)
                 plan = bundle.scenes["01-plan-and-orchestrate.md"]
                 review = bundle.scenes["02-architecture-re-review.md"]
+                self.assertEqual(review.count("## 场景判断与构造说明"), 1)
+                self.assertEqual(review.count("复审范围与治本判断"), 1)
+                self.assertIn("1. **复审范围与治本判断**", review)
                 for clause in (
                     "从业务目标零基推导改动后最简领域模型",
                     "唯一 owner、核心实体与状态机",

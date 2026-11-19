@@ -22,17 +22,17 @@ Only installer operations perform discovery. Inputs are copied, never mutated.
 
 ### Architecture workflow
 
-`defaults.py` defines the universal pipeline contracts and required scene clauses.
+`defaults.py` defines the universal pipeline contracts and scene templates.
 Planning derives the post-change minimal domain model from the business goal,
 including a single owner, core entities and state machines, atomic writes, and
 direct read projections. An extension belongs in the authoritative entity's
 lifecycle or read projection. A simplification or repair removes redundant
 tables, split state machines, and cross-table side effects at their source.
 
-`compiler.py` includes the required clauses in rendered scenes even when a
-project overlay replaces a scene body. It also renders the Orca handoff
-instructions. Workers may adapt file organization and must preserve the
-reviewed model.
+`compiler.py` renders each effective scene body after overlay composition.
+A project can customize the scene description and inherit the default body.
+The compiler also renders the Orca handoff instructions. Workers may adapt
+file organization and must preserve the reviewed model.
 The Coordinator uses `ask`/`reply` to resolve architecture disagreements without
 accepting dual tracks, sidecar tables or state machines, or Python wrappers and
 formatting as substitutes for structural convergence. Tests tied to obsolete

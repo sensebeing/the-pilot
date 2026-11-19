@@ -21,7 +21,6 @@ from .defaults import (
     LEGACY_SCENES_END,
     ORCHESTRATION_BEGIN,
     ORCHESTRATION_END,
-    REQUIRED_SCENE_CLAUSES,
     SCENES_BEGIN,
     SCENES_END,
     UNMANAGED_SCENES_MARKERS_ERROR,
@@ -471,9 +470,6 @@ def _render_scene_file(name: str, profile: dict[str, Any], *, project: dict[str,
         "{{DELIVER_FALLBACK_PROMPT}}", deliver["fallback"]
     )
     body = str(spec["body"])
-    required_clause = REQUIRED_SCENE_CLAUSES.get(name)
-    if required_clause and required_clause not in body:
-        body = f"{required_clause}\n\n{body}"
     body = body.replace("{{DELIVER_STRATEGY_BINDING}}", deliver["binding"])
     body = body.replace("{{DELIVER_GUIDANCE}}", deliver["guidance"])
     body = body.replace("{{DELIVER_ALTERNATIVES}}", deliver["alternatives"])
