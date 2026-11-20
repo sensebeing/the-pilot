@@ -372,8 +372,6 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     for guidance_path, guidance_text in global_guidance:
         atomic_write_user_file(guidance_path, guidance_text)
     for path, text in shell_env:
-        if text is None:
-            continue
         if path.name == ZSH_ENV_SUBPATH.name and not path.exists() and not path.is_symlink():
             atomic_write_text(path, text, mode=0o600)
         else:
@@ -458,13 +456,14 @@ def _shell_env_change(path: Path, transform: Callable[[str], str]) -> tuple[str,
         raise SetupError(f"{path.name} 托管块异常：{exc}") from exc
 
 
-def _merged_shell_env(gemini_dir: Path) -> list[tuple[Path, str | None]]:
-    plans: list[tuple[Path, str | None]] = []
+def _merged_shell_env(gemini_dir: Path) -> list[tuple[Path, str]]:
+    plans: list[tuple[Path, str]] = []
     for path in _shell_env_paths(gemini_dir):
         change = _shell_env_change(path, profile_compiler.merge_shell_env)
         if change is not None:
             existing, merged = change
-            plans.append((path, merged if merged != existing else None))
+            if merged != existing:
+                plans.append((path, merged))
     return plans
 
 
@@ -479,16 +478,22 @@ def _stripped_shell_env(gemini_dir: Path) -> list[tuple[Path, str]]:
     return plans
 
 
-def _shell_env_drift(gemini_dir: Path) -> list[str]:
+def _shell_env_drift(gemini_dir: Path, *, installed: bool) -> list[str]:
+    if installed:
+        transform = profile_compiler.merge_shell_env
+        finding = "托管块缺失或已漂移"
+    else:
+        transform = profile_compiler.strip_shell_env
+        finding = "仍包含托管块"
     drift: list[str] = []
     for path in _shell_env_paths(gemini_dir):
         try:
-            change = _shell_env_change(path, profile_compiler.merge_shell_env)
+            change = _shell_env_change(path, transform)
         except SetupError as exc:
             drift.append(str(exc))
         else:
             if change is not None and change[0] != change[1]:
-                drift.append(f"{path.name} 托管块缺失或已漂移")
+                drift.append(f"{path.name} {finding}")
     return drift
 
 
@@ -658,7 +663,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         "gemini_md": str(gemini_md),
         "drift": [],
     }
-    report["drift"].extend(_shell_env_drift(gemini_dir))
+    report["drift"].extend(_shell_env_drift(gemini_dir, installed=profile is not None))
     legacy_dir = gemini_dir / LEGACY_AUTOPILOT_SUBDIR
     if any((legacy_dir / name).exists() for name in LEGACY_MANAGED_FILES):
         report["drift"].append(

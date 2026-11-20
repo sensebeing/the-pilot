@@ -5193,9 +5193,13 @@ class GlobalGuidanceTest(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_default_install_creates_private_zshenv_and_uninstall_empties_it(self) -> None:
-        """A fresh default home needs the export, and uninstall must retain the dotfile."""
+        """The default install owns the export from apply until uninstall strips it."""
         zshenv = self.home / ".zshenv"
         self.assertFalse(zshenv.exists())
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["drift"], ["profile.json 缺失"])
+
         report = self.default_apply("--preset", "recommended")
         self.assertEqual(report["shell_env"], [str(zshenv.resolve())])
         self.assertEqual(zshenv.read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
@@ -5212,8 +5216,12 @@ class GlobalGuidanceTest(unittest.TestCase):
         self.assertEqual(zshenv.read_bytes(), b"")
         self.assertEqual(stat.S_IMODE(zshenv.stat().st_mode), 0o600)
 
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["drift"], ["profile.json 缺失"])
+
     def test_existing_profile_is_updated_without_creating_bash_startup_files(self) -> None:
-        """Creating a bash login file would shadow a user's existing .profile."""
+        """Apply updates existing shell files and reports only the ones it changed."""
         self.home.mkdir()
         profile = self.home / ".profile"
         original = b"export USER_SETTING=1\r\n"
@@ -5226,10 +5234,29 @@ class GlobalGuidanceTest(unittest.TestCase):
         self.assertIn(SHELL_ENV_BLOCK.encode(), profile.read_bytes())
         for name in (".bash_profile", ".bashrc"):
             self.assertFalse((self.home / name).exists())
+        self.assertEqual(self.default_apply()["shell_env"], [])
 
         result = run_setup_default(self.root, "uninstall")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(profile.read_bytes(), original)
+
+    def test_status_reports_residual_shell_blocks_without_profile(self) -> None:
+        """A missing profile must leave residual shell blocks and invalid markers visible."""
+        self.home.mkdir()
+        bashrc = self.home / ".bashrc"
+        bashrc.touch()
+        self.default_apply("--preset", "recommended")
+        (self.gemini / PROFILE_REL).unlink()
+        (self.home / ".profile").write_text(SHELL_ENV_BLOCK.splitlines()[0] + "\n", encoding="utf-8")
+
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        drift = json.loads(result.stdout)["drift"]
+        self.assertIn("profile.json 缺失", drift)
+        for name in (".zshenv", ".bashrc"):
+            self.assertIn(f"{name} 仍包含托管块", drift)
+            self.assertEqual((self.home / name).read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
+        self.assertTrue(any(item.startswith(".profile 托管块异常：") for item in drift), drift)
 
     def test_shell_env_writes_preserve_symlinks_and_target_modes(self) -> None:
         """Apply and uninstall must preserve the symlinks and private modes of dotfiles."""
