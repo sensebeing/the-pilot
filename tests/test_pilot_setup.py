@@ -43,6 +43,11 @@ PROJECT = json.loads(PROJECT_PATH.read_text(encoding="utf-8"))
 resolve_profile = partial(resolve_user_profile, project=PROJECT)
 compile_bundle = partial(profile_compiler.compile_bundle, project=PROJECT)
 ENGINE_REL = Path("config/the-pilot/runtime.py")
+SHELL_ENV_BLOCK = (
+    '# BEGIN THE_PILOT_SHELL_ENV\n'
+    'export AGY_CLI_OSC7501="${AGY_CLI_OSC7501:-off}"\n'
+    '# END THE_PILOT_SHELL_ENV\n'
+)
 SCENES_REL = Path("config/the-pilot/scenes")
 GEMINI_REL = Path("config/GEMINI.md")
 HOOKS_REL = Path("config/hooks.json")
@@ -333,6 +338,47 @@ class CompilerTest(unittest.TestCase):
             os.environ, {"THE_PILOT_GEMINI_DIR": self.temp.name}
         ))
         self.base = load_default_profile()
+
+    def test_render_and_merge_default_block(self) -> None:
+        """The managed export must preserve explicit values and stay idempotent."""
+        self.assertEqual(profile_compiler.render_shell_env_block(), SHELL_ENV_BLOCK)
+        original = "# user shell settings\nalias ls='ls -h'\n"
+        merged = profile_compiler.merge_shell_env(original)
+        self.assertEqual(merged, original + "\n" + SHELL_ENV_BLOCK)
+        self.assertEqual(profile_compiler.merge_shell_env(merged), merged)
+
+        suffix = "export USER_SETTING=1\n\n"
+        stale = SHELL_ENV_BLOCK.replace(":-off", ":-on")
+        self.assertEqual(
+            profile_compiler.merge_shell_env(original + stale + suffix),
+            original + SHELL_ENV_BLOCK + suffix,
+        )
+        self.assertEqual(profile_compiler.merge_shell_env(merged, stale), original + "\n" + stale)
+
+    def test_strip_preserves_user_content_and_tidies_seam(self) -> None:
+        """Uninstall must remove only the block and excess blank lines at its seam."""
+        before = "# user shell settings\r\nexport BEFORE=1\r\n"
+        after = "export AFTER=1\r\n\r\n"
+        strip = profile_compiler.strip_shell_env
+        self.assertEqual(strip(SHELL_ENV_BLOCK), "")
+        self.assertEqual(strip(before + "\r\n" + SHELL_ENV_BLOCK), before)
+        self.assertEqual(
+            strip(before + "\r\n\r\n" + SHELL_ENV_BLOCK + "\r\n" + after),
+            before + "\r\n" + after,
+        )
+        self.assertEqual(strip(after), after)
+
+    def test_malformed_markers_fail_closed(self) -> None:
+        """An ambiguous marker range must never cause user shell text to be removed."""
+        begin, _, end = SHELL_ENV_BLOCK.splitlines(keepends=True)
+        for malformed in (
+            begin, end, end + begin, begin + SHELL_ENV_BLOCK, SHELL_ENV_BLOCK * 2,
+            "echo " + SHELL_ENV_BLOCK, SHELL_ENV_BLOCK.rstrip("\n") + " user comment\n",
+        ):
+            with self.subTest(malformed=malformed):
+                for transform in (profile_compiler.merge_shell_env, profile_compiler.strip_shell_env):
+                    with self.assertRaises(ValueError):
+                        transform(malformed)
 
     def test_presets_cover_the_three_supported_profiles(self) -> None:
         self.assertEqual(
@@ -5119,7 +5165,7 @@ class OscTargetResolutionTest(unittest.TestCase):
 
 
 class GlobalGuidanceTest(unittest.TestCase):
-    """Default-install ownership of Claude Code and Codex global guidance."""
+    """Default-install ownership of user guidance and shell startup blocks."""
 
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
@@ -5145,6 +5191,197 @@ class GlobalGuidanceTest(unittest.TestCase):
         result = run_setup_default(self.root, "apply", *args)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_default_install_creates_private_zshenv_and_uninstall_empties_it(self) -> None:
+        """A fresh default home needs the export, and uninstall must retain the dotfile."""
+        zshenv = self.home / ".zshenv"
+        self.assertFalse(zshenv.exists())
+        report = self.default_apply("--preset", "recommended")
+        self.assertEqual(report["shell_env"], [str(zshenv.resolve())])
+        self.assertEqual(zshenv.read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
+        self.assertEqual(stat.S_IMODE(zshenv.stat().st_mode), 0o600)
+
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["drift"], [])
+
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(".zshenv:managed-block", json.loads(result.stdout)["removed"])
+        self.assertTrue(zshenv.is_file())
+        self.assertEqual(zshenv.read_bytes(), b"")
+        self.assertEqual(stat.S_IMODE(zshenv.stat().st_mode), 0o600)
+
+    def test_existing_profile_is_updated_without_creating_bash_startup_files(self) -> None:
+        """Creating a bash login file would shadow a user's existing .profile."""
+        self.home.mkdir()
+        profile = self.home / ".profile"
+        original = b"export USER_SETTING=1\r\n"
+        profile.write_bytes(original)
+        report = self.default_apply("--preset", "recommended")
+        self.assertEqual(report["shell_env"], [
+            str((self.home / ".zshenv").resolve()), str(profile.resolve()),
+        ])
+        self.assertTrue(profile.read_bytes().startswith(original))
+        self.assertIn(SHELL_ENV_BLOCK.encode(), profile.read_bytes())
+        for name in (".bash_profile", ".bashrc"):
+            self.assertFalse((self.home / name).exists())
+
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(profile.read_bytes(), original)
+
+    def test_shell_env_writes_preserve_symlinks_and_target_modes(self) -> None:
+        """Apply and uninstall must preserve the symlinks and private modes of dotfiles."""
+        self.home.mkdir()
+        files = {}
+        for name in (".zshenv", ".bashrc"):
+            path = self.home / name
+            target = self.home / f"{name}.target"
+            target.touch(mode=0o600)
+            path.symlink_to(target.name)
+            files[path] = target
+
+        self.default_apply("--preset", "recommended")
+        for path, target in files.items():
+            self.assertEqual(path.readlink(), Path(target.name))
+            self.assertEqual(target.read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+        result = run_setup_default(self.root, "uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path, target in files.items():
+            self.assertEqual(path.readlink(), Path(target.name))
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_bytes(), b"")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_broken_shell_env_targets_reject_apply_and_surface_in_status(self) -> None:
+        """An invalid target must be reported even when no profile could be installed."""
+        self.home.mkdir()
+        for name in (".zshenv", ".bashrc"):
+            for kind in ("dangling", "directory"):
+                with self.subTest(name=name, kind=kind):
+                    path = self.home / name
+                    if kind == "dangling":
+                        path.symlink_to("missing-target")
+                    else:
+                        path.mkdir()
+                    result = run_setup_default(self.root, "apply")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"{name} 托管块异常", result.stderr)
+                    for artifact in (PROFILE_REL, CONFIG_REL, GEMINI_REL, HOOKS_REL):
+                        self.assertFalse((self.gemini / artifact).exists())
+                    if name != ".zshenv":
+                        self.assertFalse((self.home / ".zshenv").exists())
+
+                    result = run_setup_default(self.root, "status")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    drift = json.loads(result.stdout)["drift"]
+                    self.assertTrue(any(item.startswith(f"{name} 托管块异常：") for item in drift), drift)
+                    if kind == "dangling":
+                        self.assertEqual(path.readlink(), Path("missing-target"))
+                        path.unlink()
+                    else:
+                        path.rmdir()
+
+    def test_uninstall_preflights_every_shell_file_before_writing(self) -> None:
+        """An invalid or malformed shell file must leave all installed artifacts in place."""
+        self.default_apply("--preset", "recommended")
+        zshenv = self.home / ".zshenv"
+        bashrc = self.home / ".bashrc"
+        artifacts = (PROFILE_REL, CONFIG_REL, GEMINI_REL, HOOKS_REL)
+        paths = [zshenv, *(self.gemini / rel for rel in artifacts)]
+        before = {path: path.read_bytes() for path in paths}
+        for kind in ("dangling", "malformed"):
+            with self.subTest(kind=kind):
+                if kind == "dangling":
+                    bashrc.symlink_to("missing-target")
+                else:
+                    bashrc.write_text(SHELL_ENV_BLOCK.splitlines()[0] + "\n", encoding="utf-8")
+                commands = ("uninstall", "apply") if kind == "malformed" else ("uninstall",)
+                for command in commands:
+                    result = run_setup_default(self.root, command)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(".bashrc 托管块异常", result.stderr)
+                    for path, original in before.items():
+                        self.assertEqual(path.read_bytes(), original)
+                result = run_setup_default(self.root, "status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                drift = json.loads(result.stdout)["drift"]
+                self.assertTrue(any(item.startswith(".bashrc 托管块异常：") for item in drift), drift)
+                bashrc.unlink()
+
+    def test_shell_env_drift_is_repaired_by_upgrade_and_self_update(self) -> None:
+        """Drift must be visible and repairable from the existing upgrade and update paths."""
+        self.default_apply("--preset", "recommended")
+        zshenv = self.home / ".zshenv"
+        zshenv.write_text(SHELL_ENV_BLOCK.replace(":-off", ":-on"), encoding="utf-8")
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(".zshenv 托管块缺失或已漂移", json.loads(result.stdout)["drift"])
+        self.default_apply("--upgrade")
+        self.assertEqual(zshenv.read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
+
+        zshenv.unlink()
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(".zshenv 托管块缺失或已漂移", json.loads(result.stdout)["drift"])
+        checkout = self.make_checkout()
+        skill_root = self.root / "skill-root"
+        skill_root.mkdir()
+        (skill_root / ".zshenv").symlink_to("missing-target")
+        result = run_setup_default(
+            self.root, "self-update", "--local-only", "--checkout-dir", str(checkout),
+            "--home-dir", str(skill_root),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(zshenv.read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
+        self.assertEqual((skill_root / ".zshenv").readlink(), Path("missing-target"))
+        self.assertFalse((skill_root / "missing-target").exists())
+        result = run_setup_default(self.root, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["drift"], [])
+
+    def test_shell_env_is_untouched_by_redirected_installations(self) -> None:
+        """Both Gemini-root overrides and the skill-only home must leave shell files alone."""
+        homes = (self.home, self.root / "skill-root", self.root / "sandbox")
+        for home in homes:
+            home.mkdir()
+            (home / ".zshenv").symlink_to("missing-target")
+            (home / ".bashrc").write_text(SHELL_ENV_BLOCK, encoding="utf-8")
+
+        skill_root, sandbox = homes[1:]
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                env = base_env(self.root)
+                root_args = []
+                if explicit:
+                    root_args = ["--gemini-dir", str(sandbox)]
+                else:
+                    env["THE_PILOT_GEMINI_DIR"] = str(sandbox)
+                for command, options in (
+                    ("apply", []),
+                    ("status", []),
+                    ("self-update", ["--local-only", "--home-dir", str(skill_root)]),
+                    ("uninstall", []),
+                ):
+                    result = subprocess.run(
+                        [sys.executable, str(SETUP_SCRIPT), command, *options, *root_args, "--no-project", "--json"],
+                        capture_output=True, text=True, env=env, timeout=60,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(result.stdout)
+                    if command == "apply":
+                        self.assertEqual(report["shell_env"], [])
+                    elif command == "status":
+                        self.assertEqual(report["drift"], [])
+                    elif command == "uninstall":
+                        self.assertNotIn(".bashrc:managed-block", report["removed"])
+                for home in homes:
+                    self.assertEqual((home / ".zshenv").readlink(), Path("missing-target"))
+                    self.assertFalse((home / "missing-target").exists())
+                    self.assertEqual((home / ".bashrc").read_text(encoding="utf-8"), SHELL_ENV_BLOCK)
 
     def test_default_install_syncs_and_uninstalls_managed_blocks(self) -> None:
         # Failure means a default install leaves stale global guidance behind,

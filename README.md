@@ -176,6 +176,11 @@ pilot status --json
 
 If your repository has a `.pilot/project.json` overlay, pass `--project /path/to/repo` during `pilot apply`.
 
+For the default `$HOME/.gemini` installation, `pilot apply` and upgrades manage
+`AGY_CLI_OSC7501` in `~/.zshenv` and any existing `~/.bash_profile`,
+`~/.bashrc`, and `~/.profile`. This disables Antigravity CLI's built-in OSC
+7501 status emitter by default in new shells and respects an explicit override.
+
 ---
 
 ## Presets and four-dimension customization
@@ -246,10 +251,10 @@ Check update status anytime via `pilot status --json` (`auto_update` field) or t
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | Read-only discovery of installed profile, project overlay, and available agent CLIs (`codex`, `claude`, `agy`). |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | Read-only distillation of recent local agent chat logs (`antigravity`, `claude`, `codex`, `cursor`) into recurring prompt patterns and pipeline health diagnostics. |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, and the `the-pilot` Hook group. Installed preferences are preserved unless `--preset` or `--profile` is given. |
+| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, the `the-pilot` Hook group, and the default-home shell block. Installed preferences are preserved unless `--preset` or `--profile` is given. |
 | `pilot self-update [--project-only] [--workspace <path>] --json` | Pull clean `main`, refresh CLI and global skill symlinks, and run `pilot apply --upgrade` under an exclusive file lock. |
-| `pilot status [--project <repo>] --json` | Verify installation health, active mode, worker priority, `auto_update` status, and byte-level artifact drift (`drift: []`). |
-| `pilot uninstall --json` | Remove managed files, `GEMINI.md` managed block, and Hook entries while preserving unrelated user config. |
+| `pilot status [--project <repo>] --json` | Verify installation health, active mode, worker priority, `auto_update` status, and artifact drift, including the default-home shell block. |
+| `pilot uninstall --json` | Remove managed files, `GEMINI.md` and shell blocks, and Hook entries while preserving unrelated user config and shell startup files. |
 | `pilot mode [status\|gate\|confirm\|off]` | Inspect or switch Turn Pilot mode (`gate`, `confirm`, `off`). |
 | `pilot worker [status\|codex\|claude\|cc]` | Inspect or persist worker priority (`codex > claude` vs. `claude > codex`) and schedule next-turn hot reload. |
 | `pilot sync` | Re-sync the `GEMINI.md` scene block after editing installed `scenes/*.md` files. |

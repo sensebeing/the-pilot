@@ -44,10 +44,13 @@ To register the skills globally across coding agents, run
    of enabled shortcuts, modes, worker selection, sync and recovery.
 
 `apply` preserves other Hook groups, unmanaged GEMINI.md prose and custom scenes.
+On the default Gemini root, it adds the `AGY_CLI_OSC7501` block to `~/.zshenv`
+and existing bash or POSIX shell startup files. `pilot status` reports block drift.
 `pilot uninstall` removes owned files, including the installed project link.
+It strips the shell block while retaining the startup files.
 Tests and demonstrations must pass explicit temporary `--gemini-dir` and
 `--home-dir` paths and set `THE_PILOT_GEMINI_DIR` for runtime operations.
 
 ## Automatic updates
 
-After setup, `pilot self-update` can refresh a clean main checkout, synchronize skill links, and recompile the installed runtime while preserving user preferences. Use `pilot status --json` to inspect its last result.
+After setup, `pilot self-update` can refresh a clean main checkout, synchronize skill links, and run `apply --upgrade` to refresh managed artifacts while preserving user preferences. Use `pilot status --json` to inspect its last result.

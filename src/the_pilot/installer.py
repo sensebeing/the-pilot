@@ -15,7 +15,7 @@ import hashlib
 import importlib
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -48,6 +48,8 @@ from .defaults import (
 GEMINI_MD_SUBPATH = Path("config") / "GEMINI.md"
 HOOKS_SUBPATH = Path("config") / "hooks.json"
 GLOBAL_GUIDANCE_SUBPATHS = (Path(".claude") / "CLAUDE.md", Path(".codex") / "AGENTS.md")
+ZSH_ENV_SUBPATH = Path(".zshenv")
+SHELL_ENV_SUBPATHS = (ZSH_ENV_SUBPATH, Path(".bash_profile"), Path(".bashrc"), Path(".profile"))
 SCENES_SUBDIR = "scenes"
 LOG_NAME = "pilot.log"
 LEGACY_LOG_NAME = "autopilot.log"
@@ -346,6 +348,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     merged_gemini = profile_compiler.merge_gemini_md(current_gemini, bundle.gemini_block)
     merged_hooks = profile_compiler.merge_hooks_json(hooks, str(engine_path))
     global_guidance = _merged_global_guidance(bundle.profile_json, gemini_dir)
+    shell_env = _merged_shell_env(gemini_dir)
     stale_scenes = [
         name
         for name in BUILTIN_SCENE_FILES
@@ -368,6 +371,13 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         atomic_write_text(hooks_path, json_text(merged_hooks))
     for guidance_path, guidance_text in global_guidance:
         atomic_write_user_file(guidance_path, guidance_text)
+    for path, text in shell_env:
+        if text is None:
+            continue
+        if path.name == ZSH_ENV_SUBPATH.name and not path.exists() and not path.is_symlink():
+            atomic_write_text(path, text, mode=0o600)
+        else:
+            atomic_write_user_file(path, text)
     for name in stale_scenes:
         (scenes_dir / name).unlink()
 
@@ -389,6 +399,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         "gemini_md": str(gemini_md),
         "hooks": str(hooks_path),
         "global_guidance": [str(path) for path, _ in global_guidance],
+        "shell_env": [str(path) for path, _ in shell_env],
         "preserved": [],
         "warnings": missing_cli_warnings(bundle.profile_json),
     }
@@ -410,19 +421,75 @@ def _installed_path(gemini_dir: Path, name: str) -> Path:
 def default_install_home(gemini_dir: Path) -> Path | None:
     """Return the home dir of the resolved default install, else ``None``.
 
-    Only the install rooted at ``$HOME/.gemini`` owns the agent products'
-    global guidance. The decision is made from the resolved install root and
+    Only the install rooted at ``$HOME/.gemini`` owns global guidance and the
+    managed shell block. The decision is made from the resolved install root and
     the resolved user home, so every entry point (apply, status, uninstall,
     self-update, auto-upgrade, runtime ``,worker``) classifies the same
     installation identically. A redirected root such as ``--gemini-dir
-    /tmp/sandbox`` does not own the real ``~/.claude`` or ``~/.codex`` guidance
-    files. An explicit ``self-update --home-dir`` authorizes tool and skill
-    maintenance for that home while leaving guidance ownership tied to Gemini.
+    /tmp/sandbox`` does not own global guidance or shell startup files.
+    An explicit ``self-update --home-dir`` authorizes tool and skill
+    maintenance for that home while leaving managed-block ownership tied to Gemini.
     """
     home = Path.home().resolve()
     if gemini_dir.resolve() != (home / ".gemini").resolve():
         return None
     return home
+
+
+def _shell_env_paths(gemini_dir: Path) -> tuple[Path, ...]:
+    home = default_install_home(gemini_dir)
+    return tuple(home / subpath for subpath in SHELL_ENV_SUBPATHS) if home is not None else ()
+
+
+def _shell_env_change(path: Path, transform: Callable[[str], str]) -> tuple[str, str] | None:
+    """Read a startup file and plan the change, or skip a missing optional file."""
+    try:
+        if path.is_file():
+            with path.open(encoding="utf-8", newline="") as handle:
+                existing = handle.read()
+        elif path.is_symlink() or path.exists():
+            raise ValueError("必须是普通文件或指向普通文件的符号链接")
+        elif path.name == ZSH_ENV_SUBPATH.name:
+            existing = ""
+        else:
+            return None
+        return existing, transform(existing)
+    except (OSError, ValueError) as exc:
+        raise SetupError(f"{path.name} 托管块异常：{exc}") from exc
+
+
+def _merged_shell_env(gemini_dir: Path) -> list[tuple[Path, str | None]]:
+    plans: list[tuple[Path, str | None]] = []
+    for path in _shell_env_paths(gemini_dir):
+        change = _shell_env_change(path, profile_compiler.merge_shell_env)
+        if change is not None:
+            existing, merged = change
+            plans.append((path, merged if merged != existing else None))
+    return plans
+
+
+def _stripped_shell_env(gemini_dir: Path) -> list[tuple[Path, str]]:
+    plans: list[tuple[Path, str]] = []
+    for path in _shell_env_paths(gemini_dir):
+        change = _shell_env_change(path, profile_compiler.strip_shell_env)
+        if change is not None:
+            existing, stripped = change
+            if stripped != existing:
+                plans.append((path, stripped))
+    return plans
+
+
+def _shell_env_drift(gemini_dir: Path) -> list[str]:
+    drift: list[str] = []
+    for path in _shell_env_paths(gemini_dir):
+        try:
+            change = _shell_env_change(path, profile_compiler.merge_shell_env)
+        except SetupError as exc:
+            drift.append(str(exc))
+        else:
+            if change is not None and change[0] != change[1]:
+                drift.append(f"{path.name} 托管块缺失或已漂移")
+    return drift
 
 
 def _merged_global_guidance(
@@ -591,6 +658,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         "gemini_md": str(gemini_md),
         "drift": [],
     }
+    report["drift"].extend(_shell_env_drift(gemini_dir))
     legacy_dir = gemini_dir / LEGACY_AUTOPILOT_SUBDIR
     if any((legacy_dir / name).exists() for name in LEGACY_MANAGED_FILES):
         report["drift"].append(
@@ -1333,6 +1401,7 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     )
     removed: list[str] = []
     global_guidance, global_labels = _stripped_global_guidance(gemini_dir)
+    shell_env = _stripped_shell_env(gemini_dir)
     hooks = read_json_object(hooks_path, "hooks.json")
     if hooks is not None and (HOOK_GROUP in hooks or LEGACY_HOOK_GROUP in hooks):
         for group in (HOOK_GROUP, LEGACY_HOOK_GROUP):
@@ -1352,6 +1421,9 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     for guidance_path, guidance_text in global_guidance:
         atomic_write_user_file(guidance_path, guidance_text)
     removed.extend(global_labels)
+    for path, text in shell_env:
+        atomic_write_user_file(path, text)
+        removed.append(f"{path.name}:managed-block")
 
     for path, label in (
         (engine_path, ENGINE_NAME),
