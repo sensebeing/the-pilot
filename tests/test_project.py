@@ -20,7 +20,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from the_pilot import __version__
-from the_pilot.compiler import compile_bundle, merge_hooks_json
+from the_pilot.compiler import compile_bundle, merge_hooks_json, split_frontmatter
 from the_pilot.defaults import DEFAULT_SPECS, PIPELINE_STAGE_CONTRACTS, SCENE_ORDER, SCENES_BEGIN
 from the_pilot.distill import distill_chat_history
 from the_pilot.profile import resolve_profile
@@ -213,6 +213,28 @@ class ProjectTest(unittest.TestCase):
         self.assertIn("冻结审定蓝图与预算", contracts["plan-and-orchestrate"]["simplicity_rule"])
         self.assertIn("搬列合表", contracts["architecture-re-review"]["simplicity_rule"])
         self.assertIn("孤儿行、延迟外键、历史枚举/版本值", contracts["deliver-and-verify"]["quality_bar"])
+
+    def test_plan_description_overlay_inherits_review_protocol(self):
+        """Failure means a trigger-only overlay loses the installed review gate or reset protocol."""
+        description = "Project planning trigger"
+        overlay = self.root / "project.json"
+        overlay.write_text(json.dumps({
+            "schema": "the-pilot-project/v1",
+            "projectId": "planning",
+            "scene_specs": {"plan-and-orchestrate": {"description": description}},
+        }), encoding="utf-8")
+        scene = self.gemini / "config/the-pilot/scenes/01-plan-and-orchestrate.md"
+
+        self.cli("apply", "--no-project")
+        _, default_body = split_frontmatter(scene.read_text(encoding="utf-8"))
+        self.cli("apply", "--project", str(overlay))
+        meta, body = split_frontmatter(scene.read_text(encoding="utf-8"))
+
+        self.assertEqual(meta["description"], description)
+        self.assertEqual(body, default_body)
+        review = body.split("**进度 ②", 1)[1].split("**进度 ③", 1)[0]
+        self.assertIn("NO-GO (OVERDESIGN)", review)
+        self.assertIn("`worker-release`", review)
 
     def test_upgrade_promotes_colliding_custom_entry_and_enables_new_recommended(self):
         """Upgrade owns promotion of project entries while direct profiles stay strict."""
