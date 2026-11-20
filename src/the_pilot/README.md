@@ -24,15 +24,26 @@ Only installer operations perform discovery. Inputs are copied, never mutated.
 
 `defaults.py` defines the universal pipeline contracts and scene templates.
 Planning derives the post-change minimal domain model from the business goal,
-including a single owner, core entities and state machines, atomic writes, and
-direct read projections. An extension belongs in the authoritative entity's
-lifecycle or read projection. A simplification or repair removes redundant
-tables, split state machines, and cross-table side effects at their source.
+including a single owner, authoritative entities and their relationships, one
+state machine per lifecycle, target control loops and lanes, atomic writes, and
+direct read projections. Before finalizing table mergers, retirements, or
+lifecycle changes, inspect the actual schema and migration constraints
+read-only. Check primary and unique key granularity, foreign key `ON DELETE`
+behavior, and independent erasure or billing lifecycles. An extension
+belongs in the authoritative entity's lifecycle or read projection. A
+simplification or repair removes redundant tables, split state machines, and
+cross-table side effects at their source. Moving a child table wholesale into
+prefixed parent columns and a secondary status column or trimming only
+peripheral tables leaves the core complexity intact.
 
 `compiler.py` renders each effective scene body after overlay composition.
 A project can customize the scene description and inherit the default body.
 The compiler also renders the Orca handoff instructions. Workers may adapt
-file organization and must preserve the reviewed model.
+file organization and must preserve the reviewed model. Approval freezes the
+blueprint and budgets for the Coordinator and Workers. A new physical
+constraint requires the Coordinator to obtain explicit user approval through
+`ask_question` before changing the blueprint, relaxing a target, removing a
+planned retirement, or deferring in-scope work.
 The Coordinator uses `ask`/`reply` to resolve architecture disagreements without
 accepting dual tracks, sidecar tables or state machines, or Python wrappers and
 formatting as substitutes for structural convergence. Tests tied to obsolete
@@ -42,8 +53,17 @@ On `worker_done`, the Coordinator reviews the diff and the resulting module.
 The `architecture-re-review` scene requires rereading Anchor 0 (the initial
 review, original requirements, or design), inventorying the current schema,
 state machines, subpackage responsibilities, triggers, and read/write paths,
-then checking each against the business goal from first principles. Send
+then checking each against the business goal from first principles. Compare
+the implementation and budget changes against the approved blueprint, Anchor 0
+and the `main` baseline to catch unauthorized changes. Reject table-count
+reductions that widen parent tables or add secondary status columns while AST
+statements, state enums, control loops, and lanes fail to shrink. Send
 structural gaps back for rework before delivery.
+
+Before merging or rolling out migrations that backfill data, tighten
+constraints, or drop tables or columns, run a read-only check for orphan rows,
+deferred foreign keys, and historical enum or version values in the target
+environment. Record the unverified scope when that environment is inaccessible.
 
 ### Automatic updates
 
