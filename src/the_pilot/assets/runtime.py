@@ -1421,7 +1421,7 @@ def _clear_delivery_request(state: dict[str, Any]) -> None:
 
 def _clear_delivery_confirmation(state: dict[str, Any]) -> None:
     _clear_delivery_request(state)
-    state.update(last_confirmed_request_id="", unconfirmed_request_id="")
+    state.update(last_confirmed_request_id="", unconfirmed_request_id="", rejected_reason="")
 
 
 def clear_suggestion(state: dict[str, Any]) -> None:
@@ -1522,10 +1522,11 @@ def resolve_terminal(workspace_path: str, explicit_handle: str = "") -> str:
 
 
 def _terminal_incarnation_matches(handle: str, expected_incarnation: str) -> bool:
+    if not expected_incarnation:
+        return False
     for terminal in _connected_antigravity_terminals():
         if terminal.get("handle") == handle:
-            incarnation = str(terminal.get("incarnationId") or "")
-            return not (expected_incarnation and incarnation) or incarnation == expected_incarnation
+            return terminal.get("incarnationId") == expected_incarnation
     return False
 
 
@@ -2068,11 +2069,14 @@ def _has_unasked_question_lead_in(planner_step: dict[str, Any]) -> bool:
     return last_line.endswith(("：", ":"))
 
 
-def _osc_frame_for_delivery_status(status: str) -> str:
+def _osc_frame_for_delivery_status(state: dict[str, Any]) -> str:
     """Keep mail out of the composer until delivery is settled."""
+    status = str(state.get("delivery_status") or "")
     if status == "accepted":
         return ""
     if status in {"pending", "unknown", "prefilled", "prefill_unknown"}:
+        return OSC_7501_WAITING_QUESTION
+    if status == "rejected" and state.get("rejected_reason") == "permission":
         return OSC_7501_WAITING_QUESTION
     return OSC_7501_DONE
 
@@ -2311,7 +2315,7 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             )
             return (
                 {"decision": "allow"},
-                _osc_frame_for_delivery_status(status),
+                _osc_frame_for_delivery_status(state),
             )
         _clear_delivery_confirmation(state)
 
@@ -2456,7 +2460,6 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             state.update(gate_action=gate, last_settled_turn_id=turn_id, auto_submitted_text="")
         if auto_submit:
             details = {}
-            frame = None
             if outcome == "accepted":
                 prompt = receipt.get("prompt")
                 prompt = prompt if isinstance(prompt, dict) else {}
@@ -2464,14 +2467,14 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 if observation in ("permission", "incarnation_replaced"):
                     outcome = "rejected"
                     details["reason"] = observation
-                    if observation == "permission":
-                        frame = OSC_7501_WAITING_QUESTION
                 else:
                     return {"decision": "allow"}, _settle_accepted_auto_submit(
                         conversation_id, state, prompt, transcript_path=transcript_path, handle=handle,
                     )
             if outcome == "rejected":
                 _rollback_auto_submit(state, previous_count, previous_text)
+                if details.get("reason") == "permission":
+                    state["rejected_reason"] = "permission"
             state["delivery_status"] = outcome
             event = {
                 "none": "auto_submit_no_terminal",
@@ -2479,7 +2482,6 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 "unknown": "auto_submit_unknown",
             }[outcome]
         else:
-            frame = None
             if handle and outcome != "accepted":
                 log_event("prefill_not_accepted", cid=conversation_id, scene=scene)
             state["delivery_status"] = {
@@ -2494,7 +2496,7 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         log_event(event, cid=conversation_id, scene=scene, **details)
         return (
             {"decision": "allow"},
-            frame if frame is not None else _osc_frame_for_delivery_status(state["delivery_status"]),
+            _osc_frame_for_delivery_status(state),
         )
 
 

@@ -1932,6 +1932,28 @@ class EngineTest(unittest.TestCase):
                         self.assertEqual(event["request_id"], "R1")
         self.assertEqual(len(send_calls(self.root)), len(cases))
 
+    def test_repeated_permission_stop_keeps_waiting_until_new_input(self) -> None:
+        """Failure means a duplicate Stop can release orchestration mail into an open permission prompt."""
+        cid = "confirm-permission-duplicate"
+        env = self.confirmation_env(cid)
+        receipt = json.loads(env["FAKE_SEND_PROMPT"])
+        env["FAKE_SEND_PROMPT"] = json.dumps(dict(receipt, observation="permission"))
+        steps = [
+            {"type": "USER_INPUT", "content": "开始"},
+            {"type": "PLANNER_RESPONSE", "content": suggestion("继续推进")},
+        ]
+        for _ in range(2):
+            self.assertEqual(self.stop_decision(cid, steps, extra_env=env), {"decision": "allow"})
+
+        target = env["THE_PILOT_OSC_TARGET"]
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WAITING_QUESTION * 2)
+        self.assertEqual(len(send_calls(self.root)), 1)
+        state = read_state(self.state, cid)
+        self.assertEqual(state["delivery_status"], "rejected")
+        self.assertEqual(state["rejected_reason"], "permission")
+        self.assertEqual(self.pre(cid, "换个任务", extra_env=env).returncode, 0)
+        self.assertFalse(read_state(self.state, cid).get("rejected_reason"))
+
     def test_confirm_delivery_recognizes_the_new_turn_without_another_send(self) -> None:
         """Failure means either local signal can leave a real turn unverified, emit a stale waiting frame, or replay Enter."""
         prompt = "继续推进"
@@ -2041,17 +2063,24 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(env["THE_PILOT_OSC_TARGET"].read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
         self.assertEqual(self.delivery_event(cid, "auto_submit_superseded")["request_id"], "R1")
 
-    def test_unconfirmed_receipt_does_not_emit_to_a_replaced_terminal(self) -> None:
-        """Failure means a delayed frame can mark a new process blocked even though the old request still needs reconciliation."""
-        cid = "confirm-replaced-incarnation"
-        env = self.confirmation_env(cid)
-        command = self.deferred_confirmation(cid, "继续推进", env)
-        self.confirm_delivery(command, dict(env, FAKE_TERMINAL_INCARNATION="agy-2"))
-        state = read_state(self.state, cid)
-        self.assertEqual(state["delivery_status"], "unknown")
-        self.assertEqual(state["unconfirmed_request_id"], "R1")
-        self.assertFalse(env["THE_PILOT_OSC_TARGET"].exists())
-        self.assertEqual(len(send_calls(self.root)), 1)
+    def test_unconfirmed_receipt_requires_proof_of_the_original_incarnation(self) -> None:
+        """Failure means a delayed frame can mark a different or unverified process blocked while settlement needs reconciliation."""
+        for cid, expected, actual in (
+            ("confirm-replaced-incarnation", "agy-1", "agy-2"),
+            ("confirm-missing-receipt-incarnation", "", "agy-1"),
+            ("confirm-missing-live-incarnation", "agy-1", ""),
+        ):
+            with self.subTest(case=cid):
+                env = self.confirmation_env(cid)
+                receipt = json.loads(env["FAKE_SEND_PROMPT"])
+                env["FAKE_SEND_PROMPT"] = json.dumps(dict(receipt, processIncarnation=expected))
+                command = self.deferred_confirmation(cid, "继续推进", env)
+                self.confirm_delivery(command, dict(env, FAKE_TERMINAL_INCARNATION=actual))
+                state = read_state(self.state, cid)
+                self.assertEqual(state["delivery_status"], "unknown")
+                self.assertEqual(state["unconfirmed_request_id"], "R1")
+                self.assertFalse(env["THE_PILOT_OSC_TARGET"].exists())
+        self.assertEqual(len(send_calls(self.root)), 3)
 
     def test_late_matching_pre_invocation_recovers_receipted_delivery(self) -> None:
         """Failure means a late start of the original send freezes subsequent Stop hooks or repeats that send."""
