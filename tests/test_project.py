@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from the_pilot import __version__
 from the_pilot.compiler import compile_bundle, merge_hooks_json
-from the_pilot.defaults import DEFAULT_SPECS, PIPELINE_STAGE_CONTRACTS, SCENE_ORDER
+from the_pilot.defaults import DEFAULT_SPECS, PIPELINE_STAGE_CONTRACTS, SCENE_ORDER, SCENES_BEGIN
 from the_pilot.distill import distill_chat_history
 from the_pilot.profile import resolve_profile
 from the_pilot.project import ProfileError, normalize_project
@@ -149,6 +149,70 @@ class ProjectTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         self.cli("uninstall")
         self.assertFalse(self.cli("status")["installed"])
+
+    def test_universal_architecture_contracts_survive_install_and_distill(self):
+        """Failure means a built-in workflow loses evidence, scope or rollout protections."""
+        self.cli("apply", "--no-project")
+        gemini_path = self.gemini / "config/GEMINI.md"
+        gemini = gemini_path.read_text(encoding="utf-8")
+        scenes = self.gemini / "config/the-pilot/scenes"
+        required_clauses = {
+            gemini_path: (
+                "父表前缀列与次级状态列",
+                "严禁主/子会话擅自改写已审定蓝图",
+                "主会话调 `ask_question` 获用户确认",
+            ),
+            scenes / "01-plan-and-orchestrate.md": (
+                "定稿前只读预检",
+                "主键与唯一键粒度",
+                "`ON DELETE`",
+                "独立擦除或计费生命周期",
+                "权威实体关系、唯一生命周期状态机与目标控制循环/泳道",
+                "父表前缀列与次级状态列",
+                "只剪外围附表",
+                "冻结蓝图与预算",
+                "删减退场项",
+                "延后范围内事项",
+                "主会话调 `ask_question` 获用户确认",
+            ),
+            scenes / "02-architecture-re-review.md": (
+                "对照 Anchor 0、已审定蓝图与 `main`",
+                "未经授权的蓝图改写或预算放宽",
+                "父表列数或次级状态列增加",
+                "AST 语句、状态枚举、控制循环与泳道未收敛",
+            ),
+            scenes / "03-deliver-and-verify.md": (
+                "回填、收紧约束或删表删列",
+                "合入或发布前",
+                "只读核查目标环境",
+                "孤儿行、延迟外键、历史枚举/版本值",
+            ),
+        }
+        for document, clauses in required_clauses.items():
+            if document == gemini_path:
+                rendered = gemini.partition(SCENES_BEGIN)[0]
+            else:
+                rendered = document.read_text(encoding="utf-8")
+            for clause in clauses:
+                with self.subTest(document=document.name, clause=clause):
+                    self.assertTrue(clause in rendered, f"Missing workflow clause in {document.name}")
+                    self.assertTrue(clause in gemini, "Missing workflow clause in GEMINI.md")
+            with self.subTest(document=document.name):
+                self.assertNotIn("。。", rendered)
+                self.assertNotIn("{{", rendered)
+
+        assessment = self.cli("distill", "--home-dir", str(self.root / "home"))["pipeline_assessment"]
+        installed = assessment["installed_pipeline"]
+        self.assertEqual(installed["profile_status"], "ok")
+        self.assertEqual(installed["scenes_status"], "ok")
+        self.assertEqual(installed["missing_stages"], [])
+        self.assertEqual(installed["incomplete_scene_contracts"], [])
+        self.assertEqual(installed["redundant_guardrails"], [])
+        contracts = assessment["stage_contracts"]
+        self.assertIn("只读核对实际 Schema", contracts["plan-and-orchestrate"]["quality_bar"])
+        self.assertIn("冻结审定蓝图与预算", contracts["plan-and-orchestrate"]["simplicity_rule"])
+        self.assertIn("搬列合表", contracts["architecture-re-review"]["simplicity_rule"])
+        self.assertIn("孤儿行、延迟外键、历史枚举/版本值", contracts["deliver-and-verify"]["quality_bar"])
 
     def test_upgrade_promotes_colliding_custom_entry_and_enables_new_recommended(self):
         """Upgrade owns promotion of project entries while direct profiles stay strict."""
