@@ -23,6 +23,8 @@ from .defaults import (
     ORCHESTRATION_END,
     SCENES_BEGIN,
     SCENES_END,
+    SHELL_ENV_BEGIN,
+    SHELL_ENV_END,
     UNMANAGED_SCENES_MARKERS_ERROR,
 )
 from .project import ProfileError, project_specs
@@ -186,6 +188,69 @@ def render_orchestration_block(profile: dict[str, Any]) -> str:
     return "\n\n".join(
         (ORCHESTRATION_BEGIN, render_orchestration_section(profile), ORCHESTRATION_END)
     ) + "\n"
+
+
+def render_shell_env_block() -> str:
+    """Disable AGY's built-in OSC 7501 emitter by default."""
+    return (
+        f"{SHELL_ENV_BEGIN}\n"
+        'export AGY_CLI_OSC7501="${AGY_CLI_OSC7501:-off}"\n'
+        f"{SHELL_ENV_END}\n"
+    )
+
+
+def merge_shell_env(existing: str, block: str | None = None) -> str:
+    """Replace the managed block or append it after the user's shell text."""
+    bounds = _shell_env_block_bounds(existing)
+    rendered = render_shell_env_block() if block is None else block
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    if bounds is not None:
+        start, end = bounds
+        return existing[:start] + rendered + existing[end:]
+    if not existing or existing.endswith(("\n\n", "\n\r\n")):
+        return existing + rendered
+    if existing.endswith("\n"):
+        newline = "\r\n" if existing.endswith("\r\n") else "\n"
+        return existing + newline + rendered
+    return existing + "\n\n" + rendered
+
+
+def strip_shell_env(existing: str) -> str:
+    """Remove the managed block and trim blank lines only at the seam."""
+    bounds = _shell_env_block_bounds(existing)
+    if bounds is None:
+        return existing
+    start, end = bounds
+    left = existing[:start].rstrip("\r\n")
+    right = existing[end:].lstrip("\r\n")
+    if not left:
+        return right
+    newline = "\r\n" if existing.startswith("\r\n", len(left)) else "\n"
+    return left + (newline * 2 + right if right else newline)
+
+
+def _shell_env_block_bounds(text: str) -> tuple[int, int] | None:
+    """Locate the two complete marker lines, including the closing newline."""
+    begins = _find_all_positions(text, SHELL_ENV_BEGIN)
+    ends = _find_all_positions(text, SHELL_ENV_END)
+    if not begins and not ends:
+        return None
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        raise ValueError("THE_PILOT_SHELL_ENV 托管标记必须恰好各出现一次且顺序正确")
+    start = begins[0]
+    end = ends[0] + len(SHELL_ENV_END)
+    for offset, marker in ((start, SHELL_ENV_BEGIN), (ends[0], SHELL_ENV_END)):
+        after = offset + len(marker)
+        if (offset and text[offset - 1] != "\n") or (
+            after < len(text) and not text.startswith(("\n", "\r\n"), after)
+        ):
+            raise ValueError("THE_PILOT_SHELL_ENV 托管标记必须独占一行")
+    if text.startswith("\r\n", end):
+        end += 2
+    elif text.startswith("\n", end):
+        end += 1
+    return start, end
 
 
 def merge_orchestration_md(existing: str, block: str) -> str:

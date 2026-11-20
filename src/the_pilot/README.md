@@ -73,6 +73,14 @@ The CLI can use a newer clean `~/the-pilot` main checkout immediately. Persisted
 `installed_sha` and `installed_tree_digest` keep the uv tool bundle aligned with
 the checkout, including after an external pull or a missing launcher.
 
+For the default Gemini root, the compiler renders the managed
+`AGY_CLI_OSC7501` block and the installer owns startup file selection.
+`apply` (including `self-update`'s upgrade) manages `~/.zshenv` and any
+existing `~/.bash_profile`, `~/.bashrc`, or `~/.profile`. `status` reports
+shell block drift, and `uninstall` strips the block while retaining each file,
+its permissions, and any symlink. A skill root supplied to
+`self-update --home-dir` leaves shell ownership tied to the default Gemini root.
+
 The PreInvocation and eligible Stop hooks request a local project sync before
 evaluating the turn. This sync can repair drifted installed artifacts even when
 the runtime matches the checkout. If the engine changes, the hook runs the

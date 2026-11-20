@@ -173,6 +173,10 @@ pilot status --json
 
 如果当前仓库包含 `<repo>/.pilot/project.json` 项目扩展配置，可在 `pilot apply` 时加上 `--project /path/to/repo`。
 
+使用默认的 `$HOME/.gemini` 安装时，`pilot apply` 和升级会在 `~/.zshenv` 及已存在的
+`~/.bash_profile`、`~/.bashrc`、`~/.profile` 中托管 `AGY_CLI_OSC7501`。
+新启动的 Shell 默认关闭 Antigravity CLI 内置的 OSC 7501 状态上报，并保留显式设置。
+
 ---
 
 ## 三档预设与四维定制矩阵
@@ -243,10 +247,10 @@ pilot apply --no-project --json    # 解除项目扩展绑定；个人偏好保�
 | --- | --- |
 | `pilot probe [--project <repo> \| --no-project] --json` | 只读探测已安装的个人偏好、项目扩展与本机可用的 Agent CLI（`codex`、`claude`、`agy`）。 |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | 只读扫描最近 N 天多 Agent 聊天记录（`antigravity`、`claude`、`codex`、`cursor`），提炼重复输入模式与流水线健康度诊断。 |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块与 `the-pilot` Hook 组；除非显式传入 `--preset` 或 `--profile`，否则保留已安装的个人偏好。 |
+| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块、`the-pilot` Hook 组及默认 Home 的 Shell 托管块。仅在显式传入 `--preset` 或 `--profile` 时替换已安装的个人偏好。 |
 | `pilot self-update [--project-only] [--workspace <path>] --json` | 在文件排他锁下安全快进 `main`、刷新 CLI 与全局技能软链，并执行 `pilot apply --upgrade`。 |
-| `pilot status [--project <repo>] --json` | 检查安装完整性、当前模式、执行器优先级、`auto_update` 状态与字节级产物漂移（`drift: []`）。 |
-| `pilot uninstall --json` | 移除托管文件、`GEMINI.md` 托管块与 Hook 条目，保留用户其他配置。 |
+| `pilot status [--project <repo>] --json` | 检查安装完整性、当前模式、执行器优先级、`auto_update` 状态与产物漂移，包括默认 Home 的 Shell 托管块。 |
+| `pilot uninstall --json` | 移除托管文件、`GEMINI.md` 与 Shell 托管块及 Hook 条目，保留其他用户配置和 Shell 启动文件。 |
 | `pilot mode [status\|gate\|confirm\|off]` | 查看或切换 Turn Pilot 模式（`gate`、`confirm`、`off`）。 |
 | `pilot worker [status\|codex\|claude\|cc]` | 查看或持久化子会话执行器优先级（`codex > claude` 或 `claude > codex`），并在下一轮热加载。 |
 | `pilot sync` | 手工编辑已安装的 `scenes/*.md` 后，将其同步刷新到 `GEMINI.md` 场景段。 |
