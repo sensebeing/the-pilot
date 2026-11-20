@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from functools import partial
 from unittest import mock
@@ -93,6 +94,7 @@ if args[:2] == ["terminal", "list"]:
             "connected": True,
             "writable": True,
             "worktreePath": worktree,
+            "incarnationId": os.environ.get("FAKE_TERMINAL_INCARNATION", "agy-1"),
         }
         for index in range(count)
     ]
@@ -113,6 +115,8 @@ elif args[:2] == ["terminal", "send"]:
         print("not-json")
     else:
         receipt = {"accepted": os.environ.get("FAKE_SEND_ACCEPTED", "1") != "0"}
+        if "FAKE_SEND_PROMPT" in os.environ:
+            receipt["prompt"] = json.loads(os.environ["FAKE_SEND_PROMPT"])
         print(json.dumps({"ok": True, "result": {"send": receipt}}, ensure_ascii=False))
 else:
     print(json.dumps({"ok": False}))
@@ -1833,6 +1837,265 @@ class EngineTest(unittest.TestCase):
         send, = send_calls(self.root)
         self.assertIn("--enter", send)
         self.assertNotIn("--wait-submit", send)
+
+    def confirmation_env(self, cid: str, request_id: str = "R1") -> dict:
+        return {
+            "FAKE_SEND_PROMPT": json.dumps({
+                "observation": "supported",
+                "requestId": request_id,
+                "processIncarnation": "agy-1",
+                "stages": ["input_accepted"],
+            }),
+            "THE_PILOT_CONFIRM_TIMEOUT_MS": "20",
+            "THE_PILOT_STOP_EXIT_TIMEOUT_MS": "20",
+            "THE_PILOT_OSC_TARGET": self.root / f"osc-{cid}",
+        }
+
+    def deferred_confirmation(
+        self, cid: str, prompt: str, env: dict, *,
+        spawn_fails: bool = False, transcript: Path | None = None,
+    ) -> list[str]:
+        """Control the child launch so hooks can be ordered without timing guesses."""
+        transcript = transcript or self.root / f"transcript-{cid}.jsonl"
+        steps = [] if transcript.exists() else [{"type": "USER_INPUT", "content": "开始"}]
+        steps.append({"type": "PLANNER_RESPONSE", "content": suggestion(prompt)})
+        write_transcript(self.root, str(transcript.relative_to(self.root)), steps, append=True)
+        command = []
+        real_popen = subprocess.Popen
+
+        def defer_child(argv, **options):
+            if argv[2:3] == ["confirm-delivery"]:
+                command.extend(argv[2:])
+                if spawn_fails:
+                    raise OSError("cannot launch confirm-delivery")
+                return None
+            return real_popen(argv, **options)
+
+        pilot_dir = self.gemini / "config/the-pilot"
+        with mock.patch.dict(os.environ, engine_env(self.root, self.gemini, self.state, env), clear=True), (
+            mock.patch.multiple(
+                runtime, GEMINI_DIR=self.gemini, PILOT_DIR=pilot_dir,
+                PROFILE_PATH=self.gemini / PROFILE_REL, SCENES_DIR=self.gemini / SCENES_REL,
+                STATE_DIR=self.state, LOG_PATH=self.state / "pilot.log",
+            )
+        ), mock.patch.object(subprocess, "Popen", side_effect=defer_child):
+            result, frame = runtime._evaluate_stop({
+                "conversationId": cid, "transcriptPath": str(transcript),
+                "terminationReason": "NO_TOOL_CALL", "fullyIdle": True,
+                "workspacePaths": [str(self.workspace)],
+            })
+            runtime.emit_osc_7501(frame)
+        self.assertEqual(result, {"decision": "allow"})
+        self.assertEqual(command[:1], ["confirm-delivery"], "Stop did not launch confirmation")
+        return command
+
+    def confirm_delivery(self, command: list[str], env: dict) -> None:
+        command = command.copy()
+        # This PID exceeds the host kernel's PID range, representing an exited Stop.
+        command[command.index("--parent-pid") + 1] = str(2 ** 30)
+        result = run_engine(self.root, self.gemini, self.state, *command, extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def delivery_event(self, cid: str, name: str) -> dict:
+        log = (self.state / "pilot.log").read_text(encoding="utf-8")
+        events = [json.loads(line) for line in log.splitlines()]
+        event, = [item for item in events if item.get("cid") == cid and item["event"] == name]
+        return event
+
+    def test_stop_classifies_prompt_receipts_before_deciding_to_confirm(self) -> None:
+        """Failure means a definitive receipt can claim the wrong status, retain a rejected turn, or start a redundant confirmation."""
+        cases = (
+            ("permission", ["input_accepted"], "rejected", runtime.OSC_7501_WAITING_QUESTION, None),
+            ("incarnation_replaced", ["input_accepted"], "rejected", runtime.OSC_7501_DONE, None),
+            ("unsupported", [], "accepted", "", False),
+            ("supported", ["input_accepted", "turn_started"], "accepted", "", True),
+        )
+        for observation, stages, status, frame, verified in cases:
+            with self.subTest(observation=observation):
+                env = self.confirmation_env(observation)
+                receipt = json.loads(env["FAKE_SEND_PROMPT"])
+                env["FAKE_SEND_PROMPT"] = json.dumps(dict(receipt, observation=observation, stages=stages))
+                result = self.stop(observation, suggestion("继续推进"), extra_env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = read_state(self.state, observation)
+                target = env["THE_PILOT_OSC_TARGET"]
+                self.assertEqual(state["delivery_status"], status)
+                self.assertFalse(state.get("delivery_request_id"))
+                self.assertEqual(target.read_text(encoding="utf-8") if target.exists() else "", frame)
+                if status == "rejected":
+                    self.assertEqual(state["consecutive_auto_turns"], 0)
+                    self.assertEqual(self.delivery_event(observation, "auto_submit_rejected")["reason"], observation)
+                else:
+                    event = self.delivery_event(observation, "auto_submitted")
+                    self.assertIs(event.get("verified"), verified)
+                    if verified:
+                        self.assertEqual(event["request_id"], "R1")
+        self.assertEqual(len(send_calls(self.root)), len(cases))
+
+    def test_confirm_delivery_recognizes_the_new_turn_without_another_send(self) -> None:
+        """Failure means either local signal can leave a real turn unverified, emit a stale waiting frame, or replay Enter."""
+        prompt = "继续推进"
+        for signal in ("hook", "transcript"):
+            with self.subTest(signal=signal):
+                env = self.confirmation_env(signal)
+                command = self.deferred_confirmation(signal, prompt, env)
+                handoff = read_state(self.state, signal)
+                self.assertEqual(handoff["delivery_status"], "accepted")
+                self.assertEqual(handoff["delivery_request_id"], "R1")
+                self.assertGreater(handoff["delivery_deadline_at"], handoff["updated_at"])
+                self.assertEqual(self.delivery_event(signal, "auto_submit_accepted")["request_id"], "R1")
+                if signal == "hook":
+                    self.assertEqual(self.pre(signal, prompt, extra_env=env).returncode, 0)
+                else:
+                    write_transcript(self.root, f"transcript-{signal}.jsonl", [
+                        {"type": "USER_INPUT", "content": f"<USER_REQUEST>{prompt}</USER_REQUEST>"},
+                    ], append=True)
+                before = calls(self.root)
+                self.confirm_delivery(command, env)
+                self.assertEqual(calls(self.root), before)
+                state = read_state(self.state, signal)
+                self.assertEqual(state["delivery_status"], "none" if signal == "hook" else "accepted")
+                for field in ("delivery_request_id", "last_confirmed_request_id", "delivery_deadline_at"):
+                    self.assertFalse(state[field])
+                event = self.delivery_event(signal, "auto_submitted")
+                self.assertEqual(event["request_id"], "R1")
+                self.assertIs(event["verified"], True)
+                target = env["THE_PILOT_OSC_TARGET"]
+                if signal == "hook":
+                    self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
+                else:
+                    self.assertFalse(target.exists())
+        self.assertEqual(len(send_calls(self.root)), 2)
+
+    def test_confirm_delivery_times_out_after_the_real_stop_exits(self) -> None:
+        """Failure means the detached child cannot settle a live Stop handoff or releases mail after an unverified Enter."""
+        cid = "confirm-timeout"
+        env = self.confirmation_env(cid)
+        result = self.stop(cid, suggestion("继续推进"), extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"decision": "allow"})
+        target = env["THE_PILOT_OSC_TARGET"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if target.exists() and target.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.01)
+        self.assertTrue(target.exists(), "Confirmation did not emit a waiting frame")
+        self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WAITING_QUESTION)
+        state = read_state(self.state, cid)
+        self.assertEqual(state["delivery_status"], "unknown")
+        self.assertEqual(state["unconfirmed_request_id"], "R1")
+        self.assertEqual(state["delivery_request_id"], "")
+        self.assertEqual(state["delivery_deadline_at"], 0.0)
+        self.assertEqual(self.delivery_event(cid, "auto_submit_unconfirmed")["reason"], "turn_start_timeout")
+        self.assertEqual([call[:2] for call in calls(self.root)], [
+            ["terminal", "list"], ["terminal", "send"], ["terminal", "list"],
+        ])
+
+    def test_confirmation_uses_only_the_primary_transcript(self) -> None:
+        """Failure means changes to hydrated content can masquerade as a new turn even though the primary transcript never advanced."""
+        cid = "confirm-truncated-input"
+        compact = write_transcript(self.root, "transcript.jsonl", [
+            {"type": "USER_INPUT", "content": "开始", "truncated_fields": ["content"]},
+        ])
+        write_transcript(self.root, "transcript_full.jsonl", [
+            {"type": "USER_INPUT", "content": "开始执行长任务"},
+        ])
+        env = self.confirmation_env(cid)
+        command = self.deferred_confirmation(cid, "继续推进", env, transcript=compact)
+        write_transcript(self.root, "transcript_full.jsonl", [
+            {"type": "USER_INPUT", "content": "完整转录被替换"},
+        ])
+        self.confirm_delivery(command, env)
+        self.assertEqual(read_state(self.state, cid)["delivery_status"], "unknown")
+        self.assertEqual(self.delivery_event(cid, "auto_submit_unconfirmed")["reason"], "turn_start_timeout")
+        self.assertEqual(len(send_calls(self.root)), 1)
+
+    def test_manual_candidate_input_supersedes_confirmation(self) -> None:
+        """Failure means an old confirmation can change a manually claimed turn or overwrite its working status."""
+        cid = "confirm-manual"
+        env = self.confirmation_env(cid)
+        command = self.deferred_confirmation(cid, "继续推进", env)
+        self.assertIn("继续推进", self.injection(self.pre(cid, ",1", extra_env=env)))
+        state = read_state(self.state, cid)
+        before = calls(self.root)
+        self.confirm_delivery(command, env)
+        self.assertEqual(calls(self.root), before)
+        self.assertEqual(read_state(self.state, cid), state)
+        self.assertEqual(env["THE_PILOT_OSC_TARGET"].read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
+        self.assertEqual(self.delivery_event(cid, "auto_submit_superseded")["request_id"], "R1")
+
+    def test_old_confirmation_cannot_settle_a_new_receipted_stop(self) -> None:
+        """Failure means R1 can mutate the session or emit status after a new turn has handed off R2."""
+        cid = "confirm-new-stop"
+        env = self.confirmation_env(cid)
+        first = self.deferred_confirmation(cid, "继续推进", env)
+        self.assertEqual(self.pre(cid, "继续推进", extra_env=env).returncode, 0)
+        self.deferred_confirmation(cid, "再继续", self.confirmation_env(cid, "R2"))
+        state = read_state(self.state, cid)
+        self.assertEqual(state["delivery_request_id"], "R2")
+        before = calls(self.root)
+        self.confirm_delivery(first, env)
+        self.assertEqual(calls(self.root), before)
+        self.assertEqual(read_state(self.state, cid), state)
+        self.assertEqual(env["THE_PILOT_OSC_TARGET"].read_text(encoding="utf-8"), runtime.OSC_7501_WORKING)
+        self.assertEqual(self.delivery_event(cid, "auto_submit_superseded")["request_id"], "R1")
+
+    def test_unconfirmed_receipt_does_not_emit_to_a_replaced_terminal(self) -> None:
+        """Failure means a delayed frame can mark a new process blocked even though the old request still needs reconciliation."""
+        cid = "confirm-replaced-incarnation"
+        env = self.confirmation_env(cid)
+        command = self.deferred_confirmation(cid, "继续推进", env)
+        self.confirm_delivery(command, dict(env, FAKE_TERMINAL_INCARNATION="agy-2"))
+        state = read_state(self.state, cid)
+        self.assertEqual(state["delivery_status"], "unknown")
+        self.assertEqual(state["unconfirmed_request_id"], "R1")
+        self.assertFalse(env["THE_PILOT_OSC_TARGET"].exists())
+        self.assertEqual(len(send_calls(self.root)), 1)
+
+    def test_late_matching_pre_invocation_recovers_receipted_delivery(self) -> None:
+        """Failure means a late start of the original send freezes subsequent Stop hooks or repeats that send."""
+        cid = "confirm-late"
+        env = self.confirmation_env(cid)
+        command = self.deferred_confirmation(cid, "继续推进", env)
+        self.confirm_delivery(command, env)
+        self.assertEqual(self.pre(cid, "继续推进", extra_env=env).returncode, 0)
+        state = read_state(self.state, cid)
+        self.assertEqual(state["delivery_status"], "none")
+        self.assertEqual(state["unconfirmed_request_id"], "")
+        event = self.delivery_event(cid, "auto_submitted")
+        self.assertEqual(event["request_id"], "R1")
+        self.assertIs(event["verified"], True)
+        self.assertIs(event["late"], True)
+        result = self.stop(cid, suggestion("下一次推进"), extra_env=env | {"FAKE_SEND_PROMPT": None})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([text_argument(call) for call in send_calls(self.root)], ["继续推进", "下一次推进"])
+        self.assertEqual(env["THE_PILOT_OSC_TARGET"].read_text(encoding="utf-8"),
+                         runtime.OSC_7501_WAITING_QUESTION + runtime.OSC_7501_WORKING)
+
+    def test_failed_or_abandoned_confirmation_keeps_the_receipt_recoverable(self) -> None:
+        """Failure means a lost confirmation can stay accepted forever or trigger another Enter on the same Stop."""
+        for reason in ("confirm_spawn_failed", "confirm_abandoned"):
+            with self.subTest(reason=reason):
+                env = self.confirmation_env(reason)
+                self.deferred_confirmation(reason, "继续推进", env, spawn_fails=reason == "confirm_spawn_failed")
+                target = env["THE_PILOT_OSC_TARGET"]
+                if reason == "confirm_abandoned":
+                    path = state_path(self.state, reason)
+                    transcript = self.root / f"transcript-{reason}.jsonl"
+                    steps = [json.loads(line) for line in transcript.read_text(encoding="utf-8").splitlines()]
+                    self.assertEqual(self.stop_decision(reason, steps, extra_env=env), {"decision": "allow"})
+                    self.assertFalse(target.exists())
+                    write_json(path, read_json(path) | {"delivery_deadline_at": 0.0})
+                    self.assertEqual(self.stop_decision(reason, steps, extra_env=env), {"decision": "allow"})
+                state = read_state(self.state, reason)
+                self.assertEqual(state["delivery_status"], "unknown")
+                self.assertEqual(state["unconfirmed_request_id"], "R1")
+                self.assertEqual(state["delivery_request_id"], "")
+                self.assertEqual(state["delivery_deadline_at"], 0.0)
+                self.assertEqual(target.read_text(encoding="utf-8"), runtime.OSC_7501_WAITING_QUESTION)
+                self.assertEqual(self.delivery_event(reason, "auto_submit_unconfirmed")["reason"], reason)
+        self.assertEqual(len(send_calls(self.root)), 2)
 
     def test_stop_uses_mode_committed_during_terminal_lookup(self) -> None:
         """resident-fact: A mode change can commit during terminal lookup and governs the ensuing send handoff."""
@@ -4981,6 +5244,41 @@ class OscTargetResolutionTest(unittest.TestCase):
                 self.assertIn(
                     "osc_status_target_rejected", log.read_text(encoding="utf-8")
                 )
+
+    def test_delayed_frame_requires_the_bound_tty_device_and_inode(self) -> None:
+        """Failure means a reused pane path can receive stale waiting bytes, or a valid binding rejects the frame."""
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        os.set_blocking(master, False)
+        opened = os.fstat(slave)
+        log = self.root / "state" / "pilot.log"
+        frame = runtime.OSC_7501_WAITING_QUESTION
+        cases = (
+            (str(opened.st_dev + 1), str(opened.st_ino)),
+            (str(opened.st_dev), str(opened.st_ino + 1)),
+            ("invalid", str(opened.st_ino)),
+            ("", str(opened.st_ino)),
+        )
+        env = {
+            "THE_PILOT_GEMINI_DIR": str(self.root / "gemini"),
+            "THE_PILOT_OSC_TARGET": os.ttyname(slave),
+            "THE_PILOT_OSC_TARGET_IS_PANE": "1",
+        }
+        with mock.patch.multiple(runtime, STATE_DIR=log.parent, LOG_PATH=log):
+            for dev, ino in cases:
+                with self.subTest(dev=dev, ino=ino), self.isolated_env(
+                    **env, THE_PILOT_OSC_DEV=dev, THE_PILOT_OSC_INO=ino,
+                ):
+                    self.assertFalse(runtime.emit_osc_7501(frame))
+                    with self.assertRaises(BlockingIOError):
+                        os.read(master, 4096)
+            with self.isolated_env(
+                **env, THE_PILOT_OSC_DEV=str(opened.st_dev), THE_PILOT_OSC_INO=str(opened.st_ino),
+            ):
+                self.assertTrue(runtime.emit_osc_7501(frame))
+                self.assertEqual(os.read(master, 4096), frame.encode())
+        self.assertEqual(log.read_text(encoding="utf-8").count("osc_status_target_rejected"), len(cases))
 
     def test_zero_byte_write_is_logged_not_spun(self) -> None:
         """A write that reports zero bytes fails instead of looping forever.

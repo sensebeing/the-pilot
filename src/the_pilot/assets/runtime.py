@@ -65,6 +65,9 @@ LOG_PATH = STATE_DIR / "pilot.log"
 # The installer gives its own ``apply`` child 30 s; this outer deadline must be
 # longer so a legitimate repair always finishes before the hook may kill it.
 PROJECT_SYNC_TIMEOUT_SECONDS = 45
+STOP_EXIT_TIMEOUT_SECONDS = 2.0
+CONFIRM_TIMEOUT_SECONDS = 2.0
+CONFIRM_DEADLINE_SECONDS = 5.0
 _RUNNING_SCRIPT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
@@ -750,7 +753,9 @@ def _hydrate_step(
     steps[index] = full_item
 
 
-def read_steps(transcript_path: str | None) -> tuple[list[dict[str, Any]], bool]:
+def read_steps(
+    transcript_path: str | None, *, hydrate: bool = True,
+) -> tuple[list[dict[str, Any]], bool]:
     if not transcript_path:
         return [], False
     path = Path(transcript_path)
@@ -782,7 +787,8 @@ def read_steps(transcript_path: str | None) -> tuple[list[dict[str, Any]], bool]
     if not complete:
         log_event("transcript_incomplete", path=str(path), steps=len(steps))
         return steps, complete
-    _hydrate_truncated_steps(steps, path)
+    if hydrate:
+        _hydrate_truncated_steps(steps, path)
     return steps, complete
 
 
@@ -1409,6 +1415,15 @@ def turn_user_identity(steps: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _clear_delivery_request(state: dict[str, Any]) -> None:
+    state.update(delivery_request_id="", delivery_deadline_at=0.0)
+
+
+def _clear_delivery_confirmation(state: dict[str, Any]) -> None:
+    _clear_delivery_request(state)
+    state.update(last_confirmed_request_id="", unconfirmed_request_id="")
+
+
 def clear_suggestion(state: dict[str, Any]) -> None:
     state.update(
         {
@@ -1420,6 +1435,7 @@ def clear_suggestion(state: dict[str, Any]) -> None:
             "auto_submitted_text": "",
         }
     )
+    _clear_delivery_confirmation(state)
     if state.get("delivery_status") not in {"pending", "unknown"}:
         state["delivery_status"] = "none"
 
@@ -1450,32 +1466,38 @@ def same_path(left: str, right: str) -> bool:
         return left.rstrip("/") == right.rstrip("/")
 
 
-def resolve_terminal(workspace_path: str, explicit_handle: str = "") -> str:
-    if not workspace_path:
-        log_event("terminal_workspace_missing")
-        return ""
-    requested = explicit_handle.strip() or os.environ.get("ORCA_TERMINAL_HANDLE", "").strip()
+def _connected_antigravity_terminals() -> list[dict[str, Any]]:
     result = run_orca(["terminal", "list", "--json"], timeout=3)
     if result is None or result.returncode != 0:
         log_event("terminal_list_failed", returncode=None if result is None else result.returncode)
-        return ""
+        return []
     try:
         payload = json.loads(result.stdout)
     except ValueError as exc:
         log_event("terminal_list_invalid", error=str(exc))
-        return ""
+        return []
     result_data = payload.get("result") if isinstance(payload, dict) else None
     terminals = result_data.get("terminals") if isinstance(result_data, dict) else None
     if not isinstance(terminals, list):
         log_event("terminal_list_invalid", reason="missing_terminals")
-        return ""
-    candidates = [
+        return []
+    return [
         item
         for item in terminals
         if isinstance(item, dict)
         and item.get("agentIdentity") == "antigravity"
         and item.get("connected") is True
-        and item.get("writable", True) is not False
+    ]
+
+
+def resolve_terminal(workspace_path: str, explicit_handle: str = "") -> str:
+    if not workspace_path:
+        log_event("terminal_workspace_missing")
+        return ""
+    requested = explicit_handle.strip() or os.environ.get("ORCA_TERMINAL_HANDLE", "").strip()
+    candidates = [
+        item for item in _connected_antigravity_terminals()
+        if item.get("writable", True) is not False
     ]
     if requested:
         matched = [
@@ -1499,6 +1521,14 @@ def resolve_terminal(workspace_path: str, explicit_handle: str = "") -> str:
     return str(matched[0].get("handle") or "")
 
 
+def _terminal_incarnation_matches(handle: str, expected_incarnation: str) -> bool:
+    for terminal in _connected_antigravity_terminals():
+        if terminal.get("handle") == handle:
+            incarnation = str(terminal.get("incarnationId") or "")
+            return not (expected_incarnation and incarnation) or incarnation == expected_incarnation
+    return False
+
+
 def _start_terminal_send(handle: str, text: str, enter: bool) -> subprocess.Popen[str]:
     args = [orca_binary(), "terminal", "send", "--terminal", handle, "--text", text, "--json"]
     if enter:
@@ -1508,20 +1538,22 @@ def _start_terminal_send(handle: str, text: str, enter: bool) -> subprocess.Pope
     )
 
 
-def _wait_for_terminal_receipt(process: subprocess.Popen[str], handle: str, enter: bool) -> str:
+def _wait_for_terminal_receipt(
+    process: subprocess.Popen[str], handle: str, enter: bool,
+) -> tuple[str, dict[str, Any]]:
     with process:
         try:
             stdout, stderr = process.communicate(timeout=5.0)
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             process.kill()
             log_event("send_unknown", handle=handle, enter=enter, error=str(exc))
-            return "unknown"
+            return "unknown", {}
     try:
         payload = json.loads(stdout)
     except ValueError as exc:
         if process.returncode == 0:
             log_event("send_receipt_invalid", handle=handle, error=str(exc))
-            return "unknown"
+            return "unknown", {}
         payload = None
     result_data = payload.get("result") if isinstance(payload, dict) else None
     receipt = result_data.get("send") if isinstance(result_data, dict) else None
@@ -1541,13 +1573,12 @@ def _wait_for_terminal_receipt(process: subprocess.Popen[str], handle: str, ente
             stdout=stdout[-500:],
             **details,
         )
-        return "rejected"
-    accepted = receipt.get("accepted") if isinstance(receipt, dict) else None
-    if isinstance(accepted, bool):
-        log_event("send_receipt", handle=handle, enter=enter, accepted=accepted)
-        return "accepted" if accepted else "rejected"
+        return "rejected", {}
+    if isinstance(receipt, dict) and isinstance(receipt.get("accepted"), bool):
+        log_event("send_receipt", handle=handle, enter=enter, accepted=receipt["accepted"])
+        return ("accepted" if receipt["accepted"] else "rejected"), receipt
     log_event("send_receipt_invalid", handle=handle, reason="missing_accepted")
-    return "unknown"
+    return "unknown", {}
 
 
 def injection(message: str) -> dict[str, Any]:
@@ -1608,7 +1639,7 @@ def _resolve_osc_target() -> tuple[Path, bool] | None:
     tty column points at Orca's pane; nested shell shims (`sh -> bash -> agy`)
     are walked for up to three hops after skipping the re-exec Python parent.
     The next non-wrapper ancestor must be `agy`. Tests and non-Orca hosts resolve to None:
-    an explicit override always wins, then Gemini-dir isolation stays inert
+    an explicit override or a captured pane binding wins, then Gemini-dir isolation stays inert
     (never probing `ps` or writing host TTYs), then the Orca pane environment
     gates the ancestor walk.
     """
@@ -1617,7 +1648,8 @@ def _resolve_osc_target() -> tuple[Path, bool] | None:
         stripped = raw_override.strip()
         if not stripped or stripped.lower() == "none":
             return None
-        return Path(stripped).expanduser(), True
+        is_override = os.environ.get("THE_PILOT_OSC_TARGET_IS_PANE") != "1"
+        return Path(stripped).expanduser(), is_override
     if not _uses_orca_pane():
         return None
     skip_python_parent = _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1"
@@ -1638,6 +1670,20 @@ def _resolve_osc_target() -> tuple[Path, bool] | None:
         skip_python_parent = False
         pid = ppid
     return None
+
+
+def _is_owned_character_device(status: os.stat_result) -> bool:
+    return stat.S_ISCHR(status.st_mode) and status.st_uid == os.getuid()
+
+
+def _bound_pane_matches(opened: os.stat_result) -> bool:
+    if os.environ.get("THE_PILOT_OSC_TARGET_IS_PANE") != "1":
+        return True
+    try:
+        expected = (int(os.environ["THE_PILOT_OSC_DEV"]), int(os.environ["THE_PILOT_OSC_INO"]))
+    except (KeyError, ValueError):
+        return False
+    return (opened.st_dev, opened.st_ino) == expected
 
 
 def _open_override_target(target: Path) -> int:
@@ -1694,7 +1740,7 @@ def emit_osc_7501(frame: str) -> bool:
             fd = _open_override_target(target)
         else:
             status = os.stat(target)
-            if not stat.S_ISCHR(status.st_mode) or status.st_uid != os.getuid():
+            if not _is_owned_character_device(status):
                 log_event("osc_status_target_rejected", target=str(target))
                 return False
             fd = os.open(target, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
@@ -1703,7 +1749,7 @@ def emit_osc_7501(frame: str) -> bool:
                 # The path may be replaced between stat and open: re-check the
                 # descriptor actually opened before writing escape bytes.
                 opened = os.fstat(fd)
-                if not stat.S_ISCHR(opened.st_mode) or opened.st_uid != os.getuid():
+                if not _is_owned_character_device(opened) or not _bound_pane_matches(opened):
                     log_event("osc_status_target_rejected", target=str(target))
                     return False
             _write_osc_bytes(fd, data)
@@ -1797,6 +1843,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 state["auto_submitted_text"] = ""
                 state["candidates"] = []
                 state["candidate_turn_id"] = ""
+                _clear_delivery_confirmation(state)
                 if not save_state(conversation_id, state):
                     log_event("pre_state_save_failed", cid=conversation_id)
             log_event(f"pre_invocation_{code}", cid=conversation_id, error=detail)
@@ -1846,8 +1893,19 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["current_user_turn_id"] = user_turn or "missing"
         auto_text = str(state.get("auto_submitted_text") or "")
         manual_input = not auto_text or text != auto_text
+        pending_req = str(state.get("delivery_request_id") or "")
+        unconfirmed_req = str(state.get("unconfirmed_request_id") or "")
+        _clear_delivery_confirmation(state)
         if manual_input:
             state["consecutive_auto_turns"] = 0
+        elif pending_req:
+            state.update(last_confirmed_request_id=pending_req, delivery_status="none")
+        elif unconfirmed_req and state.get("delivery_status") == "unknown":
+            state["delivery_status"] = "none"
+            log_event(
+                "auto_submitted", cid=conversation_id, scene=str(state.get("scene") or ""),
+                request_id=unconfirmed_req, verified=True, late=True,
+            )
         if state.get("delivery_status") in {"pending", "unknown"} and manual_input:
             previous_status = str(state.get("delivery_status") or "")
             state["delivery_status"] = "cleared"
@@ -2057,6 +2115,96 @@ def _rollback_auto_submit(state: dict[str, Any], previous_count: int, previous_t
     state["consecutive_auto_turns"] = previous_count
     state["auto_submitted_text"] = previous_text
     state["last_settled_turn_id"] = ""
+    _clear_delivery_confirmation(state)
+
+
+def _record_unconfirmed_delivery(
+    conversation_id: str, state: dict[str, Any], request_id: str, reason: str,
+) -> bool:
+    _clear_delivery_request(state)
+    state.update(delivery_status="unknown", unconfirmed_request_id=request_id)
+    if not save_state(conversation_id, state):
+        log_event("auto_submit_state_failed", cid=conversation_id, request_id=request_id, reason=reason)
+        return False
+    log_event(
+        "auto_submit_unconfirmed", cid=conversation_id, scene=str(state.get("scene") or ""),
+        request_id=request_id, reason=reason,
+    )
+    return True
+
+
+def _delivery_confirmation_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("THE_PILOT_REEXEC", None)
+    env.pop("ORCA_AUTOPILOT_REEXEC", None)
+    if "THE_PILOT_OSC_TARGET" in env:
+        return env
+    env["THE_PILOT_OSC_TARGET"] = "none"
+    resolved = _resolve_osc_target()
+    if resolved is not None:
+        pane, _ = resolved
+        try:
+            status = os.stat(pane)
+        except OSError:
+            return env
+        if _is_owned_character_device(status):
+            env.update(
+                THE_PILOT_OSC_TARGET=str(pane),
+                THE_PILOT_OSC_TARGET_IS_PANE="1",
+                THE_PILOT_OSC_DEV=str(status.st_dev),
+                THE_PILOT_OSC_INO=str(status.st_ino),
+            )
+    return env
+
+
+def _settle_accepted_auto_submit(
+    conversation_id: str, state: dict[str, Any], prompt: dict[str, Any],
+    *, transcript_path: str, handle: str,
+) -> str:
+    scene = str(state.get("scene") or "")
+    request_id = str(prompt.get("requestId") or "").strip()
+    observation = prompt.get("observation")
+    stages = prompt.get("stages")
+    verified = bool(
+        request_id and observation != "unsupported"
+        and isinstance(stages, list) and "turn_started" in stages
+    )
+    confirm = observation == "supported" and bool(request_id) and not verified
+    state["delivery_status"] = "accepted"
+    if confirm:
+        state.update(delivery_request_id=request_id, delivery_deadline_at=time.time() + CONFIRM_DEADLINE_SECONDS)
+    if not save_state(conversation_id, state):
+        log_event("auto_submit_state_failed", cid=conversation_id, scene=scene, request_id=request_id)
+        return OSC_7501_WAITING_QUESTION
+    if not confirm:
+        details = {"request_id": request_id} if verified else {}
+        log_event("auto_submitted", cid=conversation_id, scene=scene, verified=verified, **details)
+        return ""
+
+    reexecuted = _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1"
+    stop_pid = os.getppid() if reexecuted else os.getpid()
+    try:
+        subprocess.Popen(
+            [
+                sys.executable, str(Path(__file__).resolve()), "confirm-delivery",
+                "--cid", conversation_id,
+                "--user-turn", state["current_user_turn_id"],
+                "--turn-id", state["last_settled_turn_id"],
+                "--request-id", request_id,
+                "--terminal", handle,
+                "--incarnation", str(prompt.get("processIncarnation") or ""),
+                "--transcript", transcript_path,
+                "--parent-pid", str(stop_pid),
+            ],
+            env=_delivery_confirmation_env(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        _record_unconfirmed_delivery(conversation_id, state, request_id, "confirm_spawn_failed")
+        return OSC_7501_WAITING_QUESTION
+    log_event("auto_submit_accepted", cid=conversation_id, scene=scene, request_id=request_id)
+    return ""
 
 
 def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -2141,6 +2289,15 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             )
             return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
         status = str(state.get("delivery_status") or "")
+        request_id = str(state.get("delivery_request_id") or "")
+        if (
+            state.get("last_settled_turn_id") == turn_id
+            and status == "accepted"
+            and request_id
+            and time.time() >= float(state.get("delivery_deadline_at") or 0.0)
+        ):
+            _record_unconfirmed_delivery(conversation_id, state, request_id, "confirm_abandoned")
+            return {"decision": "allow"}, OSC_7501_WAITING_QUESTION
         if (
             state.get("last_settled_turn_id") == turn_id
             or status in {"pending", "unknown"}
@@ -2156,6 +2313,7 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 {"decision": "allow"},
                 _osc_frame_for_delivery_status(status),
             )
+        _clear_delivery_confirmation(state)
 
         planners = [step for step in turn_steps if step.get("type") == "PLANNER_RESPONSE"]
         if not planners:
@@ -2285,8 +2443,9 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             return {"decision": "allow"}, OSC_7501_DONE
 
         outcome = "none"
+        receipt = {}
         if process is not None:
-            outcome = _wait_for_terminal_receipt(process, handle, enter=auto_submit)
+            outcome, receipt = _wait_for_terminal_receipt(process, handle, enter=auto_submit)
         elif launch_error is not None:
             outcome = "rejected" if auto_submit else "unknown"
             log_event("send_start_failed", handle=handle, enter=auto_submit, error=launch_error)
@@ -2296,17 +2455,31 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         if outcome == "none" or not auto_submit:
             state.update(gate_action=gate, last_settled_turn_id=turn_id, auto_submitted_text="")
         if auto_submit:
+            details = {}
+            frame = None
+            if outcome == "accepted":
+                prompt = receipt.get("prompt")
+                prompt = prompt if isinstance(prompt, dict) else {}
+                observation = prompt.get("observation")
+                if observation in ("permission", "incarnation_replaced"):
+                    outcome = "rejected"
+                    details["reason"] = observation
+                    if observation == "permission":
+                        frame = OSC_7501_WAITING_QUESTION
+                else:
+                    return {"decision": "allow"}, _settle_accepted_auto_submit(
+                        conversation_id, state, prompt, transcript_path=transcript_path, handle=handle,
+                    )
             if outcome == "rejected":
                 _rollback_auto_submit(state, previous_count, previous_text)
             state["delivery_status"] = outcome
             event = {
-                "accepted": "auto_submitted",
                 "none": "auto_submit_no_terminal",
                 "rejected": "auto_submit_rejected",
                 "unknown": "auto_submit_unknown",
             }[outcome]
-            details = {}
         else:
+            frame = None
             if handle and outcome != "accepted":
                 log_event("prefill_not_accepted", cid=conversation_id, scene=scene)
             state["delivery_status"] = {
@@ -2321,13 +2494,130 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         log_event(event, cid=conversation_id, scene=scene, **details)
         return (
             {"decision": "allow"},
-            _osc_frame_for_delivery_status(state["delivery_status"]),
+            frame if frame is not None else _osc_frame_for_delivery_status(state["delivery_status"]),
         )
 
 
 def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
     """Return only the Stop hook decision for direct callers."""
     return _evaluate_stop(payload)[0]
+
+
+def _timeout_seconds(variable: str, default: float) -> float:
+    try:
+        milliseconds = int(os.environ.get(variable, ""))
+    except ValueError:
+        return default
+    return min(max(milliseconds, 0), int(default * 1000)) / 1000
+
+
+def _wait_for_stop_exit(parent_pid: int) -> bool:
+    timeout = _timeout_seconds("THE_PILOT_STOP_EXIT_TIMEOUT_MS", STOP_EXIT_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + timeout
+    while parent_pid > 1:
+        try:
+            os.kill(parent_pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.01, remaining))
+    return False
+
+
+def _owns_delivery_confirmation(state: dict[str, Any], args: argparse.Namespace) -> bool:
+    return (
+        state.get("current_user_turn_id") == args.user_turn
+        and state.get("last_settled_turn_id") == args.turn_id
+        and state.get("delivery_status") == "accepted"
+        and state.get("delivery_request_id") == args.request_id
+    )
+
+
+def _new_transcript_input(
+    steps: list[dict[str, Any]], expected_user_turn: str,
+) -> dict[str, Any] | None:
+    user_turn = turn_user_identity(steps)
+    if not user_turn or user_turn == expected_user_turn:
+        return None
+    latest_user = next(step for step in reversed(steps) if step.get("type") == "USER_INPUT")
+    if (
+        "content" in _truncated_fields(latest_user)
+        and user_turn.partition(":")[0] == expected_user_turn.partition(":")[0]
+    ):
+        # The hook may have hydrated this input. The compact text at the same
+        # position cannot prove that a new turn started.
+        return None
+    return latest_user
+
+
+def _poll_turn_start(args: argparse.Namespace) -> None:
+    # Polling is advisory. Repeat all decision reads after taking the session lock.
+    timeout = _timeout_seconds("THE_PILOT_CONFIRM_TIMEOUT_MS", CONFIRM_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + timeout
+    while True:
+        state = load_state(args.cid)
+        if state is None or not _owns_delivery_confirmation(state, args):
+            return
+        steps, _ = read_steps(args.transcript, hydrate=False)
+        if _new_transcript_input(steps, args.user_turn) is not None:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.05, remaining))
+
+
+def command_confirm_delivery(args: argparse.Namespace) -> int:
+    stop_exited = _wait_for_stop_exit(args.parent_pid)
+    if stop_exited:
+        _poll_turn_start(args)
+    cid = args.cid
+    request_id = args.request_id
+    with state_lock(cid):
+        state = load_state(cid)
+        if state is not None and state.get("last_confirmed_request_id") == request_id:
+            state["last_confirmed_request_id"] = ""
+            if save_state(cid, state):
+                log_event(
+                    "auto_submitted", cid=cid, scene=str(state.get("scene") or ""),
+                    request_id=request_id, verified=True,
+                )
+            return 0
+        if state is None or not _owns_delivery_confirmation(state, args):
+            log_event("auto_submit_superseded", cid=cid, request_id=request_id)
+            return 0
+
+        steps, complete = read_steps(args.transcript, hydrate=False)
+        latest_user = _new_transcript_input(steps, args.user_turn)
+        if latest_user is not None:
+            _clear_delivery_request(state)
+            if save_state(cid, state):
+                if extract_user_text(latest_user.get("content")) == state.get("auto_submitted_text"):
+                    log_event(
+                        "auto_submitted", cid=cid, scene=str(state.get("scene") or ""),
+                        request_id=request_id, verified=True,
+                    )
+                else:
+                    log_event("auto_submit_superseded", cid=cid, request_id=request_id)
+            return 0
+
+        if not stop_exited:
+            reason = "stop_still_running"
+        elif not complete:
+            reason = "transcript_incomplete"
+        elif turn_identity(steps) != args.turn_id:
+            reason = "transcript_changed"
+        else:
+            reason = "turn_start_timeout"
+        if _record_unconfirmed_delivery(cid, state, request_id, reason) and _terminal_incarnation_matches(
+            args.terminal, args.incarnation,
+        ):
+            emit_osc_7501(OSC_7501_WAITING_QUESTION)
+    return 0
 
 
 def render_scenes_block(scenes: dict[str, dict[str, Any]]) -> str:
@@ -2698,6 +2988,13 @@ def build_parser() -> argparse.ArgumentParser:
     setter.add_argument("template")
     logger = subparsers.add_parser("log", help="查看最近事件")
     logger.add_argument("--limit", type=int, default=30)
+    # argparse includes suppressed subparsers in usage and the help table.
+    subparsers.metavar = "{" + ",".join(subparsers.choices) + "}"
+    confirm = subparsers.add_parser("confirm-delivery", help=argparse.SUPPRESS)
+    subparsers._choices_actions.pop()
+    for option in ("cid", "user-turn", "turn-id", "request-id", "terminal", "incarnation", "transcript"):
+        confirm.add_argument(f"--{option}", required=True)
+    confirm.add_argument("--parent-pid", required=True, type=int)
     return parser
 
 
@@ -2709,6 +3006,8 @@ def main(argv: list[str] | None = None) -> int:
         return command_mode(args.target)
     if args.command == "hook":
         return run_hook(args.event)
+    if args.command == "confirm-delivery":
+        return command_confirm_delivery(args)
     if args.command == "status":
         return command_status(args.json)
     if args.command == "sync":
