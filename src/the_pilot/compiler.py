@@ -179,7 +179,7 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
    - 禁止平级 `--worktree new-top-level`/`--no-parent`。仅用户明确要求独立长期 Tier-1 可用 `--no-parent`（原生 {coordinator_label}），需回执则绑定 Dealer thread 或 `orca orchestration send`。
 4. **交互与验收**：
    - `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 等回执，`reply`/`send` 裁决和指导，`--ack` 确认消费。
-   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。独立架构审查优先级：**`{review_priority}`**。
+   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。代码落地后的独立架构审查优先级：**`{review_priority}`**（文档/方案阶段在当前主会话内完成，不拉起单独审查子会话）。
    - 未达标用 `worker-show` 取已验证终端，建整改 Task，`worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回；通过后同终端 follow-up 通知合入并推送 `main`。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
 
 
