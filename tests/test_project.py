@@ -215,7 +215,7 @@ class ProjectTest(unittest.TestCase):
         self.assertIn("孤儿行、延迟外键、历史枚举/版本值", contracts["deliver-and-verify"]["quality_bar"])
 
     def test_plan_description_overlay_inherits_review_protocol(self):
-        """Failure means a trigger-only overlay loses the installed review gate or reset protocol."""
+        """Failure means a description-only overlay fails to preserve in-session plan review."""
         description = "Project planning trigger"
         overlay = self.root / "project.json"
         overlay.write_text(json.dumps({
@@ -233,8 +233,10 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(meta["description"], description)
         self.assertEqual(body, default_body)
         review = body.split("**进度 ②", 1)[1].split("**进度 ③", 1)[0]
-        self.assertIn("NO-GO (OVERDESIGN)", review)
-        self.assertIn("`worker-release`", review)
+        self.assertIn("当前主会话直接对详细方案做一次方案级最简架构 Review", review)
+        self.assertIn("不拉起单独审查子会话", review)
+        self.assertNotIn("NO-GO (OVERDESIGN)", review)
+        self.assertNotIn("`worker-release`", review)
 
     def test_upgrade_promotes_colliding_custom_entry_and_enables_new_recommended(self):
         """Upgrade owns promotion of project entries while direct profiles stay strict."""
