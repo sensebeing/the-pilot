@@ -666,6 +666,49 @@ class CompilerTest(unittest.TestCase):
                     runtime.update_orchestration_guidance(block, target), expected
                 )
 
+    def test_orchestration_delegates_heavy_verification_and_bounds_reader_load(self) -> None:
+        # Failure means Tier-1 Coordinators regain ownership of heavy
+        # verification and long waits, short Orca messages pay a draft-file
+        # turn tax, or unbounded repo/Orca reads and inline Python bloat the
+        # main-session context.
+        profile = resolve_profile(self.base, preset="recommended")
+        section = profile_compiler.render_orchestration_section(profile)
+
+        for clause in (
+            "独立分支完成修改、定向测试与秒级本地静态门禁",
+            "待主会话零基复审",
+            "worker 执行模型级 `guard review`、仓库原子合入流程",
+            "长构建/部署/探测等待",
+            "不挂后台 `guard review`、测试套件/构建轮询",
+        ):
+            self.assertIn(clause, section)
+        for repository_specific in (
+            "check-doc-structure", "product-quality", "git-land.py",
+        ):
+            self.assertNotIn(repository_specific, section)
+
+        for clause in (
+            '单段契约用 `--spec "<任务契约>"` 一轮发出',
+            '单段正文用 `--body "<正文>"` 一轮发出',
+            "多段才用 `--spec-file <路径>`",
+            "多段才用 `--body-file <路径>`",
+            "与最终只读核查同轮写入，不单独起草",
+        ):
+            self.assertIn(clause, section)
+        self.assertNotIn("多行正文统一用 `--body-file`", section)
+        self.assertNotIn("多行契约用 `--spec-file <路径>`", section)
+
+        for clause in (
+            "主会话并行批量执行只读核查",
+            "查 diff 先 `git diff --stat` 再按 `-- <paths>` 限定",
+            "禁用整分支无界 `git show`/`git diff`",
+            "Orca 查询用有界选择器（`--terminal-state reclaimable`、`--worktree path:<路径>`）",
+            "多行 Python 用 `uv run --project ...`/`.py`",
+            "禁嵌套引号 `python3 -c`",
+            "不挂后台 `guard review`、测试套件/构建轮询",
+        ):
+            self.assertIn(clause, section)
+
     def test_orchestration_block_merge_preserves_prose_and_strips_cleanly(self) -> None:
         # Failure means install/uninstall rewrites unrelated global agent
         # prose, appends a second managed block, or guesses at malformed markers.
