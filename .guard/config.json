@@ -32,6 +32,16 @@
       },
       {
         "scope_prefixes": [
+          "src/the_pilot/packaging.py"
+        ],
+        "imports": [
+          "the_pilot"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "packaging.py is the standard-library-only PEP 517/660 backend leaf; it must never import the_pilot or any of its modules."
+      },
+      {
+        "scope_prefixes": [
           "src/the_pilot/defaults.py"
         ],
         "imports": [
@@ -40,6 +50,7 @@
           "the_pilot.compiler",
           "the_pilot.distill",
           "the_pilot.installer",
+          "the_pilot.packaging",
           "the_pilot.runtime",
           "the_pilot.cli"
         ],
@@ -55,6 +66,7 @@
           "the_pilot.compiler",
           "the_pilot.distill",
           "the_pilot.installer",
+          "the_pilot.packaging",
           "the_pilot.runtime",
           "the_pilot.cli"
         ],
@@ -69,6 +81,7 @@
           "the_pilot.compiler",
           "the_pilot.distill",
           "the_pilot.installer",
+          "the_pilot.packaging",
           "the_pilot.runtime",
           "the_pilot.cli"
         ],
@@ -82,6 +95,7 @@
         "imports": [
           "the_pilot.distill",
           "the_pilot.installer",
+          "the_pilot.packaging",
           "the_pilot.runtime",
           "the_pilot.cli"
         ],
@@ -94,6 +108,7 @@
         ],
         "imports": [
           "the_pilot.installer",
+          "the_pilot.packaging",
           "the_pilot.runtime",
           "the_pilot.cli"
         ],

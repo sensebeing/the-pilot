@@ -6,12 +6,14 @@
 - `compiler.py`: pure rendering and managed-document merges; no IO.
 - `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs, plus scene pipeline assessment of the installed profile and scene contracts.
 - `installer.py`: the sole owner of global installation, `self-update`, installation locking and artifact writes. It removes obsolete installed project snapshots during apply and uninstall.
+- `packaging.py`: the zero-dependency PEP 517/660 backend leaf (`requires = []`). It owns the controlled package file enumeration, the source and wheel tree digests, and wheel, editable and sdist builds outside the checkout. It never reads or writes `build/`, `dist/` or `*.egg-info`; only `installer.py` imports it.
 - `assets/runtime.py`: the standalone runtime, copied unchanged on install. It owns per-turn workspace shortcut discovery and validation, terminal lifecycle status and `agy` launch argument semantics, including pane resolution and the paired OSC 7501 activity and OSC 2 title write. It owns the single synchronous Stop submission, post-Stop turn-start observation from the session and transcript, and settlement of unconfirmed delivery in the original pane. The package reuses its universal entry catalog, shortcut schema, comma command rendering and log rotation.
 - `runtime.py`: subprocess adapter to the installed runtime (no second engine).
 - `cli.py`: installer versus runtime command routing only.
 
 Dependencies flow from the CLI to installer, compiler, profile, project and
-defaults. The standalone asset has standard-library dependencies only. Distill
+defaults. `packaging.py` is a standard-library-only leaf that only `installer.py`
+consumes. The standalone asset has standard-library dependencies only. Distill
 validates the installed pipeline against the universal catalog. Package bootstrap
 can load code from a verified checkout using Git provenance and update metadata.
 
@@ -74,6 +76,16 @@ and project-neutral artifact recompilation while preserving `profile.json` prefe
 The CLI can use a newer clean `~/the-pilot` main checkout immediately. Persisted
 `installed_sha` and `installed_tree_digest` keep the uv tool bundle aligned with
 the checkout, including after an external pull or a missing launcher.
+
+A uv tool update is a two-stage transaction. `installer.py` first builds a wheel
+in-process from the checkout's controlled files and requires its package tree
+digest to equal the checkout digest; no subprocess touches the launcher during
+that stage, so an unbuildable or inconsistent checkout leaves the live
+`~/.local/bin/pilot` intact. Only the verified wheel reaches the single
+`uv tool install --force <wheel>` call, after which the launcher and installed
+package digest are checked again. A failed command raises `SetupError` carrying
+its exit status or timeout plus the tail of its `stderr` (or `stdout`), so
+`auto_update.json` and `auto_update.log` record the real cause.
 
 For the default Gemini root, the compiler renders the managed shell startup
 block and the installer owns startup file selection. The block defaults

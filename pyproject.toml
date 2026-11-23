@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = []
+build-backend = "packaging"
+backend-path = ["src/the_pilot"]
 
 [project]
 name = "the-pilot"
@@ -32,9 +33,3 @@ Changelog = "https://github.com/sensebeing/the-pilot/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pilot = "the_pilot.cli:main"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-the_pilot = ["assets/*.py", "assets/*.json"]
