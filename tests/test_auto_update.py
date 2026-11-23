@@ -225,6 +225,7 @@ class AutoUpdateTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                 "HOME": str(root / "process-home"),
                 "THE_PILOT_GEMINI_DIR": str(gemini),
+                "THE_PILOT_STATE_DIR": str(state),
                 "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
                 "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }):
@@ -750,6 +751,7 @@ class AutoUpdateTest(unittest.TestCase):
             env = {
                 "HOME": str(root / "process-home"), "PATH": f"{root}:{os.environ['PATH']}",
                 "UV_LOG": str(uv_log),
+                "THE_PILOT_STATE_DIR": str(state),
                 "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
                 "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }
@@ -814,7 +816,8 @@ class AutoUpdateTest(unittest.TestCase):
             ])
             env = {
                 "HOME": str(root / "process-home"), "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
-                "UV_LOG": str(uv_log), "UV_TOOL_DIR": str(tools), "UV_TOOL_BIN_DIR": str(bin_dir),
+                "UV_LOG": str(uv_log), "THE_PILOT_STATE_DIR": str(state),
+                "UV_TOOL_DIR": str(tools), "UV_TOOL_BIN_DIR": str(bin_dir),
             }
             before = tree_paths(checkout)
             with mock.patch.dict(os.environ, env), \
@@ -1032,6 +1035,7 @@ class AutoUpdateTest(unittest.TestCase):
                     "HOME": str(root / "process-home"),
                     "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                     "UV_LOG": str(uv_log),
+                    "THE_PILOT_STATE_DIR": str(state),
                     "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
                     "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
                 }
@@ -1087,6 +1091,7 @@ class AutoUpdateTest(unittest.TestCase):
                 "HOME": str(root / "process-home"),
                 "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                 "UV_LOG": str(uv_log),
+                "THE_PILOT_STATE_DIR": str(state),
                 "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
                 "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }
@@ -1186,6 +1191,7 @@ class AutoUpdateTest(unittest.TestCase):
                 "HOME": str(root / "process-home"),
                 "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                 "UV_LOG": str(uv_log),
+                "THE_PILOT_STATE_DIR": str(state),
                 "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
                 "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }
@@ -1250,6 +1256,12 @@ class AutoUpdateTest(unittest.TestCase):
             args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
             update_env = {
                 "THE_PILOT_ENABLE_AUTO_UPDATE": "1", "THE_PILOT_DISABLE_AUTO_UPDATE": "0",
+                "THE_PILOT_STATE_DIR": str(state),
+                "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
+            }
+            local_env = {
+                "THE_PILOT_STATE_DIR": str(state),
                 "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
                 "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }
@@ -1281,11 +1293,13 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertNotIn("installed_tree_digest", persisted)
             engine.write_text(engine.read_text() + "\n# dirty\n")
             before = (gemini / "config/the-pilot/runtime.py").read_bytes()
-            self.assertEqual(installer.self_update(args)["local_source_status"], "none")
+            with mock.patch.dict(os.environ, local_env):
+                self.assertEqual(installer.self_update(args)["local_source_status"], "none")
             self.assertEqual(before, (gemini / "config/the-pilot/runtime.py").read_bytes())
             subprocess.run(["git", "-C", str(checkout), "restore", str(engine.relative_to(checkout))], check=True)
             subprocess.run(["git", "-C", str(checkout), "checkout", "-b", "feature"], check=True, capture_output=True)
-            self.assertEqual(installer.self_update(args)["local_source_status"], "none")
+            with mock.patch.dict(os.environ, local_env):
+                self.assertEqual(installer.self_update(args)["local_source_status"], "none")
 
     def test_pilot_pre_invocation_reexecs_updated_engine_on_same_turn(self):
         """A clean local checkout repairs the installed engine and runs it on the same turn."""
