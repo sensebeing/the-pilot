@@ -1,8 +1,12 @@
 """Focused contracts for the zero-touch update paths."""
+import base64
+import contextlib
+import hashlib
 import io
 import json
 import os
 import shutil
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,8 +16,17 @@ import sys
 import time
 import zipfile
 
-from the_pilot import installer
+from the_pilot import installer, packaging
 from the_pilot.assets import runtime
+
+
+def tree_paths(root: Path) -> set[str]:
+    """Snapshot a checkout tree without Git internals or byte-code caches."""
+    return {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if "__pycache__" not in path.parts and ".git" not in path.parts
+    }
 
 
 class AutoUpdateTest(unittest.TestCase):
@@ -58,9 +71,29 @@ class AutoUpdateTest(unittest.TestCase):
         checkout = home / "the-pilot"
         checkout.mkdir(parents=True)
         source = Path(__file__).parents[1]
+        for name in ("pyproject.toml", "README.md", "LICENSE", ".gitignore"):
+            shutil.copyfile(source / name, checkout / name)
         for folder in ("src", "bin", "skills"):
             shutil.copytree(source / folder, checkout / folder, ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copyfile(source / ".gitignore", checkout / ".gitignore")
+        subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
+        for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+        self.commit_checkout(checkout, "baseline")
+        return checkout
+
+    def make_package_checkout(self, root: Path, *, pyproject_text: str | None = None) -> Path:
+        """Create a clean main checkout holding every packaging input."""
+        source = Path(__file__).parents[1]
+        checkout = root / "the-pilot"
+        checkout.mkdir(parents=True)
+        for name in ("pyproject.toml", "README.md", "LICENSE", ".gitignore"):
+            if pyproject_text is not None and name == "pyproject.toml":
+                (checkout / name).write_text(pyproject_text, encoding="utf-8")
+            else:
+                shutil.copyfile(source / name, checkout / name)
+        shutil.copytree(
+            source / "src", checkout / "src", ignore=shutil.ignore_patterns("__pycache__")
+        )
         subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
         for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
             subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
@@ -191,7 +224,12 @@ class AutoUpdateTest(unittest.TestCase):
             local_skills = gemini / "config/skills"
             local_skills.mkdir(parents=True)
             uv = root / "uv"
-            uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/uv-args"\n')
+            uv.write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$@" > "$HOME/uv-args"\n'
+                'mkdir -p "$HOME/.local/bin"\n'
+                'touch "$HOME/.local/bin/pilot"\n'
+            )
             uv.chmod(0o755)
             env = {"HOME": str(home), "PATH": f"{root}:{os.environ['PATH']}"}
             subprocess.run(
@@ -294,7 +332,9 @@ class AutoUpdateTest(unittest.TestCase):
             )
             self.assertEqual(json.loads(result.stdout)["status"], "up_to_date")
             self.assertTrue((home / ".local/bin/pilot").is_file())
-            self.assertEqual((home / "uv-args").read_text().splitlines(), ["tool", "install", "--force", str(checkout)])
+            arguments = (home / "uv-args").read_text().splitlines()
+            self.assertEqual(arguments[:3], ["tool", "install", "--force"])
+            self.assertTrue(arguments[-1].endswith(".whl"), arguments[-1])
 
     def test_session_start_announces_without_loading_or_syncing_the_profile(self):
         """SessionStart exposes the initial pane state before project maintenance.
@@ -636,8 +676,11 @@ class AutoUpdateTest(unittest.TestCase):
             home = root / "home"
             checkout = home / "the-pilot"
             checkout.mkdir(parents=True)
-            shutil.copytree(Path(__file__).parents[1] / "src", checkout / "src")
-            shutil.copytree(Path(__file__).parents[1] / "bin", checkout / "bin")
+            source = Path(__file__).parents[1]
+            for name in ("pyproject.toml", "README.md", "LICENSE"):
+                shutil.copyfile(source / name, checkout / name)
+            shutil.copytree(source / "src", checkout / "src", ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(source / "bin", checkout / "bin")
             subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.com"], check=True)
             subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True)
@@ -665,7 +708,9 @@ class AutoUpdateTest(unittest.TestCase):
                 installer.self_update(args)
                 report = json.loads((state / "auto_update.json").read_text())
                 self.assertEqual(report["installed_sha"], sha)
-                self.assertIn("tool install --force", uv_log.read_text())
+                install_arguments = uv_log.read_text().splitlines()[-1].split()
+                self.assertEqual(install_arguments[:3], ["tool", "install", "--force"])
+                self.assertTrue(install_arguments[-1].endswith(".whl"), install_arguments[-1])
                 uv_log.write_text("")
                 installer.self_update(args)
                 self.assertEqual(uv_log.read_text(), "")
@@ -676,78 +721,114 @@ class AutoUpdateTest(unittest.TestCase):
                 self.assertEqual(local_report["last_checked_at"], 123456.0)
                 self.assertEqual(local_report["installed_sha"], sha)
 
-    def test_stale_build_staging_is_discarded_before_uv_reinstall_and_digest_converges(self):
-        """Deleted-module build residue cannot keep the same commit reinstalling."""
+    def test_self_update_installs_a_verified_wheel_that_ignores_build_residue(self):
+        """A deleted module left in ignored build staging can neither reach the wheel nor reinstall forever.
+
+        The updater must build only the controlled package files, verify the
+        wheel tree digest against the checkout digest, extract that wheel, and
+        then stop re-calling ``uv`` for the same commit. Failure means a
+        gitignored ``build/lib`` copy of a deleted module is installed again,
+        so the installed package digest can never equal its source and every
+        update check force-reinstalls the same commit.
+        """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home, gemini = root / "home", root / "gemini"
-            checkout = home / "the-pilot"
-            checkout.mkdir(parents=True)
-            source = Path(__file__).parents[1]
-            for name in ("pyproject.toml", "setup.py", "README.md", ".gitignore"):
-                shutil.copyfile(source / name, checkout / name)
-            shutil.copytree(
-                source / "src", checkout / "src",
-                ignore=shutil.ignore_patterns("__pycache__"),
-            )
-            subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
-            for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
-                subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
-            self.commit_checkout(checkout, "source")
+            checkout = self.make_package_checkout(home)
             stale = checkout / "build/lib/the_pilot/assets/autopilot.py"
             stale.parent.mkdir(parents=True)
             stale.write_text("# deleted module residue\n", encoding="utf-8")
-            entry = home / ".local/bin/pilot"
-            entry.parent.mkdir(parents=True)
-            entry.write_text("#!/bin/sh\n")
-            entry.chmod(0o755)
-            package = home / ".local/share/uv/tools/the-pilot/lib/python3.12/site-packages/the_pilot"
-            shutil.copytree(checkout / "src/the_pilot", package)
-            (package / "assets/autopilot.py").write_text("# polluted install\n", encoding="utf-8")
+            egg_info = checkout / "src/the_pilot.egg-info/stale.txt"
+            egg_info.parent.mkdir(parents=True)
+            egg_info.write_text("stale metadata\n", encoding="utf-8")
+            site_packages = home / ".local/share/uv/tools/the-pilot/lib/python3.12/site-packages"
+            polluted = site_packages / "the_pilot/assets"
+            polluted.mkdir(parents=True)
+            (polluted / "autopilot.py").write_text("# polluted install\n", encoding="utf-8")
+            launcher = home / ".local/bin/pilot"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\n# live launcher\n", encoding="utf-8")
+            launcher.chmod(0o755)
             state = gemini / "config/the-pilot/state"
             state.mkdir(parents=True)
             (state / "auto_update.json").write_text(json.dumps({
                 "installed_sha": "old", "installed_tree_digest": "old",
             }))
-            installs: list[Path] = []
-            real_run = installer.subprocess_run
-
-            def fake_run(command, timeout, *, env=None):
-                if command[:3] == ["uv", "tool", "install"]:
-                    checkout_arg = Path(command[-1])
-                    self.assertFalse((checkout_arg / "build").exists())
-                    shutil.rmtree(package)
-                    shutil.copytree(checkout_arg / "src/the_pilot", package)
-                    installs.append(checkout_arg)
-                    return ""
-                return real_run(command, timeout, env=env)
-
+            uv_log = root / "uv.log"
+            uv_wheel = root / "installed.whl"
+            uv = root / "uv"
+            uv.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, shutil, sys, zipfile\n"
+                "from pathlib import Path\n"
+                "arguments = sys.argv[1:]\n"
+                "with open(os.environ['UV_LOG'], 'a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps(arguments) + '\\n')\n"
+                "wheel = Path(arguments[-1])\n"
+                "shutil.copyfile(wheel, os.environ['UV_WHEEL_COPY'])\n"
+                "site_packages = Path(os.environ['SITE_PACKAGES'])\n"
+                "shutil.rmtree(site_packages / 'the_pilot', ignore_errors=True)\n"
+                "with zipfile.ZipFile(wheel) as archive:\n"
+                "    for name in archive.namelist():\n"
+                "        if name.startswith('the_pilot/'):\n"
+                "            archive.extract(name, site_packages)\n"
+                "launcher = Path(os.environ['LAUNCHER'])\n"
+                "launcher.parent.mkdir(parents=True, exist_ok=True)\n"
+                "launcher.write_text('#!/bin/sh\\n')\n"
+                "launcher.chmod(0o755)\n",
+                encoding="utf-8",
+            )
+            uv.chmod(0o755)
             args = installer.build_parser().parse_args([
                 "self-update", "--local-only", "--gemini-dir", str(gemini),
-                "--home-dir", str(home), "--no-project", "--json",
+                "--home-dir", str(home), "--json",
             ])
-            with mock.patch.object(installer.shutil, "which", return_value="/fake/uv"), \
-                    mock.patch.object(installer, "subprocess_run", side_effect=fake_run):
+            env = {
+                "HOME": str(root / "process-home"), "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "UV_LOG": str(uv_log), "UV_WHEEL_COPY": str(uv_wheel),
+                "SITE_PACKAGES": str(site_packages), "LAUNCHER": str(launcher),
+            }
+            before = tree_paths(checkout)
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(installer.shutil, "which", return_value=str(uv)):
                 installer.self_update(args)
-                digest = installer._compute_source_tree_digest(checkout / "src/the_pilot")
-                self.assertEqual(len(installs), 1)
-                self.assertFalse((checkout / "build").exists())
-                self.assertFalse((package / "assets/autopilot.py").exists())
-                self.assertEqual(installer._compute_source_tree_digest(package), digest)
+                digest = packaging.compute_source_tree_digest(checkout / "src/the_pilot")
+                calls = [json.loads(line) for line in uv_log.read_text().splitlines()]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][:3], ["tool", "install", "--force"])
+                self.assertTrue(calls[0][-1].endswith(".whl"), calls[0][-1])
+                wheel_names = set(zipfile.ZipFile(uv_wheel).namelist())
+                self.assertNotIn("the_pilot/assets/autopilot.py", wheel_names)
+                self.assertIn("the_pilot/assets/runtime.py", wheel_names)
+                self.assertEqual(
+                    packaging.compute_wheel_tree_digest(uv_wheel), digest,
+                )
+                installed = site_packages / "the_pilot"
+                self.assertFalse((installed / "assets/autopilot.py").exists())
+                self.assertEqual(packaging.compute_source_tree_digest(installed), digest)
+                self.assertEqual(tree_paths(checkout), before)
+                self.assertFalse((checkout / "dist").exists())
                 metadata = json.loads((state / "auto_update.json").read_text())
                 self.assertEqual(metadata["installed_tree_digest"], digest)
+                uv_log.write_text("")
                 installer.self_update(args)
-                self.assertEqual(len(installs), 1)
+                self.assertEqual(uv_log.read_text(), "")
 
     @unittest.skipUnless(shutil.which("uv"), "uv is required to build a wheel")
-    def test_wheel_build_excludes_deleted_modules_left_in_build_staging(self):
-        """Stale gitignored build staging never reaches the distributable wheel."""
+    def test_offline_uv_build_matches_the_source_digest_without_build_staging(self):
+        """A cold-cache offline build of the checkout ignores ignored build residue.
+
+        Failure means a fresh machine cannot build the wheel without network
+        access, or the wheel carries a deleted module and/or disagrees with
+        the source digest, which would keep the installed tool mismatched and
+        reinstall it on every update check.
+        """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout = root / "checkout"
             checkout.mkdir()
             source = Path(__file__).parents[1]
-            for name in ("pyproject.toml", "setup.py", "README.md", "LICENSE"):
+            for name in ("pyproject.toml", "README.md", "LICENSE"):
                 shutil.copyfile(source / name, checkout / name)
             shutil.copytree(
                 source / "src", checkout / "src",
@@ -756,15 +837,219 @@ class AutoUpdateTest(unittest.TestCase):
             stale = checkout / "build/lib/the_pilot/assets/autopilot.py"
             stale.parent.mkdir(parents=True)
             stale.write_text("# deleted module residue\n", encoding="utf-8")
+            egg_info = checkout / "src/the_pilot.egg-info/stale.txt"
+            egg_info.parent.mkdir(parents=True)
+            egg_info.write_text("stale metadata\n", encoding="utf-8")
+            before = tree_paths(checkout)
+            cache = root / "cache"
+            cache.mkdir()
             result = subprocess.run(
-                ["uv", "build", "--wheel", "--out-dir", str(root / "dist")],
+                ["uv", "build", "--wheel", "--offline", "--out-dir", str(root / "dist")],
                 cwd=checkout, capture_output=True, text=True, timeout=180,
+                env={
+                    **os.environ,
+                    "UV_CACHE_DIR": str(cache),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             wheel = next((root / "dist").glob("*.whl"))
             names = set(zipfile.ZipFile(wheel).namelist())
             self.assertNotIn("the_pilot/assets/autopilot.py", names)
             self.assertIn("the_pilot/assets/runtime.py", names)
+            self.assertEqual(
+                packaging.compute_wheel_tree_digest(wheel),
+                packaging.compute_source_tree_digest(checkout / "src/the_pilot"),
+            )
+            self.assertEqual(tree_paths(checkout), before)
+
+    def test_editable_wheel_matches_the_pep660_contract(self):
+        """Editable installs must expose the checkout through a valid PEP 660 wheel.
+
+        Failure means the documented `python3 -m pip install -e .` cannot
+        import the checkout, lacks the `pilot` console entry point, or ships a
+        RECORD whose hashes and sizes do not match the archive.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = self.make_package_checkout(root)
+            dist = root / "dist"
+            with contextlib.chdir(checkout):
+                filename = packaging.build_editable(str(dist))
+                metadata_name = packaging.prepare_metadata_for_build_editable(
+                    str(root / "metadata")
+                )
+            self.assertEqual(filename, "the_pilot-0.1.0-0.editable-py3-none-any.whl")
+            self.assertEqual(metadata_name, "the_pilot-0.1.0.dist-info")
+            self.assertTrue((root / "metadata/the_pilot-0.1.0.dist-info/METADATA").is_file())
+            record_path = "the_pilot-0.1.0.dist-info/RECORD"
+            with zipfile.ZipFile(dist / filename) as archive:
+                names = archive.namelist()
+                self.assertFalse([name for name in names if name.startswith("the_pilot/")])
+                self.assertEqual(
+                    archive.read("the_pilot.pth").decode("utf-8"),
+                    f"{(checkout / 'src').resolve()}\n",
+                )
+                self.assertEqual(
+                    archive.read("the_pilot-0.1.0.dist-info/entry_points.txt").decode("utf-8"),
+                    "[console_scripts]\npilot = the_pilot.cli:main\n",
+                )
+                record_rows = [
+                    row
+                    for row in archive.read(record_path).decode("utf-8").splitlines()
+                    if row
+                ]
+                self.assertIn(f"{record_path},,", record_rows)
+                for row in record_rows:
+                    if row == f"{record_path},,":
+                        continue
+                    name, digest, size = row.rsplit(",", 2)
+                    content = archive.read(name)
+                    expected = base64.urlsafe_b64encode(
+                        hashlib.sha256(content).digest()
+                    ).rstrip(b"=").decode("ascii")
+                    self.assertEqual(digest.removeprefix("sha256="), expected)
+                    self.assertEqual(int(size), len(content))
+
+    def test_sdist_carries_the_sources_without_build_residue(self):
+        """The PEP 517 sdist must rebuild the package from sources alone.
+
+        Failure means a source release ships a deleted module from ignored
+        `build/` staging, omits the packaging backend or package sources, or
+        declares third-party build requirements that a cold offline
+        environment cannot satisfy.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = self.make_package_checkout(root)
+            stale = checkout / "build/lib/the_pilot/assets/autopilot.py"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("# deleted module residue\n", encoding="utf-8")
+            out = root / "sdist"
+            with contextlib.chdir(checkout):
+                filename = packaging.build_sdist(str(out))
+                requirements = (
+                    packaging.get_requires_for_build_wheel(),
+                    packaging.get_requires_for_build_editable(),
+                    packaging.get_requires_for_build_sdist(),
+                )
+            self.assertEqual(filename, "the_pilot-0.1.0.tar.gz")
+            self.assertEqual(requirements, ([], [], []))
+            with tarfile.open(out / filename) as archive:
+                names = set(archive.getnames())
+            self.assertIn("the_pilot-0.1.0/pyproject.toml", names)
+            self.assertIn("the_pilot-0.1.0/src/the_pilot/packaging.py", names)
+            self.assertIn("the_pilot-0.1.0/src/the_pilot/assets/runtime.py", names)
+            self.assertFalse(any("build/" in name for name in names))
+            self.assertFalse(any("egg-info" in name for name in names))
+
+    def test_wheel_build_or_digest_failure_never_touches_the_live_launcher(self):
+        """Stage 1 failures must leave the current pilot launcher and uv untouched.
+
+        Failure means a broken `pyproject.toml` or a wheel/checkout digest
+        mismatch reaches `uv tool install --force`, which deletes the live
+        `~/.local/bin/pilot` before building and reproduces
+        `exec: pilot: not found` when that build fails.
+        """
+        for case in ("invalid-pyproject", "digest-mismatch"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home, gemini = root / "home", root / "gemini"
+                broken = "[project\n" if case == "invalid-pyproject" else None
+                checkout = self.make_package_checkout(home, pyproject_text=broken)
+                launcher = home / ".local/bin/pilot"
+                launcher.parent.mkdir(parents=True)
+                launcher.write_text("#!/bin/sh\n# live launcher\n", encoding="utf-8")
+                uv_log = root / "uv.log"
+                uv = root / "uv"
+                uv.write_text(
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' \"$@\" >> \"$UV_LOG\"\n"
+                )
+                uv.chmod(0o755)
+                state = gemini / "config/the-pilot/state"
+                state.mkdir(parents=True)
+                (state / "auto_update.json").write_text(json.dumps({
+                    "installed_sha": "old", "installed_tree_digest": "old",
+                }))
+                args = installer.build_parser().parse_args([
+                    "self-update", "--local-only", "--gemini-dir", str(gemini),
+                    "--home-dir", str(home), "--json",
+                ])
+                env = {
+                    "HOME": str(root / "process-home"),
+                    "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                    "UV_LOG": str(uv_log),
+                }
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(installer.shutil, "which", return_value=str(uv)):
+                    if case == "digest-mismatch":
+                        with self.assertRaises(installer.SetupError):
+                            installer._install_uv_tool_from_checkout(checkout, home, "0" * 64)
+                    else:
+                        with self.assertRaises(installer.SetupError) as caught:
+                            installer.self_update(args)
+                        self.assertIn("pyproject.toml", str(caught.exception))
+                        metadata = json.loads((state / "auto_update.json").read_text())
+                        self.assertIn("pyproject.toml", metadata["error"])
+                self.assertEqual(
+                    launcher.read_text(encoding="utf-8"), "#!/bin/sh\n# live launcher\n"
+                )
+                self.assertFalse(uv_log.exists())
+
+    def test_uv_exit_status_and_stderr_reach_the_update_record_and_log(self):
+        """A failed `uv tool install` must preserve its exit code and stderr cause.
+
+        Failure means `auto_update.json` and `auto_update.log` again carry only
+        `returned non-zero exit status 2` with no diagnostic, so the operator
+        cannot tell why the launcher update failed or whether it was retried.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, gemini = root / "home", root / "gemini"
+            checkout = self.make_package_checkout(home)
+            launcher = home / ".local/bin/pilot"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\n# live launcher\n", encoding="utf-8")
+            uv_log = root / "uv.log"
+            uv = root / "uv"
+            uv.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$@\" >> \"$UV_LOG\"\n"
+                "printf '%s\\n' 'error: failed to acquire uv tool lock' >&2\n"
+                "exit 2\n"
+            )
+            uv.chmod(0o755)
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            (state / "auto_update.json").write_text(json.dumps({
+                "installed_sha": "old", "installed_tree_digest": "old",
+            }))
+            args = installer.build_parser().parse_args([
+                "self-update", "--local-only", "--gemini-dir", str(gemini),
+                "--home-dir", str(home), "--json",
+            ])
+            env = {
+                "HOME": str(root / "process-home"),
+                "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "UV_LOG": str(uv_log),
+            }
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(installer.shutil, "which", return_value=str(uv)):
+                with self.assertRaises(installer.SetupError) as caught:
+                    installer.self_update(args)
+            failure = str(caught.exception)
+            self.assertIn("returned non-zero exit status 2", failure)
+            self.assertIn("error: failed to acquire uv tool lock", failure)
+            metadata = json.loads((state / "auto_update.json").read_text())
+            self.assertIn("returned non-zero exit status 2", metadata["error"])
+            self.assertIn("error: failed to acquire uv tool lock", metadata["error"])
+            log = (state / "auto_update.log").read_text(encoding="utf-8")
+            self.assertIn("returned non-zero exit status 2", log)
+            self.assertIn("error: failed to acquire uv tool lock", log)
+            self.assertEqual(
+                launcher.read_text(encoding="utf-8"), "#!/bin/sh\n# live launcher\n"
+            )
 
     def test_project_only_zero_cooldown_syncs_clean_main_checkout_and_skips_dirty_or_branch(self):
         """Project-only sync updates clean main immediately and ignores dirty or feature branches."""

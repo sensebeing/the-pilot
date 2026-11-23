@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import importlib
 import json
 import os
@@ -27,6 +26,7 @@ import time
 from typing import Any
 
 from . import compiler as profile_compiler
+from . import packaging
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .assets.runtime import append_log_event
 from .profile import (
@@ -86,6 +86,7 @@ DEFAULT_PROFILE_PATH = ASSETS_DIR / "profile.default.json"
 ENGINE_SOURCE_PATH = ASSETS_DIR / ENGINE_NAME
 AUTO_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 LOCAL_SYNC_INTERVAL_SECONDS = 30
+_compute_source_tree_digest = packaging.compute_source_tree_digest
 
 
 class SetupError(Exception):
@@ -767,33 +768,6 @@ def _discover_checkout(explicit: str | None, *, home_dir: Path | None = None) ->
     return None, False
 
 
-def _compute_source_tree_digest(src_root: Path) -> str:
-    """Hash source Python files and bundled assets deterministically."""
-    digest = hashlib.sha256()
-    if not src_root.is_dir():
-        return digest.hexdigest()
-    files = []
-    for path in src_root.rglob("*"):
-        if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
-            continue
-        relative = path.relative_to(src_root)
-        if path.suffix == ".py" or relative.parts[:1] == ("assets",):
-            files.append((relative.as_posix(), path))
-    for relative, path in sorted(files):
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _discard_stale_build_artifacts(checkout: Path) -> None:
-    """Drop ignored build staging before uv builds a wheel from the checkout."""
-    build = checkout / "build"
-    if build.exists():
-        shutil.rmtree(build)
-
-
 def _installed_uv_package_dir(home_dir: Path) -> Path | None:
     root = home_dir / ".local/share/uv/tools/the-pilot"
     matches = sorted(root.glob("lib/python*/site-packages/the_pilot"))
@@ -819,6 +793,42 @@ def _uv_tool_stale(
         or metadata.get("installed_tree_digest") != digest
         or (package is not None and _compute_source_tree_digest(package) != digest)
     )
+
+
+def _install_uv_tool_from_checkout(
+    checkout: Path, home_dir: Path, expected_digest: str,
+) -> None:
+    """Swap the installed uv tool only after a verified wheel exists.
+
+    Stage 1 builds the wheel in-process from the checkout's controlled files
+    and enforces that its package tree digest equals the checkout digest. That
+    step never touches the live launcher, so an unbuildable or inconsistent
+    checkout leaves ``~/.local/bin/pilot`` exactly as it was. Stage 2 makes the
+    single ``uv tool install --force <wheel>`` call and verifies the launcher
+    and installed package afterwards.
+    """
+    with tempfile.TemporaryDirectory(prefix="the-pilot-wheel-") as directory:
+        try:
+            wheel_path = packaging.build_wheel_from_checkout(checkout, Path(directory))
+        except (OSError, ValueError) as exc:
+            raise SetupError(f"Could not build a wheel from {checkout}: {exc}") from exc
+        wheel_digest = packaging.compute_wheel_tree_digest(wheel_path)
+        if wheel_digest != expected_digest:
+            raise SetupError(
+                f"Built wheel digest {wheel_digest} does not match checkout digest {expected_digest}"
+            )
+        subprocess_run(["uv", "tool", "install", "--force", str(wheel_path)], 30)
+    launcher = home_dir / ".local/bin/pilot"
+    if not launcher.exists():
+        raise SetupError(f"uv tool install did not create {launcher}")
+    installed_package = _installed_uv_package_dir(home_dir)
+    if installed_package is not None:
+        installed_digest = packaging.compute_source_tree_digest(installed_package)
+        if installed_digest != expected_digest:
+            raise SetupError(
+                f"Installed package digest {installed_digest} does not match "
+                f"checkout digest {expected_digest}"
+            )
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:
@@ -923,7 +933,7 @@ def maybe_activate_newer_checkout_package(package_path: list[str]) -> bool:
         return False
     package_path.insert(0, str(package))
     boot_package_dir = PACKAGE_DIR
-    for name in ("assets.runtime", "defaults", "project", "profile", "compiler", "distill", "runtime", "installer"):
+    for name in ("assets.runtime", "defaults", "project", "profile", "compiler", "distill", "packaging", "runtime", "installer"):
         module = sys.modules.get(f"the_pilot.{name}")
         if module is not None:
             active = importlib.reload(module)
@@ -1173,8 +1183,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                         if after_sha != before_sha or _uv_tool_stale(
                             home_dir, after_sha, checkout_digest, existing_metadata, managed=True,
                         ):
-                            _discard_stale_build_artifacts(checkout)
-                            subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
+                            _install_uv_tool_from_checkout(checkout, home_dir, checkout_digest)
                         report["installed_sha"] = after_sha
                         report["installed_tree_digest"] = checkout_digest
                 report["head_sha"] = subprocess_run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], 20).strip()
@@ -1233,8 +1242,25 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def _command_failure_detail(exc: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> str:
+    """Keep the tail of a failed command's stderr, falling back to its stdout."""
+    stderr = exc.stderr or ""
+    stdout = exc.stdout or ""
+    output = stderr if stderr.strip() else stdout
+    return output.strip()[-600:]
+
+
 def subprocess_run(command: list[str], timeout: int, *, env: Mapping[str, str] | None = None) -> str:
-    result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout, env=env)
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.CalledProcessError as exc:
+        detail = _command_failure_detail(exc)
+        message = f"Command {command} returned non-zero exit status {exc.returncode}"
+        raise SetupError(f"{message}: {detail}" if detail else str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        detail = _command_failure_detail(exc)
+        message = f"Command {command} timed out after {timeout}s"
+        raise SetupError(f"{message}: {detail}" if detail else str(exc)) from exc
     return result.stdout or result.stderr
 
 
