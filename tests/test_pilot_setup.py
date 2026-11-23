@@ -606,9 +606,8 @@ class CompilerTest(unittest.TestCase):
                     )
 
     def test_two_tier_guidance_survives_worker_hot_switch(self) -> None:
-        # Failure means the Tier-1 AGY / Tier-2 worker contract, cross-repo
-        # callback, or `,worker` slot rewriting is missing or diverges from a
-        # fresh compile.
+        # Failure means generated guidance can send coordinators down an invalid
+        # dispatch path, take mail before Orca wakes them, or drift on `,worker`.
         profile = resolve_profile(self.base, preset="recommended")
         section = profile_compiler.render_orchestration_section(profile)
         for required in (
@@ -622,7 +621,14 @@ class CompilerTest(unittest.TestCase):
             'worker-start --spec "<任务契约>" --worktree current --agent claude --json',
             'worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent claude --setup run --json',
             'worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent claude --setup run --json',
-            "worker-start --worktree path:<子工作区路径> --terminal <handle>",
+            "--spec-file <路径>",
+            "--setup skip",
+            "scene=NONE",
+            "Orca 原生唤醒",
+            "orca orchestration check --environment local --json",
+            "自动标记已处理",
+            "reply --id <msg_id>",
+            'orca orchestration send --environment local --to dispatch:<dispatch_id> --subject "<主题>" --body-file <路径> --json',
             "worker_done",
             "仅文件组织可调整",
             "不得降低最简领域模型",
@@ -637,6 +643,11 @@ class CompilerTest(unittest.TestCase):
             "重读起点、盘点现状、零基对账",
         ):
             self.assertIn(required, section)
+        self.assertNotIn("check --wait", section)
+        self.assertNotIn("--ack", section)
+        self.assertNotIn(
+            "worker-start --worktree path:<子工作区路径> --terminal <handle>", section
+        )
         for initial, target in (
             (["claude", "codex"], ["codex", "claude"]),
             (["claude"], ["claude", "codex"]),

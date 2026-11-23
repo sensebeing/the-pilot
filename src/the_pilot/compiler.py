@@ -177,10 +177,11 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
    - 同仓子工作区 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须指定 `--parent-worktree active` 或 `path:<当前路径>`）。
    - 跨仓回传 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，`worker_done` 唤醒主会话。
    - 禁止平级 `--worktree new-top-level`/`--no-parent`。仅用户明确要求独立长期 Tier-1 可用 `--no-parent`（原生 {coordinator_label}），需回执则绑定 Dealer thread 或 `orca orchestration send`。
+   - 多行契约用 `--spec-file <路径>`，纯文档/只读子任务可用 `--setup skip`。
 4. **交互与验收**：
-   - `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 等回执，`reply`/`send` 裁决和指导，`--ack` 确认消费。
-   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。代码落地后的独立架构审查优先级：**`{review_priority}`**（文档/方案阶段在当前主会话内完成，不拉起单独审查子会话）。
-   - 未达标用 `worker-show` 取已验证终端，建整改 Task，`worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回；通过后同终端 follow-up 通知合入并推送 `main`。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
+   - `worker-start`、`reply` 或 `send` 后即以 `scene=NONE` 结束回合，等待 Orca 原生唤醒（严禁后台挂 `--wait` 查信、`manage_task` 轮询或 `sleep`）；唤醒后按需执行 `orca orchestration check --environment local --json`（消费即自动标记已处理），用 `reply --id <msg_id>` 或 `send` 裁决指导，多行正文统一用 `--body-file`。
+   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。须先通过秒级本地静态门禁再运行模型级 `guard review`；代码落地后的独立架构审查优先级：**`{review_priority}`**（文档/方案阶段在当前主会话内完成，不拉起单独审查子会话）。
+   - 未达标整改或审查通过通知合入并推送 `main`，均使用 `orca orchestration send --environment local --to dispatch:<dispatch_id> --subject "<主题>" --body-file <路径> --json` 派回（若用 `worker-start --terminal <handle>` 续跑须省略 `--worktree`）。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
 
 
 def render_orchestration_block(profile: dict[str, Any]) -> str:
