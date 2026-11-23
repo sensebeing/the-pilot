@@ -222,7 +222,12 @@ class AutoUpdateTest(unittest.TestCase):
                 "self-update", "--project-only", "--home-dir", str(home),
                 "--gemini-dir", str(gemini), "--json",
             ])
-            with mock.patch.dict(os.environ, {"HOME": str(root / "process-home"), "THE_PILOT_GEMINI_DIR": str(gemini)}):
+            with mock.patch.dict(os.environ, {
+                "HOME": str(root / "process-home"),
+                "THE_PILOT_GEMINI_DIR": str(gemini),
+                "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
+            }):
                 report = installer.self_update(args)
             self.assertIsNone(report["error"])
             self.assertEqual(report["local_source_status"], "updated")
@@ -742,7 +747,12 @@ class AutoUpdateTest(unittest.TestCase):
             state.mkdir(parents=True)
             sha = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             (state / "auto_update.json").write_text(json.dumps({"installed_sha": "old", "installed_tree_digest": "old"}))
-            env = {"HOME": str(root / "process-home"), "PATH": f"{root}:{os.environ['PATH']}", "UV_LOG": str(uv_log)}
+            env = {
+                "HOME": str(root / "process-home"), "PATH": f"{root}:{os.environ['PATH']}",
+                "UV_LOG": str(uv_log),
+                "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
+            }
             with mock.patch.dict(os.environ, env, clear=False):
                 args = installer.build_parser().parse_args(["self-update", "--gemini-dir", str(gemini), "--home-dir", str(home), "--no-project", "--json"])
                 installer.self_update(args)
@@ -1022,6 +1032,8 @@ class AutoUpdateTest(unittest.TestCase):
                     "HOME": str(root / "process-home"),
                     "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                     "UV_LOG": str(uv_log),
+                    "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                    "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
                 }
                 with mock.patch.dict(os.environ, env), \
                         mock.patch.object(installer.shutil, "which", return_value=str(uv)):
@@ -1075,6 +1087,8 @@ class AutoUpdateTest(unittest.TestCase):
                 "HOME": str(root / "process-home"),
                 "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                 "UV_LOG": str(uv_log),
+                "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(installer.shutil, "which", return_value=str(uv)):
@@ -1172,6 +1186,8 @@ class AutoUpdateTest(unittest.TestCase):
                 "HOME": str(root / "process-home"),
                 "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                 "UV_LOG": str(uv_log),
+                "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
             }
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(installer.shutil, "which", return_value=str(uv)):
@@ -1232,7 +1248,11 @@ class AutoUpdateTest(unittest.TestCase):
             metadata = {"last_checked_at": time.time()}
             (state / "auto_update.json").write_text(json.dumps(metadata))
             args = installer.build_parser().parse_args(["self-update", "--project-only", "--gemini-dir", str(gemini), "--home-dir", str(home), "--json"])
-            update_env = {"THE_PILOT_ENABLE_AUTO_UPDATE": "1", "THE_PILOT_DISABLE_AUTO_UPDATE": "0"}
+            update_env = {
+                "THE_PILOT_ENABLE_AUTO_UPDATE": "1", "THE_PILOT_DISABLE_AUTO_UPDATE": "0",
+                "UV_TOOL_DIR": str(home / ".local/share/uv/tools"),
+                "UV_TOOL_BIN_DIR": str(home / ".local/bin"),
+            }
             with mock.patch.dict(os.environ, update_env), mock.patch.object(installer.shutil, "which", return_value=None):
                 unmanaged_report = installer.self_update(args)
             self.assertIsNone(unmanaged_report["error"])
