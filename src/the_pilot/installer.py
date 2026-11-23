@@ -787,6 +787,13 @@ def _compute_source_tree_digest(src_root: Path) -> str:
     return digest.hexdigest()
 
 
+def _discard_stale_build_artifacts(checkout: Path) -> None:
+    """Drop ignored build staging before uv builds a wheel from the checkout."""
+    build = checkout / "build"
+    if build.exists():
+        shutil.rmtree(build)
+
+
 def _installed_uv_package_dir(home_dir: Path) -> Path | None:
     root = home_dir / ".local/share/uv/tools/the-pilot"
     matches = sorted(root.glob("lib/python*/site-packages/the_pilot"))
@@ -1166,6 +1173,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                         if after_sha != before_sha or _uv_tool_stale(
                             home_dir, after_sha, checkout_digest, existing_metadata, managed=True,
                         ):
+                            _discard_stale_build_artifacts(checkout)
                             subprocess_run(["uv", "tool", "install", "--force", str(checkout)], 30)
                         report["installed_sha"] = after_sha
                         report["installed_tree_digest"] = checkout_digest
