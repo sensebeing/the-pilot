@@ -45,8 +45,12 @@ To register the skills globally across coding agents, run
    of enabled shortcuts, modes, worker selection, sync and recovery.
 
 `apply` preserves other Hook groups, unmanaged GEMINI.md prose and custom scenes.
-On the default Gemini root, it adds the `AGY_CLI_OSC7501` block to `~/.zshenv`
-and existing bash or POSIX shell startup files. `pilot status` reports block drift.
+It registers `SessionStart`, `PreInvocation`, and `Stop`. The installed runtime
+owns the paired OSC 7501 activity and OSC 2 title frames used by Orca.
+On the default Gemini root, `apply` manages the shell startup block in `~/.zshenv`
+and existing bash or POSIX shell startup files. The block delegates interactive
+`agy` startup and resume announcements to the installed runtime. `pilot status`
+reports block drift.
 `pilot uninstall` removes owned files, including any obsolete project snapshot.
 It strips the shell block while retaining the startup files.
 Tests and demonstrations must pass explicit temporary `--gemini-dir` and

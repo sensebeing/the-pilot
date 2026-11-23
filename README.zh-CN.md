@@ -172,8 +172,11 @@ pilot status --json
 ```
 
 使用默认的 `$HOME/.gemini` 安装时，`pilot apply` 和升级会在 `~/.zshenv` 及已存在的
-`~/.bash_profile`、`~/.bashrc`、`~/.profile` 中托管 `AGY_CLI_OSC7501`。
-新启动的 Shell 默认关闭 Antigravity CLI 内置的 OSC 7501 状态上报，并保留显式设置。
+`~/.bash_profile`、`~/.bashrc`、`~/.profile` 中维护托管启动块。启动块将
+`AGY_CLI_OSC7501` 默认为 `off`，并在交互式 `agy` 新开或恢复会话前宣告初始状态。
+显式设为 `on` 时跳过启动宣告。`SessionStart` 钩子也会宣告新会话状态，无需等待项目同步。
+Pilot 在同一帧中先写 OSC 7501 活动状态，再写 OSC 2 标题，使 Orca 能在终端输出丢失后
+恢复就绪状态。等待回答或保留草稿时使用中性标题，防止投递覆盖输入。
 
 ---
 
@@ -238,7 +241,7 @@ pilot status --json
 | `pilot sync` | 手工编辑已安装的 `scenes/*.md` 后，将其同步刷新到 `GEMINI.md` 场景段。 |
 | `pilot set <shortcut> <template>` | 将口令模板保存到 `profile.json`。修改仓库口令时，在对应工作区运行。 |
 | `pilot log [--lines <n>]` | 查看 `state/pilot.log` 中的结构化运行时投递日志。 |
-| `pilot hook --event <PreInvocation\|Stop>` | 供宿主 Agent 运行时调用的生命周期 Hook 入口。 |
+| `pilot hook --event <SessionStart\|PreInvocation\|Stop>` | 供宿主 Agent 运行时调用的生命周期 Hook 入口。 |
 
 ---
 

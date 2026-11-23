@@ -44,7 +44,8 @@ PROJECT = json.loads(PROJECT_PATH.read_text(encoding="utf-8"))
 resolve_profile = partial(resolve_user_profile, project=PROJECT)
 compile_bundle = partial(profile_compiler.compile_bundle, project=PROJECT)
 ENGINE_REL = Path("config/the-pilot/runtime.py")
-SHELL_ENV_BLOCK = (
+SHELL_ENV_BLOCK = profile_compiler.render_shell_env_block()
+LEGACY_SHELL_ENV_BLOCK = (
     '# BEGIN THE_PILOT_SHELL_ENV\n'
     'export AGY_CLI_OSC7501="${AGY_CLI_OSC7501:-off}"\n'
     '# END THE_PILOT_SHELL_ENV\n'
@@ -345,14 +346,13 @@ class CompilerTest(unittest.TestCase):
 
     def test_render_and_merge_default_block(self) -> None:
         """The managed export must preserve explicit values and stay idempotent."""
-        self.assertEqual(profile_compiler.render_shell_env_block(), SHELL_ENV_BLOCK)
         original = "# user shell settings\nalias ls='ls -h'\n"
         merged = profile_compiler.merge_shell_env(original)
         self.assertEqual(merged, original + "\n" + SHELL_ENV_BLOCK)
         self.assertEqual(profile_compiler.merge_shell_env(merged), merged)
 
         suffix = "export USER_SETTING=1\n\n"
-        stale = SHELL_ENV_BLOCK.replace(":-off", ":-on")
+        stale = LEGACY_SHELL_ENV_BLOCK
         self.assertEqual(
             profile_compiler.merge_shell_env(original + stale + suffix),
             original + SHELL_ENV_BLOCK + suffix,
@@ -374,7 +374,7 @@ class CompilerTest(unittest.TestCase):
 
     def test_malformed_markers_fail_closed(self) -> None:
         """An ambiguous marker range must never cause user shell text to be removed."""
-        begin, _, end = SHELL_ENV_BLOCK.splitlines(keepends=True)
+        begin, *_, end = SHELL_ENV_BLOCK.splitlines(keepends=True)
         for malformed in (
             begin, end, end + begin, begin + SHELL_ENV_BLOCK, SHELL_ENV_BLOCK * 2,
             "echo " + SHELL_ENV_BLOCK, SHELL_ENV_BLOCK.rstrip("\n") + " user comment\n",
@@ -5058,24 +5058,118 @@ class OscTargetResolutionTest(unittest.TestCase):
             return runtime._resolve_osc_target()
 
     def test_frames_match_orca_program_status_contract(self) -> None:
-        """The exact wire frames Orca strips and maps to program activity.
+        """Orca receives activity before the title, together in one write.
 
-        Failure means Orca no longer recognizes the emitted sequence and the
-        pane status regresses to unknown.
-        resident-fact: status: OSC 7501 帧文本是 Orca
-        `terminal.program-status.v1` 的外部协议。
+        Failure means a dropped activity signal can stall delivery or a Ready
+        title can briefly allow delivery over a pending question.
+        resident-fact: status: OSC 7501 在前，OSC 2 在后，阻塞时标题为中性。
         """
-        self.assertEqual(
-            runtime.OSC_7501_WORKING,
-            "\x1b]7501;state=working:app=antigravity\x07",
+        cases = (
+            (runtime.OSC_7501_WORKING,
+             b"\x1b]7501;state=working:app=antigravity\x07\x1b]2;\xe2\xa0\x8b Antigravity Working\x07"),
+            (runtime.OSC_7501_DONE,
+             b"\x1b]7501;state=done:app=antigravity\x07\x1b]2;Antigravity Ready\x07"),
+            (runtime.OSC_7501_WAITING_QUESTION,
+             b"\x1b]7501;state=blocked:kind=question:app=antigravity\x07\x1b]2;Antigravity\x07"),
         )
-        self.assertEqual(
-            runtime.OSC_7501_DONE, "\x1b]7501;state=done:app=antigravity\x07"
+        target = self.root / "osc.log"
+        with self.isolated_env(
+            THE_PILOT_GEMINI_DIR=str(self.root / "gemini"), THE_PILOT_OSC_TARGET=str(target)
+        ), mock.patch.object(runtime.os, "write", wraps=os.write) as write:
+            for frame, expected in cases:
+                with self.subTest(frame=frame):
+                    self.assertTrue(runtime.emit_osc_7501(frame))
+                    write.assert_called_once_with(mock.ANY, expected)
+                    write.reset_mock()
+        self.assertEqual(target.read_bytes(), b"".join(expected for _, expected in cases))
+
+    def test_boot_prefers_agent_tty_but_can_find_the_predecessor_shell(self) -> None:
+        """Boot can reach Orca's pane before the agent process exists.
+
+        Failure means shell resumes leave the pane unannounced or an internal
+        shell PTY is preferred over an existing agent's pane.
+        resident-fact: status: 启动优先使用 agy 的 TTY，否则在三层 Shell 内解析。
+        """
+        for parent, grandparent, expected in (
+            ((40, "ttys041", "-/bin/zsh"), (1, "ttys042", "/bin/agy"), "ttys042"),
+            ((40, "ttys041", "-/bin/zsh"), (1, "?", "orca"), "ttys041"),
+            ((40, "??", "/bin/sh"), (1, "ttys042", "/bin/bash"), "ttys042"),
+            ((40, "../../etc/passwd", "/bin/sh"), (1, "ttys042", "python3"), None),
+            ((40, "ttys041", "python3"), (1, "ttys042", "/bin/zsh"), "ttys042"),
+        ):
+            with self.subTest(parent=parent, grandparent=grandparent), self.isolated_env(
+                ORCA_PANE_KEY="pane-1"
+            ), mock.patch.object(runtime.os, "getppid", return_value=50), mock.patch.object(
+                runtime, "_ps_process", side_effect={50: parent, 40: grandparent}.get
+            ):
+                self.assertEqual(
+                    runtime._resolve_boot_osc_target(),
+                    (Path("/dev") / expected, False) if expected else None,
+                )
+
+    def test_boot_isolation_and_opt_out_leave_the_terminal_untouched(self) -> None:
+        """A sandbox, non-Orca shell, or built-in emitter owns no boot write.
+
+        Failure means boot probes a host terminal from a test or competes
+        with the user's explicitly enabled built-in emitter.
+        resident-fact: status: 无显式目标时隔离环境和非 Orca shell 不探测终端。
+        """
+        for env in (
+            {},
+            {"ORCA_PANE_KEY": "pane-1", "THE_PILOT_GEMINI_DIR": str(self.root)},
+            {"ORCA_PANE_KEY": "pane-1", "ORCA_AUTOPILOT_GEMINI_DIR": str(self.root)},
+            {"ORCA_PANE_KEY": "pane-1", "THE_PILOT_OSC_TARGET": " NONE "},
+            {"AGY_CLI_OSC7501": " ON ", "THE_PILOT_OSC_TARGET": str(self.root / "osc.log")},
+        ):
+            with self.subTest(env=env), self.isolated_env(AGY_CLI_OSC7501="off"), mock.patch.dict(
+                os.environ, env
+            ), mock.patch.object(runtime.os, "getppid") as getppid:
+                self.assertEqual(runtime.main(["announce-boot"]), 0)
+                getppid.assert_not_called()
+        self.assertFalse((self.root / "osc.log").exists())
+
+    def test_announce_boot_writes_the_interactive_entry_state(self) -> None:
+        """Boot honors agy's flag arity and stops parsing flags at the first prompt.
+
+        Failure means an idle resume appears to be working, or a prompt or
+        one-shot CLI command leaves a false idle signal in the pane.
+        resident-fact: status: 启动参数遵守 Go flag 位置参数规则，一次性命令不发帧。
+        """
+        cases = (
+            ([], runtime.OSC_7501_DONE),
+            (["-c"], runtime.OSC_7501_DONE),
+            (["--continue"], runtime.OSC_7501_DONE),
+            (["--conversation=cid"], runtime.OSC_7501_DONE),
+            (["--conversation", "cid"], runtime.OSC_7501_DONE),
+            (["-model", "Gemini 4 Carbon (High)", "-conversation", "cid"], runtime.OSC_7501_DONE),
+            (["--dangerously-skip-permissions", "--model", "Gemini 4 Carbon (High)",
+              "--conversation", "cid"], runtime.OSC_7501_DONE),
+            (["--prompt-interactive", "   "], runtime.OSC_7501_DONE),
+            (["--prompt-interactive", "go"], runtime.OSC_7501_WORKING),
+            (["-i=go"], runtime.OSC_7501_WORKING),
+            (["-"], runtime.OSC_7501_WORKING),
+            (["go", "--help"], runtime.OSC_7501_WORKING),
+            (["go", "--", "mcp"], runtime.OSC_7501_WORKING),
+            (["--", "mcp"], runtime.OSC_7501_WORKING),
+            (["--model", "--help"], runtime.OSC_7501_DONE),
+            *(([flag], "") for flag in ("-h", "--help", "-help", "-v", "--version", "-version")),
+            *(([flag, "go"], "") for flag in ("-p", "--print", "-print", "--prompt", "-prompt")),
+            *(([subcommand, "list"], "") for subcommand in ("mcp", "models", "update")),
         )
-        self.assertEqual(
-            runtime.OSC_7501_WAITING_QUESTION,
-            "\x1b]7501;state=blocked:kind=question:app=antigravity\x07",
-        )
+        target = self.root / "osc.log"
+        with self.isolated_env(
+            THE_PILOT_GEMINI_DIR=str(self.root / "gemini"), THE_PILOT_OSC_TARGET=str(target)
+        ):
+            os.environ.pop("AGY_CLI_OSC7501", None)
+            for args, frame in cases:
+                with self.subTest(args=args):
+                    target.unlink(missing_ok=True)
+                    self.assertEqual(runtime.main(["announce-boot", "--", *args]), 0)
+                    if frame:
+                        self.assertEqual(target.read_bytes(), frame.encode("utf-8"))
+                    else:
+                        self.assertFalse(target.exists())
+            self.assertNotIn("announce-boot", runtime.build_parser().format_help())
 
     def test_shell_wrapper_walks_up_to_the_agy_process(self) -> None:
         """Only the ancestor agy's tty names Orca's pane, not a child PTY.
@@ -5576,7 +5670,7 @@ class GlobalGuidanceTest(unittest.TestCase):
         self.home.mkdir()
         profile = self.home / ".profile"
         original = b"export USER_SETTING=1\r\n"
-        profile.write_bytes(original)
+        profile.write_bytes(original + b"\r\n" + LEGACY_SHELL_ENV_BLOCK.encode())
         report = self.default_apply("--preset", "recommended")
         self.assertEqual(report["shell_env"], [
             str((self.home / ".zshenv").resolve()), str(profile.resolve()),
@@ -5590,6 +5684,46 @@ class GlobalGuidanceTest(unittest.TestCase):
         result = run_setup_default(self.root, "uninstall")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(profile.read_bytes(), original)
+
+    def test_shell_boot_wrapper_announces_before_interactive_agy_only(self) -> None:
+        """POSIX shells forward argv and preserve status ownership at startup.
+
+        Failure means a resume starts without pane status, its arguments
+        change, or a script or built-in emitter is wrapped unexpectedly.
+        resident-fact: status: 交互包装先宣告再启动 agy，保留参数且尊重开关。
+        """
+        self.default_apply("--preset", "recommended")
+        block = self.root / "pilot-shell-env"
+        block.write_text((self.home / ".zshenv").read_text())
+        target = self.root / "osc.log"
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        agy = bin_dir / "agy"
+        agy.write_text('#!/bin/sh\nif [ -f "$THE_PILOT_OSC_TARGET" ]; then\n'
+                       '  cat "$THE_PILOT_OSC_TARGET"\nfi\n'
+                       'printf "[%s]\\n" "$AGY_CLI_OSC7501" "$@"\n')
+        agy.chmod(0o755)
+        env = {"HOME": str(self.home), "ZDOTDIR": str(self.root), "PILOT_BLOCK": str(block),
+               "PATH": f"{bin_dir}:{Path(sys.executable).parent}:/usr/bin:/bin",
+               "THE_PILOT_GEMINI_DIR": str(self.gemini), "THE_PILOT_OSC_TARGET": str(target)}
+        invocation = '. "$PILOT_BLOCK"; agy --model "Gemini model" --conversation "id 1"'
+        for shell in ("/bin/sh", "/bin/bash", "/bin/zsh"):
+            if not Path(shell).is_file():
+                continue
+            subprocess.run([shell, "-n", str(block)], env=env, check=True, capture_output=True)
+            for mode, override, frame in (
+                ("-ic", {}, runtime.OSC_7501_DONE),
+                ("-ic", {"AGY_CLI_OSC7501": "on"}, ""),
+                ("-c", {}, ""),
+            ):
+                with self.subTest(shell=shell, mode=mode, override=override):
+                    target.unlink(missing_ok=True)
+                    result = subprocess.run([shell, mode, invocation], env={**env, **override},
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    setting = override.get("AGY_CLI_OSC7501", "off")
+                    self.assertEqual(result.stdout, frame + f"[{setting}]\n[--model]\n"
+                                     "[Gemini model]\n[--conversation]\n[id 1]\n")
 
     def test_status_reports_residual_shell_blocks_without_profile(self) -> None:
         """A missing profile must leave residual shell blocks and invalid markers visible."""

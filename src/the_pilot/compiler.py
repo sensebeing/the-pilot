@@ -185,10 +185,20 @@ def render_orchestration_block(profile: dict[str, Any]) -> str:
 
 
 def render_shell_env_block() -> str:
-    """Disable AGY's built-in OSC 7501 emitter by default."""
+    """Delegate interactive boot status to the installed runtime by default."""
     return (
         f"{SHELL_ENV_BEGIN}\n"
         'export AGY_CLI_OSC7501="${AGY_CLI_OSC7501:-off}"\n'
+        'case "$-" in\n'
+        '  *i*)\n'
+        '    agy() {\n'
+        '      if [ "${AGY_CLI_OSC7501:-off}" != "on" ] && [ -r "$HOME/.gemini/config/the-pilot/runtime.py" ]; then\n'
+        '        python3 "$HOME/.gemini/config/the-pilot/runtime.py" announce-boot -- "$@" >/dev/null 2>&1 || true\n'
+        '      fi\n'
+        '      command agy "$@"\n'
+        '    }\n'
+        '    ;;\n'
+        'esac\n'
         f"{SHELL_ENV_END}\n"
     )
 
@@ -474,7 +484,7 @@ def merge_hooks_json(existing: dict[str, Any], engine_path: str) -> dict[str, An
                 "timeout": 10,
             }
         ]
-        for event in ("PreInvocation", "Stop")
+        for event in ("SessionStart", "PreInvocation", "Stop")
     }
     registry.pop(LEGACY_HOOK_GROUP, None)
     registry[HOOK_GROUP] = commands
