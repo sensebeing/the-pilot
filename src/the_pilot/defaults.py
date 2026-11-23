@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from .assets.runtime import UNIVERSAL_ENTRY_KEYS
+from .assets.runtime import UNIVERSAL_ENTRY_KEYS, UNIVERSAL_ENTRY_SPECS
 
 PROFILE_SCHEMA = "the-pilot-profile/v1"
 
@@ -111,28 +111,7 @@ HARNESS_ORCHESTRATION_SENTENCE = (
 )
 
 DEFAULT_SPECS = {'entry_order': list(UNIVERSAL_ENTRY_KEYS),
- 'entry_specs': {'r': {'command_id': 'CMD_MOD_REVIEW',
-                       'description': '对指定功能/模块进行完整代码与最简架构 Review',
-                       'requires_arg': True,
-                       'usage': 'r <module>',
-                       'template': '详细 review 一下目前 {arg} '
-                                   '的整个代码和设计，从整个架构去看是否有更简洁、更加根本的设计或收敛方案，判断是否有过度设计、工程质量是否达标、是否已经达到最简架构要求'},
-                 'rt': {'command_id': 'CMD_TOOL_REVIEW',
-                        'description': '以 Anthropic 内部架构师视角对指定类别工具进行整体 Review',
-                        'requires_arg': True,
-                        'usage': 'rt <工具类别>',
-                        'template': '再整体 review 下 {arg} 相关工具，以 anthropic '
-                                    '内部架构师的视角，工具的设计是否最佳，是否已经最简洁'},
-                 'd': {'command_id': 'CMD_CLARIFY_DESIGN',
-                       'description': '先澄清需求并产出最符合工程架构的详细设计方案，再用 Orca 编排实施',
-                       'requires_arg': False,
-                       'usage': 'd [需求描述]',
-                       'template': '你先和我澄清需求和产出最符合工程架构的详细设计方案。然后再用项目的 orca 编排模式来推进子会话/子工作区实施'},
-                 'pull': {'command_id': 'CMD_GIT_PULL',
-                          'description': '先拉下代码到最新 origin/main',
-                          'requires_arg': False,
-                          'usage': 'pull',
-                          'template': '先拉下代码到最新 origin/main'}},
+ 'entry_specs': UNIVERSAL_ENTRY_SPECS,
  'presets': {'recommended': {'pilot': {'mode': 'gate', 'max_consecutive_auto_turns': 8},
                              'scenes': {'enabled_scenes': ['plan-and-orchestrate',
                                                            'architecture-re-review',

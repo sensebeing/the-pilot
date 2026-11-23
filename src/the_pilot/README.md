@@ -6,7 +6,7 @@
 - `compiler.py`: pure rendering and managed-document merges; no IO.
 - `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs, plus scene pipeline assessment of the installed profile and scene contracts.
 - `installer.py`: the sole owner of global installation, `self-update`, installation locking and artifact writes. It removes obsolete installed project snapshots during apply and uninstall.
-- `assets/runtime.py`: the standalone runtime, copied unchanged on install. It owns per-turn workspace shortcut discovery and validation, terminal lifecycle status and `agy` launch argument semantics, including pane resolution and the paired OSC 7501 activity and OSC 2 title write. It owns the single synchronous Stop submission, post-Stop turn-start observation from the session and transcript, and settlement of unconfirmed delivery in the original pane. The package reuses its shortcut schema, comma command rendering and log rotation.
+- `assets/runtime.py`: the standalone runtime, copied unchanged on install. It owns per-turn workspace shortcut discovery and validation, terminal lifecycle status and `agy` launch argument semantics, including pane resolution and the paired OSC 7501 activity and OSC 2 title write. It owns the single synchronous Stop submission, post-Stop turn-start observation from the session and transcript, and settlement of unconfirmed delivery in the original pane. The package reuses its universal entry catalog, shortcut schema, comma command rendering and log rotation.
 - `runtime.py`: subprocess adapter to the installed runtime (no second engine).
 - `cli.py`: installer versus runtime command routing only.
 

@@ -29,7 +29,7 @@ from typing import Any
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .assets.runtime import append_log_event
-from .profile import resolve_profile, validate_profile
+from .profile import UnknownShortcutOverride, resolve_profile, validate_profile
 from .defaults import (
     DEFAULT_SPECS,
     DELIVER_STRATEGIES,
@@ -259,8 +259,8 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
         installed_profile = None
     if installed_profile is not None:
         try:
-            report["installed_profile"] = validate_profile(installed_profile)
-        except profile_compiler.ProfileError as exc:
+            report["installed_profile"] = _resolve_installed_profile(gemini_dir, installed_profile)
+        except (SetupError, profile_compiler.ProfileError) as exc:
             report["installed_profile_error"] = str(exc)
     return report
 
@@ -314,9 +314,11 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     preset = args.preset if args.preset is not None else (
         None if reusing_installed else "recommended"
     )
-    profile = resolve_profile(
-        base, preset=preset, overrides=overrides_from_args(args)
-    )
+    overrides = overrides_from_args(args)
+    if reusing_installed:
+        profile = _resolve_installed_profile(gemini_dir, base, overrides=overrides)
+    else:
+        profile = resolve_profile(base, preset=preset, overrides=overrides)
 
     bundle = profile_compiler.compile_bundle(profile)
     current_gemini = read_text(gemini_md)
@@ -333,9 +335,9 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         if name not in bundle.scenes and (scenes_dir / name).is_file()
     ]
 
-    (pilot_dir / "project.json").unlink(missing_ok=True)
     atomic_write_text(profile_path, json_text(bundle.profile_json))
     atomic_write_text(config_path, json_text(bundle.config_json))
+    (pilot_dir / "project.json").unlink(missing_ok=True)
     for filename, text in bundle.scenes.items():
         atomic_write_text(scenes_dir / filename, text)
     atomic_write_text(engine_path, engine_text, mode=0o755)
@@ -388,6 +390,20 @@ def _installed_path(gemini_dir: Path, name: str) -> Path:
         return canonical
     legacy = gemini_dir / LEGACY_AUTOPILOT_SUBDIR / name
     return legacy if legacy.exists() else canonical
+
+
+def _resolve_installed_profile(
+    gemini_dir: Path, raw: dict[str, Any], *, overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read retired catalog identities only when profile aliases cannot resolve an override."""
+    try:
+        return resolve_profile(raw, preset=None, overrides=overrides)
+    except UnknownShortcutOverride:
+        config = read_json_object(_installed_path(gemini_dir, "config.json"), "config.json") or {}
+        entries = config.get("entry_shortcuts")
+        if not isinstance(entries, dict) or not entries:
+            raise
+        return resolve_profile(raw, preset=None, overrides=overrides, installed_entries=entries)
 
 
 def default_install_home(gemini_dir: Path) -> Path | None:
@@ -657,7 +673,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         return report
 
     existing_config = read_json_object(config_path, "config.json") or {}
-    bundle = profile_compiler.compile_bundle(profile)
+    bundle = profile_compiler.compile_bundle(_resolve_installed_profile(gemini_dir, profile))
     report["drift"].extend(_global_guidance_drift(bundle.profile_json, gemini_dir))
     report.update(
         {

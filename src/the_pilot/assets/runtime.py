@@ -78,7 +78,40 @@ MODES = ("gate", "confirm", "off")
 PROFILE_SCHEMA = "the-pilot-profile/v1"
 LEGACY_PROFILE_SCHEMA = "orca-autopilot-profile/v1"
 PROJECT_SCHEMA = "the-pilot-project/v1"
-UNIVERSAL_ENTRY_KEYS = ("r", "rt", "d", "pull")
+UNIVERSAL_ENTRY_SPECS = {
+    "r": {
+        "command_id": "CMD_MOD_REVIEW",
+        "description": "对指定功能/模块进行完整代码与最简架构 Review",
+        "requires_arg": True,
+        "usage": "r <module>",
+        "template": (
+            "详细 review 一下目前 {arg} 的整个代码和设计，从整个架构去看是否有更简洁、"
+            "更加根本的设计或收敛方案，判断是否有过度设计、工程质量是否达标、是否已经达到最简架构要求"
+        ),
+    },
+    "rt": {
+        "command_id": "CMD_TOOL_REVIEW",
+        "description": "以 Anthropic 内部架构师视角对指定类别工具进行整体 Review",
+        "requires_arg": True,
+        "usage": "rt <工具类别>",
+        "template": "再整体 review 下 {arg} 相关工具，以 anthropic 内部架构师的视角，工具的设计是否最佳，是否已经最简洁",
+    },
+    "d": {
+        "command_id": "CMD_CLARIFY_DESIGN",
+        "description": "先澄清需求并产出最符合工程架构的详细设计方案，再用 Orca 编排实施",
+        "requires_arg": False,
+        "usage": "d [需求描述]",
+        "template": "你先和我澄清需求和产出最符合工程架构的详细设计方案。然后再用项目的 orca 编排模式来推进子会话/子工作区实施",
+    },
+    "pull": {
+        "command_id": "CMD_GIT_PULL",
+        "description": "先拉下代码到最新 origin/main",
+        "requires_arg": False,
+        "usage": "pull",
+        "template": "先拉下代码到最新 origin/main",
+    },
+}
+UNIVERSAL_ENTRY_KEYS = tuple(UNIVERSAL_ENTRY_SPECS)
 RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent", "pilot", "autopilot"})
 LEGACY_PROJECT_FIELDS = frozenset({"presets", "scene_specs", "deliver_content", "feedback_closeout"})
 RECOVERY_FAILED_MESSAGE = (
@@ -420,7 +453,7 @@ def load_config() -> tuple[dict[str, Any] | None, str, str]:
 
 
 def validate_project_entries(raw: Any) -> dict[str, dict[str, Any]]:
-    """Validate the v1 overlay envelope and its executable shortcut specs."""
+    """Validate and expand the shortcut specs declared by a v1 overlay."""
     if not isinstance(raw, dict) or raw.get("schema") != PROJECT_SCHEMA:
         raise ValueError(f"project.schema must be {PROJECT_SCHEMA}")
     allowed = {"schema", "projectId", "description", "entry_order", "entry_specs", *LEGACY_PROJECT_FIELDS}
@@ -441,10 +474,17 @@ def validate_project_entries(raw: Any) -> dict[str, dict[str, Any]]:
         raise ValueError("entry_order must list each entry spec once and may include built-in entries")
     identities = set()
     required = {"command_id", "description", "requires_arg", "usage", "template"}
-    for key, spec in specs.items():
+    normalized = {}
+    for key in order:
+        if key not in specs:
+            continue
+        fields = specs[key]
         if not is_entry_key(key) or key in RESERVED_COMMA_ALIASES:
             raise ValueError(f"Invalid or reserved entry key: {key}")
-        if not isinstance(spec, dict) or not required <= set(spec) or set(spec) - required - {"workflow_type"}:
+        if not isinstance(fields, dict) or set(fields) - required - {"workflow_type"}:
+            raise ValueError(f"Invalid entry spec: {key}")
+        spec = {**UNIVERSAL_ENTRY_SPECS.get(key, {}), **fields}
+        if not required <= set(spec):
             raise ValueError(f"Invalid entry spec: {key}")
         if not isinstance(spec["requires_arg"], bool):
             raise ValueError(f"{key}.requires_arg must be boolean")
@@ -454,7 +494,8 @@ def validate_project_entries(raw: Any) -> dict[str, dict[str, Any]]:
         if spec["command_id"] in identities:
             raise ValueError("Project entry command IDs must be unique")
         identities.add(spec["command_id"])
-    return {key: specs[key] for key in order if key in specs}
+        normalized[key] = spec
+    return normalized
 
 
 def entry_comma_command(key: str, shortcut: dict[str, Any]) -> dict[str, Any]:

@@ -19,12 +19,17 @@ from .defaults import (
 from .project import ProfileError, project_specs
 
 
+class UnknownShortcutOverride(ProfileError):
+    """The override could not be resolved from the supplied shortcut identities."""
+
+
 def resolve_profile(
     base: dict[str, Any],
     *,
     preset: str | None = "recommended",
     overrides: dict[str, Any] | None = None,
     project: dict[str, Any] | None = None,
+    installed_entries: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge a base profile with one preset and the caller's overrides."""
     specs = project_specs(project)
@@ -39,11 +44,12 @@ def resolve_profile(
             merged,
             _normalize_pilot_section(_copy_mapping(overrides, "profile overrides")),
         )
-    return validate_profile(merged, project=project)
+    return validate_profile(merged, project=project, installed_entries=installed_entries)
 
 
 def _shortcut_override_aliases(
     shortcuts: dict[str, Any], specs: dict[str, Any],
+    installed_entries: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], set[str]]:
     """Map every alias ``template_overrides`` accepts to its canonical key.
 
@@ -125,9 +131,11 @@ def _shortcut_override_aliases(
     if isinstance(enabled_entry, list):
         for key in enabled_entry:
             spec = specs["entry_specs"].get(key) if isinstance(key, str) else None
-            if not isinstance(spec, dict):
-                continue
-            add_secondary(str(spec.get("command_id") or ""), key)
+            if isinstance(spec, dict):
+                add_secondary(spec["command_id"], key)
+            installed = installed_entries.get(key) if installed_entries else None
+            if isinstance(installed, dict) and isinstance(installed.get("command_id"), str):
+                add_secondary(installed["command_id"], key)
     if isinstance(custom_entry, dict):
         for key, spec in custom_entry.items():
             if not isinstance(key, str):
@@ -161,7 +169,10 @@ def _custom_comma_command_id(alias: str, spec: Any = None) -> str:
     )
 
 
-def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict[str, Any]:
+def validate_profile(
+    raw: Any, *, project: dict[str, Any] | None = None,
+    installed_entries: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return a normalized copy of ``raw`` or raise ``ProfileError``."""
     specs = project_specs(project)
     profile = _copy_mapping(raw, "profile")
@@ -253,6 +264,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             "custom_comma": custom_comma,
         },
         specs,
+        installed_entries,
     )
     active_command_ids: set[str] = set()
     for command_id in (
@@ -500,7 +512,7 @@ def _normalize_overrides(
             raise ProfileError("template_overrides 的键必须是非空字符串")
         canonical = _resolve_override_alias(raw_key, aliases, ambiguous)
         if canonical is None:
-            raise ProfileError(f"template_overrides 指向不存在的口令 {raw_key!r}")
+            raise UnknownShortcutOverride(f"template_overrides 指向不存在的口令 {raw_key!r}")
         _record_override(overrides, canonical, raw_key, item)
     return overrides
 

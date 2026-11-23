@@ -29,10 +29,12 @@ def _merge(base: dict, overlay: dict) -> dict:
 def normalize_project(raw: Any) -> dict[str, Any]:
     """Reject unknown fields, invalid content, and scene path escapes."""
     try:
-        validate_project_entries(raw)
+        entries = validate_project_entries(raw)
     except ValueError as exc:
         raise ProfileError(str(exc)) from exc
     normalized = copy.deepcopy(raw)
+    if "entry_specs" in normalized:
+        normalized["entry_specs"] = entries
     for name, preset in (normalized.get("presets") or {}).items():
         if not isinstance(preset, dict):
             raise ProfileError(f"Invalid preset: {name}")

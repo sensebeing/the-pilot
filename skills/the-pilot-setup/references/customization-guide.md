@@ -2,38 +2,41 @@
 
 ## Three configuration tiers
 
-Universal templates live in the package. `.pilot/project.json` carries a project
-policy overlay. Installed `profile.json` stores personal preferences; generated
-`config.json` and GEMINI.md guidance are derived from those inputs.
-Installed scene files can be edited for runtime use; `pilot sync` refreshes the
-GEMINI.md scene summary. An upgrade recompiles scenes from the profile/overlay.
+Universal templates live in the package. Installed `profile.json` stores
+personal preferences. The installer compiles global `config.json`, scene files,
+and agent guidance from these inputs. `pilot sync` refreshes the GEMINI.md scene
+summary after a scene edit. Upgrade recompiles the built-in scenes from the
+installed profile and removes any obsolete installed project snapshot.
 
-Discovery precedence is `--no-project`, explicit `--project` (root or JSON),
-installed `config/the-pilot/project.json`, nearest cwd ancestor's `.pilot/project.json`,
-then universal defaults. Apply persists the selected normalized overlay; universal
-apply deletes a previous link. Probe and status never write the link.
+Put shared repository shortcuts in `.pilot/project.json`. PreInvocation finds
+the nearest overlay from the active workspace and resolves its `entry_order`
+and `entry_specs` for that turn. A built-in entry can override individual fields
+and inherit the rest from the universal catalog. Use the repository's `AGENTS.md` or `CLAUDE.md`,
+runbooks, and authorized skills for delivery, notifications, and closeout rules.
+The project overlay stays in the repository.
 
 ## Profile dimensions
 
 - `orchestration`: Tier-1 `coordinator_agent` (fixed to native `agy`, accepting
   the `antigravity` alias) plus ordered `worker_agents` and `review_agents`.
 - `pilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (`1..50`).
-- `scenes`: enabled scenes, delivery strategy, feedback notification preference,
-  and additional guardrails. An overlay defines what the notification preference
-  means; it never grants external-send permission by itself.
+- `scenes`: enabled scenes, delivery strategy, and additional guardrails.
+  Repository runbooks and current authorization govern external sends.
 - `shortcuts`: enabled built-in entries, custom entries, custom comma commands,
   template overrides keyed by entry, alias or command identity.
 
-Presets: recommended uses gate/8 turns/four scenes/four universal entries;
-conservative uses confirm/4 turns; orchestration-only uses off/no scenes/no entries.
-A project may override these presets. User overrides are applied last.
+The recommended preset enables gate mode, eight turns, four scenes, and four
+universal entries. The conservative preset uses confirm mode and four turns.
+The orchestration-only preset switches Pilot off and disables scenes and entry
+shortcuts, including workspace entries. User overrides are applied last.
 
 `pilot apply --help` lists individual override flags. `--profile` accepts inline
 JSON, a file, or `@file`, and explicitly replaces installed preferences;
 `--preset` explicitly resets them to that preset. Otherwise apply reuses an
-installed `profile.json`, so attaching or detaching a project keeps personal
-preferences. `--upgrade` requires an installed `profile.json` and cannot be
-combined with `--preset` or `--profile`. Use `pilot set` for durable template edits, and
+installed `profile.json`. `--upgrade` requires an installed `profile.json` and
+cannot be combined with `--preset` or `--profile`. Run `pilot set` inside the
+workspace to change a repository shortcut's personal template. That preference
+applies when the workspace supplies the shortcut. Use
 `pilot distill --days 7 --json` (see [distillation-guide.md](distillation-guide.md))
 to discover repeated user prompt patterns across local coding agents before
 proposing custom shortcuts or scene guardrails.
@@ -44,7 +47,9 @@ proposing custom shortcuts or scene guardrails.
 - Unmanaged scene markers: remove or relocate the obsolete manual scene block;
   installation refuses ambiguous managed-region ownership before artifact writes.
 - Unknown delivery: inspect `pilot log`, then explicitly request recovery.
-- Invalid overlay/profile: fix its reported contract error; nothing is installed.
+- Invalid workspace overlay: check `pilot log` for `project_overlay_invalid`.
+  The hook keeps the universal catalog available. An invalid profile must be
+  repaired before installation.
 - Worker priority updates are locked and persistent; isolated roots do not sync
   other real client configuration files. A default `$HOME/.gemini` install also
   maintains the managed `THE_PILOT_ORCHESTRATION` block in `~/.claude/CLAUDE.md`

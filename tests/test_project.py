@@ -85,6 +85,54 @@ class ProjectTest(unittest.TestCase):
         self.cli("apply", "--entry-shortcuts", "r,pull", cwd=repo)
         self.assertIn("Local review sample", json.dumps(self.pre(repo, ",r sample", "enabled-r")))
 
+    def test_partial_builtin_overlay_inherits_the_universal_entry_contract(self):
+        """A v1 overlay can replace a built-in template and inherit its other fields."""
+        repo = self.root / "repo"
+        project = {
+            "schema": self.project["schema"], "projectId": "review-workspace",
+            "entry_specs": {"r": {"template": "Workspace review {arg}"}},
+        }
+        self.workspace_overlay(repo, project)
+        self.cli("apply", cwd=repo)
+        expected = {**DEFAULT_SPECS["entry_specs"]["r"], "template": "Workspace review {arg}"}
+        self.assertEqual(normalize_project(project)["entry_specs"]["r"], expected)
+        for command in ("r", ",r"):
+            self.assertIn("Workspace review sample", json.dumps(self.pre(repo, f"{command} sample", command)))
+        self.assertNotIn("Workspace review", json.dumps(self.pre(self.root, "r sample", "neutral")))
+
+    def test_upgrade_migrates_legacy_project_command_id_overrides(self):
+        """The retired installed catalog can identify a durable workspace override by its old ID."""
+        repo = self.root / "repo"
+        self.workspace_overlay(repo, self.project)
+        self.cli("apply", cwd=repo)
+        pilot = self.gemini / "config/the-pilot"
+        profile_path = pilot / "profile.json"
+        config_path = pilot / "config.json"
+        clean_config = json.loads(config_path.read_text())
+        profile = json.loads(profile_path.read_text())
+        profile["shortcuts"]["enabled_entry"].append("fb")
+        command_id = self.project["entry_specs"]["fb"]["command_id"]
+        legacy_bundle = compile_bundle(profile, project=self.project)
+        override = "Legacy personal feedback {arg}"
+        profile["shortcuts"]["template_overrides"] = {command_id: override}
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+        config_path.write_text(json.dumps(legacy_bundle.config_json), encoding="utf-8")
+        snapshot = pilot / "project.json"
+        snapshot.write_text(json.dumps(self.project), encoding="utf-8")
+
+        expected = {"fb": override}
+        probe = self.cli("probe")
+        self.assertEqual(probe.get("installed_profile", {}).get("shortcuts", {}).get("template_overrides"), expected)
+        self.assertTrue(self.cli("status")["drift"])
+        self.assertEqual(json.loads(profile_path.read_text()), profile)
+        self.assertTrue(snapshot.is_file())
+        self.cli("apply", "--upgrade", cwd=self.root)
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(json.loads(profile_path.read_text())["shortcuts"]["template_overrides"], expected)
+        self.assertEqual(json.loads(config_path.read_text()), clean_config)
+        self.assertEqual(self.cli("status")["drift"], [])
+        self.assertIn("Legacy personal feedback sample", json.dumps(self.pre(repo, ",fb sample", "upgraded")))
+
     def test_workspace_shortcut_overrides_use_all_supported_identities(self):
         """A profile override can name a workspace shortcut by key, alias, or command ID."""
         repo = self.root / "repo"
