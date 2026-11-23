@@ -1243,9 +1243,13 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _command_failure_detail(exc: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> str:
-    """Keep the tail of a failed command's stderr, falling back to its stdout."""
-    stderr = exc.stderr or ""
-    stdout = exc.stdout or ""
+    """Keep the tail of a failed command's stderr, falling back to its stdout.
+
+    ``TimeoutExpired`` carries raw bytes even when ``subprocess.run`` was called
+    with ``text=True``, so both streams are decoded before formatting.
+    """
+    stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+    stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
     output = stderr if stderr.strip() else stdout
     return output.strip()[-600:]
 

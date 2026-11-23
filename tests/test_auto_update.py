@@ -1,6 +1,7 @@
 """Focused contracts for the zero-touch update paths."""
 import base64
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -911,6 +912,26 @@ class AutoUpdateTest(unittest.TestCase):
                     self.assertEqual(digest.removeprefix("sha256="), expected)
                     self.assertEqual(int(size), len(content))
 
+    def test_wheel_record_stays_valid_csv_with_a_comma_in_a_package_path(self):
+        """Wheel RECORD is a CSV file, so a comma in an asset name must be quoted.
+
+        Failure means a legitimate bundled asset such as
+        `assets/report,2026.json` produces an ambiguous RECORD row that
+        installers and audit tools cannot parse as three fields.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = self.make_package_checkout(root)
+            asset = checkout / "src/the_pilot/assets/report,2026.json"
+            asset.write_text("{}\n", encoding="utf-8")
+            wheel = packaging.build_wheel_from_checkout(checkout, root / "dist")
+            with zipfile.ZipFile(wheel) as archive:
+                record = archive.read("the_pilot-0.1.0.dist-info/RECORD").decode("utf-8")
+            rows = list(csv.reader(io.StringIO(record)))
+            self.assertNotIn("\r", record)
+            self.assertTrue(all(len(row) == 3 for row in rows), rows)
+            self.assertIn("the_pilot/assets/report,2026.json", {row[0] for row in rows})
+
     def test_sdist_carries_the_sources_without_build_residue(self):
         """The PEP 517 sdist must rebuild the package from sources alone.
 
@@ -937,9 +958,13 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(requirements, ([], [], []))
             with tarfile.open(out / filename) as archive:
                 names = set(archive.getnames())
+                pkg_info = archive.extractfile("the_pilot-0.1.0/PKG-INFO").read().decode("utf-8")
             self.assertIn("the_pilot-0.1.0/pyproject.toml", names)
+            self.assertIn("the_pilot-0.1.0/PKG-INFO", names)
             self.assertIn("the_pilot-0.1.0/src/the_pilot/packaging.py", names)
             self.assertIn("the_pilot-0.1.0/src/the_pilot/assets/runtime.py", names)
+            self.assertIn("Metadata-Version: 2.1", pkg_info)
+            self.assertIn("Name: the-pilot", pkg_info)
             self.assertFalse(any("build/" in name for name in names))
             self.assertFalse(any("egg-info" in name for name in names))
 
@@ -1050,6 +1075,27 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(
                 launcher.read_text(encoding="utf-8"), "#!/bin/sh\n# live launcher\n"
             )
+
+    def test_subprocess_timeout_decodes_byte_stderr_into_the_error(self):
+        """A timed-out command's raw byte stderr must become readable diagnostics.
+
+        `subprocess.TimeoutExpired.stderr` is bytes even when `text=True` was
+        requested, so failure here means a timeout raises AttributeError or
+        renders as `b'...'`, hiding the cause from `auto_update.json` and the
+        log.
+        """
+        script = (
+            "import sys, time\n"
+            "sys.stderr.write('timed out acquiring uv tool lock')\n"
+            "sys.stderr.flush()\n"
+            "time.sleep(5)\n"
+        )
+        with self.assertRaises(installer.SetupError) as caught:
+            installer.subprocess_run([sys.executable, "-c", script], 1)
+        failure = str(caught.exception)
+        self.assertIn("timed out after 1s", failure)
+        self.assertIn("timed out acquiring uv tool lock", failure)
+        self.assertNotIn("b'", failure)
 
     def test_project_only_zero_cooldown_syncs_clean_main_checkout_and_skips_dirty_or_branch(self):
         """Project-only sync updates clean main immediately and ignores dirty or feature branches."""

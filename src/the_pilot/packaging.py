@@ -15,6 +15,7 @@ its checkout activation, and this module must stay importable in a bare
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import io
 import os
@@ -209,18 +210,24 @@ def _temporary_sibling(destination: Path) -> Path:
     return Path(handle.name)
 
 
-def _record_line(name: str, content: bytes) -> str:
+def _record_row(name: str, content: bytes) -> tuple[str, str, str]:
     digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii")
-    return f"{name},sha256={digest},{len(content)}"
+    return name, f"sha256={digest}", str(len(content))
+
+
+def _record_text(rows: list[tuple[str, str, str]]) -> str:
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerows(rows)
+    return buffer.getvalue()
 
 
 def _write_wheel(
     destination: Path, entries: list[tuple[str, bytes, int]], record_name: str,
 ) -> None:
-    record_lines = [_record_line(name, content) for name, content, _ in entries]
-    record_lines.append(f"{record_name},,")
-    record_lines.sort()
-    record = ("\n".join(record_lines) + "\n").encode("utf-8")
+    record_rows = [_record_row(name, content) for name, content, _ in entries]
+    record_rows.append((record_name, "", ""))
+    record_rows.sort()
+    record = _record_text(record_rows).encode("utf-8")
     payload = [*entries, (record_name, record, 0o100644)]
     temporary = _temporary_sibling(destination)
     try:
@@ -326,22 +333,31 @@ def build_sdist(sdist_directory: str, config_settings: dict | None = None) -> st
     stem = _distribution_stem(project)
     destination_directory = Path(sdist_directory)
     destination_directory.mkdir(parents=True, exist_ok=True)
-    archive_entries = [
-        (name, checkout / name) for name in SOURCE_DOCUMENTS if (checkout / name).is_file()
+    archive_entries: list[tuple[str, bytes, int]] = [
+        (name, (checkout / name).read_bytes(), 0o644)
+        for name in SOURCE_DOCUMENTS
+        if (checkout / name).is_file()
     ]
     archive_entries.extend(
-        (f"src/{PACKAGE_NAME}/{relative}", path) for relative, path in package_files
+        (
+            f"src/{PACKAGE_NAME}/{relative}",
+            path.read_bytes(),
+            0o755 if path.stat().st_mode & 0o111 else 0o644,
+        )
+        for relative, path in package_files
+    )
+    archive_entries.append(
+        ("PKG-INFO", _metadata_text(project, checkout).encode("utf-8"), 0o644)
     )
     destination = destination_directory / f"{stem}.tar.gz"
     temporary = _temporary_sibling(destination)
     try:
         with tarfile.open(temporary, "w:gz") as archive:
-            for relative, path in sorted(archive_entries):
-                content = path.read_bytes()
+            for relative, content, mode in sorted(archive_entries):
                 info = tarfile.TarInfo(f"{stem}/{relative}")
                 info.size = len(content)
                 info.mtime = 0
-                info.mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
+                info.mode = mode
                 archive.addfile(info, io.BytesIO(content))
         os.replace(temporary, destination)
     finally:
