@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
+from .assets.runtime import entry_comma_command
 from .defaults import (
     AGENT_LABELS,
     COORDINATOR_AGENTS,
@@ -109,15 +110,7 @@ def build_comma_commands(profile: dict[str, Any], *, project: dict[str, Any] | N
         command_id = shortcut["command_id"]
         if command_id in commands:
             raise ProfileError(f"命令身份冲突：{command_id}")
-        commands[command_id] = {
-            "command_id": command_id,
-            "canonical_key": key,
-            "aliases": [f",{key}"],
-            "scene": "",
-            "title": shortcut["description"],
-            "template": shortcut["template"],
-            **({"workflow_type": shortcut["workflow_type"]} if "workflow_type" in shortcut else {}),
-        }
+        commands[command_id] = entry_comma_command(key, shortcut)
     for alias in sorted(profile["shortcuts"]["custom_comma"]):
         spec = profile["shortcuts"]["custom_comma"][alias]
         template = _override(overrides, alias) or spec["template"]
@@ -180,7 +173,7 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
    - 多行契约用 `--spec-file <路径>`，纯文档/只读子任务可用 `--setup skip`。
 4. **交互与验收**：
    - `worker-start`、`reply` 或 `send` 后即以 `scene=NONE` 结束回合，等待 Orca 原生唤醒（严禁后台挂 `--wait` 查信、`manage_task` 轮询或 `sleep`）；唤醒后按需执行 `orca orchestration check --environment local --json`（消费即自动标记已处理），用 `reply --id <msg_id>` 或 `send` 裁决指导，多行正文统一用 `--body-file`。
-   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。须先通过秒级本地静态门禁再运行模型级 `guard review`；代码落地后的独立架构审查优先级：**`{review_priority}`**（文档/方案阶段在当前主会话内完成，不拉起单独审查子会话）。
+   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查当前仓库工程门禁与架构规则（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。须先通过秒级本地静态门禁再运行模型级 `guard review`；代码落地后的独立架构审查优先级：**`{review_priority}`**（文档/方案阶段在当前主会话内完成，不拉起单独审查子会话）。
    - 未达标整改或审查通过通知合入并推送 `main`，均使用 `orca orchestration send --environment local --to dispatch:<dispatch_id> --subject "<主题>" --body-file <路径> --json` 派回（若用 `worker-start --terminal <handle>` 续跑须省略 `--worktree`）。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
 
 
@@ -377,8 +370,8 @@ def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
 
 1. **第一步：任务性质二分类**：
    - **前置铁律**：先查同链路近 7~14 天修复史与端到端拓扑，判断唯一 owner 和最简根治路径；复发不得叠黑白名单、局部重试或表象补丁。
-   - **A 类 — 确定性收敛**：正确行为与边界已由产品设计、模块契约、`peq.*`、事实或当前明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界；含内部根因修复、授权内冗余清理、工具回执、并发/超时及质量收敛。`gate=auto` 按实际进度逐步推进（定位 → 出详细方案 → 方案级架构 review → 编排实施），不得跳过方案设计或方案复审，不重复提问。
-   - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按 AGENTS.md 与 `peq.architecture-simplicity` 说明不变量与替代保护，最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；所有进度均沿用此边界：B 类方案/裁决未确认标 `gate=pause`，已确认边界内 `gate=auto` 单步递进，prod 发布、未授权真实 E2E 除外。
+   - **A 类 — 确定性收敛**：正确行为与边界已由产品设计、模块契约、仓库工程门禁、事实或当前明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界；含内部根因修复、授权内冗余清理、工具回执、并发/超时及质量收敛。`gate=auto` 按实际进度逐步推进（定位 → 出详细方案 → 方案级架构 review → 编排实施），不得跳过方案设计或方案复审，不重复提问。
+   - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按当前仓库的 AGENTS.md 与最简架构规则说明不变量与替代保护，最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；所有进度均沿用此边界：B 类方案/裁决未确认标 `gate=pause`，已确认边界内 `gate=auto` 单步递进，prod 发布、未授权真实 E2E 除外。
    - **简化边界**：历史提交/合同不能豁免最简架构；说明不变量、复发成因及唯一 owner 的替代保护，授权边界按 A/B 分类，不重复裁决。
 2. **第二步：场景与 Prompt（真源 `~/.gemini/config/the-pilot/scenes/*.md`）**：{routing}
 3. **第三步：正文可见建议与唯一隐藏标签**：正文必须显示 `- **,1（主推）**：<主推文本>`，可选 `- **,2（备选）**：<备选文本>`、`- **,3（备选）**：<备选文本>`，不可只藏在注释里。
@@ -535,13 +528,10 @@ def _render_scene_file(name: str, profile: dict[str, Any], *, project: dict[str,
     spec = specs['scene_specs'][name]
     strategy = profile["scenes"]["deliver_strategy"]
     deliver = specs['deliver_content'][strategy]
-    feedback_enabled = profile["scenes"]["enable_feedback_email"]
     guardrails = profile["scenes"]["guardrails"]
     description = str(spec["description"])
     description = description.replace("{{DELIVER_COMPLETION}}", deliver["completion"])
-    description = description.replace(
-        "{{FEEDBACK_TRIGGER}}", specs["feedback_closeout"][str(feedback_enabled).lower()]["trigger"]
-    )
+    description = description.replace("{{FEEDBACK_TRIGGER}}", "")
     fallback = str(spec["fallback_prompt"]).replace(
         "{{DELIVER_FALLBACK_PROMPT}}", deliver["fallback"]
     )
@@ -552,14 +542,7 @@ def _render_scene_file(name: str, profile: dict[str, Any], *, project: dict[str,
     body = body.replace("{{DELIVER_EXAMPLES}}", deliver["examples"])
     body = body.replace("{{RE_REVIEW_PROGRESS}}", deliver["re_review_progress"])
     body = body.replace("{{RE_REVIEW_ALT}}", deliver["re_review_alt"])
-    body = body.replace(
-        "{{FEEDBACK_CLOSEOUT_BLOCK}}",
-        specs["feedback_closeout"][str(feedback_enabled).lower()]["block"],
-    )
-    body = body.replace(
-        "{{FEEDBACK_REPLY_EXAMPLES}}",
-        specs["feedback_closeout"][str(feedback_enabled).lower()]["examples"],
-    )
+    body = body.replace("{{FEEDBACK_CLOSEOUT_BLOCK}}", "").replace("{{FEEDBACK_REPLY_EXAMPLES}}", "")
     body = body.replace("{{CUSTOM_GUARDRAILS}}", _custom_guardrails(guardrails))
     meta = [
         "---",

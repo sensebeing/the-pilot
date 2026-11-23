@@ -165,13 +165,11 @@ npx skills add sensebeing/the-pilot --global --agent '*'
 3. **提炼历史习惯并应用配置**：
 
 ```sh
-pilot probe --no-project --json
+pilot probe --json
 pilot distill --days 7 --json
-pilot apply --no-project --preset recommended --json
+pilot apply --preset recommended --json
 pilot status --json
 ```
-
-如果当前仓库包含 `<repo>/.pilot/project.json` 项目扩展配置，可在 `pilot apply` 时加上 `--project /path/to/repo`。
 
 使用默认的 `$HOME/.gemini` 安装时，`pilot apply` 和升级会在 `~/.zshenv` 及已存在的
 `~/.bash_profile`、`~/.bashrc`、`~/.profile` 中维护托管启动块。启动块将
@@ -188,8 +186,8 @@ Pilot 在同一帧中先写 OSC 7501 活动状态，再写 OSC 2 标题，使 Or
 
 | 预设档位 | Pilot 模式 | 连续自动轮数上限 | 启用场景 | 默认交付策略 | 默认口令 | 适用场景 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `recommended` | `gate` | `8` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull`（含项目扩展） | 推荐默认：流程性阶段自动回车推进，遇到产品/架构裁决或生产发布暂停确认。 |
-| `conservative` | `confirm` | `4` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull`（含项目扩展） | 人工确认模式：每轮结束把建议预填到输入框，始终等待你按 `Enter` 发送。 |
+| `recommended` | `gate` | `8` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull` | 推荐默认：流程性阶段自动回车推进，遇到产品/架构裁决或生产发布暂停确认。 |
+| `conservative` | `confirm` | `4` | 全部 4 个场景 | `merge_dev_e2e` | `r`、`rt`、`d`、`pull` | 人工确认模式：每轮结束把建议预填到输入框，始终等待你按 `Enter` 发送。 |
 | `orchestration-only` | `off` | `4` | 无（`[]`） | `merge_dev_e2e` | 无（`[]`） | 仅启用 Orca 主从职责与分支隔离规范，关闭回合末自动预填。 |
 
 ### 四维定制能力矩阵（`the-pilot-profile/v1`）
@@ -198,47 +196,31 @@ Pilot 在同一帧中先写 OSC 7501 活动状态，再写 OSC 2 标题，使 Or
 | --- | --- | --- | --- |
 | 1. 主从编排（Orchestration） | `coordinator_agent`<br>`worker_agents`<br>`review_agents` | 主会话：`agy`（兼容 `antigravity`）<br>子会话：`["codex", "claude"]` 或 `["claude", "codex"]`<br>审查：`["codex", "claude", "agy"]` | Tier-1 原生 AGY 主会话（设计/Review）与 Tier-2 派发子会话（分支编码）职责分离、父子工作区隔离、跨仓回调与执行器优先级。 |
 | 2. 自动推进（Pilot） | `mode`<br>`max_consecutive_auto_turns` | 模式：`gate` \| `confirm` \| `off`<br>轮数上限：`1..50`（默认 `8`） | 控制 `gate=auto` 是否自动回车，以及达到连续自动推进上限后回退为仅预填。 |
-| 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | 交付策略：`merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>反馈发信：`false` \| `true` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线。 |
+| 3. 场景状态机（Scenes） | `enabled_scenes`<br>`deliver_strategy`<br>`guardrails` | 交付策略：`merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only` | 控制启用哪些场景、交付阶段生成哪些验证指令，以及按场景注入自定义质量底线。 |
 | 4. 快捷口令（Shortcuts） | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | 通用口令：`r`、`rt`、`d`、`pull`<br>外加项目扩展口令与自定义 `,` 别名 | 在 `PreInvocation` 阶段将简短口令展开为完整的架构审查、设计或编排提示词。 |
 
 ---
 
 ## 项目扩展层（`.pilot/project.json`）
 
-通用模式保持项目无关（默认启用 `r`、`rt`、`d`、`pull`）。项目可在仓库根目录放置 `.pilot/project.json`（`schema: "the-pilot-project/v1"`，参考 [examples/project.example.json](examples/project.example.json)），按需叠加团队专属口令、预设、交付说明与收尾动作：
+全局安装的 `GEMINI.md`、`CLAUDE.md`、`AGENTS.md` 托管块、内置场景与基础口令均保持项目无关。仓库可提交 [`.pilot/project.json`](examples/project.example.json) 来定义专属口令。
 
-```json
-{
-  "schema": "the-pilot-project/v1",
-  "projectId": "example",
-  "description": "A project-specific closeout instruction.",
-  "scene_specs": {
-    "closeout-and-sync": {
-      "fallback_prompt": "Update project documentation and release owned resources."
-    }
-  }
-}
-```
+每轮 `PreInvocation` 取首个非空工作区路径，缺省时用钩子的工作目录，并向上查找最近的 overlay。该轮在内存中展开仓库声明的口令及逗号别名，例如 `deploy-check` 和 `,deploy-check`。改动下一轮生效，同一安装下的多个工作区各用自己的口令。配置无效时记录日志，通用命令仍可使用。
 
-```sh
-pilot apply --project /path/to/repo --preset recommended --json  # 首次安装：显式选择预设
-pilot apply --project /path/to/repo --json  # 重复执行：绑定项目扩展并保留已安装的个人偏好
-pilot apply --upgrade --json       # 以已安装的 profile.json 为基线重编译（该文件必须存在，不能与 --preset/--profile 同用）
-pilot apply --no-project --json    # 解除项目扩展绑定；个人偏好保持不变
-```
+配置使用 `the-pilot-project/v1`，包含 `projectId`、可选 `description`、`entry_order` 和 `entry_specs`。要覆盖模板，在个人配置的 `shortcuts.enabled_entry` 中加入对应口令，并在 `shortcuts.template_overrides` 中设置模板。覆盖仅在当前工作区声明该口令时生效。项目交付与收尾规则由仓库指引、运行手册及已授权领域技能定义。
 
-重复执行 `pilot apply`（包括带 `--project` 或 `--no-project`）都会保留已安装的 `profile.json`，个人偏好在项目扩展切换后依然有效；只有 `--preset` 或 `--profile` 会显式重置或替换这些偏好。
+`pilot apply --upgrade --json` 根据已安装的个人配置重新编译产物，并清除旧版全局项目快照。旧版 `--project` 和 `--no-project` 参数仍可用于兼容调用。
 
 ---
 
 ## 自动更新机制
 
-接入后，`the-pilot` 通过两层非阻塞机制自动保持最新，无需手动触发升级：
+接入后，`the-pilot` 通过两种机制自动保持最新，无需手动触发升级：
 
-1. **6 小时冷却后台自更新**：在 `Stop` 钩子执行时，若距离上次检查已满 6 小时，`runtime.py` 会在后台异步拉起 `pilot self-update --quiet`。当本机 `~/the-pilot` 处于干净 `main` 分支时自动执行 `git pull --ff-only`，检测到新提交后刷新 `uv` CLI、自愈全局技能软链（`~/.agents/skills`、`~/.claude/skills`、`~/.gemini/config/skills`），并在保留个人 `profile.json` 的前提下执行 `pilot apply --upgrade`。脏工作区或非 `main` 分支绝不改动。
-2. **当前工作区 `.pilot/project.json` 变更热同步**：当检测到当前工作区的 `.pilot/project.json` 发生哈希变化时，后台自动触发 `pilot self-update --project-only --workspace <cwd>`，使项目新增口令或场景规则即刻生效。
+1. **6 小时冷却后台自更新**：符合条件的钩子及安装或运行时配置变更可在冷却期结束后安排后台更新。当本机 `~/the-pilot` 处于干净 `main` 分支时自动执行 `git pull --ff-only`，检测到新提交后刷新 `uv` CLI、自愈全局技能软链（`~/.agents/skills`、`~/.claude/skills`、`~/.gemini/config/skills`），并在保留个人 `profile.json` 的前提下执行 `pilot apply --upgrade`。脏工作区或非 `main` 分支绝不改动。
+2. **本地引擎热同步**：符合条件的钩子通过 `pilot self-update --project-only` 检查干净的本地 `~/the-pilot`。发现托管产物漂移时重新编译，并在当前事件使用更新后的引擎。
 
-可随时通过 `pilot status --json`（查看 `auto_update` 字段）检查更新状态，或运行 `pilot self-update --json` 立即更新。设置环境变量 `THE_PILOT_DISABLE_AUTO_UPDATE=1` 可关闭后台自动检查。
+可随时通过 `pilot status --json`（查看 `auto_update` 字段）检查更新状态，或运行 `pilot self-update --json` 立即更新。设置环境变量 `THE_PILOT_DISABLE_AUTO_UPDATE=1` 可关闭后台自动检查。`state/pilot.log` 与 `state/auto_update.log` 达到 512 KiB 后分别轮转为单个 `.1` 归档。
 
 `pilot apply --upgrade` 同时执行旧版 `config/autopilot` 安装到 `config/the-pilot` 的一次性单向迁移：托管文件迁入新目录，`state/autopilot.log` 改名为 `state/pilot.log`，删除旧版 `orca-agy-autopilot` Hook 组，并保留自定义场景与会话状态。迁移窗口内，已打开会话中的 `<!-- autopilot: ... -->` 标签与 `,autopilot recover` 仍可正常工作。
 
@@ -248,16 +230,16 @@ pilot apply --no-project --json    # 解除项目扩展绑定；个人偏好保�
 
 | 命令 | 用途 |
 | --- | --- |
-| `pilot probe [--project <repo> \| --no-project] --json` | 只读探测已安装的个人偏好、项目扩展与本机可用的 Agent CLI（`codex`、`claude`、`agy`）。 |
+| `pilot probe --json` | 只读探测已安装的个人偏好与本机可用的 Agent CLI（`codex`、`claude`、`agy`）。 |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | 只读扫描最近 N 天多 Agent 聊天记录（`antigravity`、`claude`、`codex`、`cursor`），提炼重复输入模式与流水线健康度诊断。 |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块、`the-pilot` Hook 组及默认 Home 的 Shell 托管块。仅在显式传入 `--preset` 或 `--profile` 时替换已安装的个人偏好。 |
-| `pilot self-update [--project-only] [--workspace <path>] --json` | 在文件排他锁下安全快进 `main`、刷新 CLI 与全局技能软链，并执行 `pilot apply --upgrade`。 |
-| `pilot status [--project <repo>] --json` | 检查安装完整性、当前模式、执行器优先级、`auto_update` 状态与产物漂移，包括默认 Home 的 Shell 托管块。 |
+| `pilot apply [--preset <name>] [--profile <json>] [--upgrade] --json` | 编译并原子安装 `<gemini-dir>/config/the-pilot/runtime.py`、`profile.json`、`config.json`、`scenes/*.md`、`GEMINI.md` 托管块、`the-pilot` Hook 组及默认 Home 的 Shell 托管块。仅在显式传入 `--preset` 或 `--profile` 时替换已安装的个人偏好。 |
+| `pilot self-update [--project-only] --json` | 在文件排他锁下快进 `main`、刷新 CLI 和技能软链，并重新编译。`--project-only` 执行钩子的本地热同步，可安排后台更新。 |
+| `pilot status --json` | 检查安装完整性、当前模式、执行器优先级、`auto_update` 状态与产物漂移，包括默认 Home 的 Shell 托管块。 |
 | `pilot uninstall --json` | 移除托管文件、`GEMINI.md` 与 Shell 托管块及 Hook 条目，保留其他用户配置和 Shell 启动文件。 |
 | `pilot mode [status\|gate\|confirm\|off]` | 查看或切换 Turn Pilot 模式（`gate`、`confirm`、`off`）。 |
 | `pilot worker [status\|codex\|claude\|cc]` | 查看或持久化子会话执行器优先级（`codex > claude` 或 `claude > codex`），并在下一轮热加载。 |
 | `pilot sync` | 手工编辑已安装的 `scenes/*.md` 后，将其同步刷新到 `GEMINI.md` 场景段。 |
-| `pilot set <shortcut> <template>` | 在 `profile.json` 中持久化自定义口令模板并重新编译 `config.json`。 |
+| `pilot set <shortcut> <template>` | 将口令模板保存到 `profile.json`。修改仓库口令时，在对应工作区运行。 |
 | `pilot log [--lines <n>]` | 查看 `state/pilot.log` 中的结构化运行时投递日志。 |
 | `pilot hook --event <SessionStart\|PreInvocation\|Stop>` | 供宿主 Agent 运行时调用的生命周期 Hook 入口。 |
 

@@ -1,5 +1,8 @@
 """Universal profile vocabulary and project-neutral scene templates."""
+
 from pathlib import Path
+
+from .assets.runtime import UNIVERSAL_ENTRY_KEYS, UNIVERSAL_ENTRY_SPECS
 
 PROFILE_SCHEMA = "the-pilot-profile/v1"
 
@@ -69,18 +72,6 @@ PIPELINE_STAGE_CONTRACTS = {
 
 DELIVER_STRATEGIES = ("merge_dev_e2e", "merge_dev_only", "local_verify_only")
 
-RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent", "pilot", "autopilot"})
-
-def is_comma_alias(value: str) -> bool:
-    return bool(value) and value[0] in "abcdefghijklmnopqrstuvwxyz0123456789" and all(
-        char in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in value
-    )
-
-
-def is_entry_key(value: str) -> bool:
-    return is_comma_alias(value) and value[0] in "abcdefghijklmnopqrstuvwxyz"
-
-
 GEMINI_BEGIN = "<!-- BEGIN THE_PILOT_PROFILE -->"
 
 GEMINI_END = "<!-- END THE_PILOT_PROFILE -->"
@@ -111,57 +102,33 @@ UNMANAGED_SCENES_MARKERS_ERROR = (
 )
 
 HARNESS_ORCHESTRATION_SENTENCE = (
-    "主会话从业务目标设计最简领域模型并严格评审；子会话按模型实施，仅文件组织可调整"
-    "（不死板锁死文件清单，调整理由在 worker_done 汇报），不得降低最简领域模型的要求。架构分歧必须用 "
+    "主会话从业务目标零基推导最简领域模型并严格评审；子会话按模型实施，仅文件组织可调整，"
+    "理由在 worker_done 汇报，不得降低最简领域模型要求。架构分歧必须用 "
     "`orca orchestration ask` 回传；主会话 `reply` 不得默许双表/双状态机、用 Python 封装或排版代替"
-    "结构收敛、在核心实体外加旁路表或状态机。禁止将子表原样搬成父表前缀列与次级状态列。"
+    "结构收敛、在核心实体外加旁路表或状态机。"
     "严禁主/子会话擅自改写已审定蓝图或调松门禁指标。遇到新的物理约束，须由主会话调 `ask_question` 获用户确认后方可调整。"
     "锁定废弃流程表的白盒测试改测领域入口与核心实体真值"
 )
 
-DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
- 'entry_specs': {'r': {'command_id': 'CMD_MOD_REVIEW',
-                       'description': '对指定功能/模块进行完整代码与最简架构 Review',
-                       'requires_arg': True,
-                       'usage': 'r <module>',
-                       'template': '详细 review 一下目前 {arg} '
-                                   '的整个代码和设计，从整个架构去看是否有更简洁、更加根本的设计或收敛方案，判断是否有过度设计、工程质量是否达标、是否已经达到最简架构要求'},
-                 'rt': {'command_id': 'CMD_TOOL_REVIEW',
-                        'description': '以 Anthropic 内部架构师视角对指定类别工具进行整体 Review',
-                        'requires_arg': True,
-                        'usage': 'rt <工具类别>',
-                        'template': '再整体 review 下 {arg} 相关工具，以 anthropic '
-                                    '内部架构师的视角，工具的设计是否最佳，是否已经最简洁'},
-                 'd': {'command_id': 'CMD_CLARIFY_DESIGN',
-                       'description': '先澄清需求并产出最符合工程架构的详细设计方案，再用 Orca 编排实施',
-                       'requires_arg': False,
-                       'usage': 'd [需求描述]',
-                       'template': '你先和我澄清需求和产出最符合工程架构的详细设计方案。然后再用项目的 orca 编排模式来推进子会话/子工作区实施'},
-                 'pull': {'command_id': 'CMD_GIT_PULL',
-                          'description': '先拉下代码到最新 origin/main',
-                          'requires_arg': False,
-                          'usage': 'pull',
-                          'template': '先拉下代码到最新 origin/main'}},
+DEFAULT_SPECS = {'entry_order': list(UNIVERSAL_ENTRY_KEYS),
+ 'entry_specs': UNIVERSAL_ENTRY_SPECS,
  'presets': {'recommended': {'pilot': {'mode': 'gate', 'max_consecutive_auto_turns': 8},
                              'scenes': {'enabled_scenes': ['plan-and-orchestrate',
                                                            'architecture-re-review',
                                                            'deliver-and-verify',
                                                            'closeout-and-sync'],
-                                        'deliver_strategy': 'merge_dev_e2e',
-                                        'enable_feedback_email': False},
-                             'shortcuts': {'enabled_entry': ['r', 'rt', 'd', 'pull']}},
+                                        'deliver_strategy': 'merge_dev_e2e'},
+                             'shortcuts': {'enabled_entry': list(UNIVERSAL_ENTRY_KEYS)}},
              'conservative': {'pilot': {'mode': 'confirm', 'max_consecutive_auto_turns': 4},
                               'scenes': {'enabled_scenes': ['plan-and-orchestrate',
                                                             'architecture-re-review',
                                                             'deliver-and-verify',
                                                             'closeout-and-sync'],
-                                         'deliver_strategy': 'merge_dev_e2e',
-                                         'enable_feedback_email': False},
-                              'shortcuts': {'enabled_entry': ['r', 'rt', 'd', 'pull']}},
+                                         'deliver_strategy': 'merge_dev_e2e'},
+                              'shortcuts': {'enabled_entry': list(UNIVERSAL_ENTRY_KEYS)}},
              'orchestration-only': {'pilot': {'mode': 'off', 'max_consecutive_auto_turns': 4},
                                     'scenes': {'enabled_scenes': [],
-                                               'deliver_strategy': 'merge_dev_e2e',
-                                               'enable_feedback_email': False},
+                                               'deliver_strategy': 'merge_dev_e2e'},
                                     'shortcuts': {'enabled_entry': [],
                                                   'custom_entry': {},
                                                   'custom_comma': {},
@@ -188,7 +155,7 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                   '核对约束证据与目标模型，排除表象补丁及过度设计后定稿。'
                                                   '备选 `,2` 对方案做最简架构 review 后先停下等我确认再进入实施。\n'
                                                   '   - **进度 ③（方案已审定或上轮复审给出明确根治改法，本轮未改代码）**：主推 `,1` 按已审定方案通过 Orca 编排子工作区推进实施并严格 review。新机制/多阶段/跨服务改动的备选 `,2` 按审定顺序先实施并验证首阶段或核心模块。'
-                                                  '审定后冻结蓝图与预算，主/子会话不得放宽目标、删减退场项或延后范围内事项至后续波次。遇到新的物理约束，须由主会话调 `ask_question` 获用户确认后方可调整。\n'
+                                                  '审定后冻结蓝图与预算，涵盖退场项和本轮交付范围。\n'
                                                   '   - 句末自然包含质量底线：**「确保达到设计目标、最简架构设计要求、工程质量要求」**。\n'
                                                   '3. **门禁判定**：进度 ① → ② → ③ 均按「Agent 单一语义 Owner 三步判断模型」第一步分类；A 类及已确认边界内的 B 类 `gate=auto` 单步递进，B 类方案/裁决未确认 `gate=pause`，同步提问直接调 `ask_question`（不写标签），异步待答输出 `scene=NONE`。沿用统一授权边界，不重复裁决。\n'
                                                   '\n'
@@ -239,7 +206,8 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                 '1. **本机交付策略（唯一真源：`profile.json` 的 '
                                                 '`scenes.deliver_strategy`，已注入本场景）**：\n'
                                                 '{{DELIVER_STRATEGY_BINDING}}\n'
-                                                '进入 `/ship` 发布 prod 前必须 '
+                                                '按当前仓库的 `AGENTS.md` / `CLAUDE.md`、交付 runbook 和已授权技能执行剩余步骤。若仓库规定发布交接，按其流程办理。\n'
+                                                '发布 prod 前必须 '
                                                 '`gate=pause`，人工确认一次；`prod` 真实 E2E 与全量/批量套件 E2E 须获当轮明确要求。\n'
                                                 '2. **迁移预检**：含数据回填、收紧约束或删表删列的迁移，在合入或发布前须只读核查目标环境的孤儿行、延迟外键、历史枚举/版本值。'
                                                 '无法访问时明确记录未验证范围。\n'
@@ -264,17 +232,16 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                           '并按项目生命周期回收工作区',
                                        'body': '## 收尾清单\n'
                                                '\n'
-                                               '1. 同步本任务设计、契约与操作文档，记录尚未完成的义务及其 owner。\n'
+                                               '1. 按已配置的交付策略核对完成条件，遵循当前仓库的 `AGENTS.md` / `CLAUDE.md` 与 runbook，同步设计、契约、操作文档及台账，记录未完成义务的 owner。\n'
                                                '2. 完成已授权且证据充分的结案操作；外部发送仍遵循当前授权。当尚有已授权的结案、通知或工作区释放义务未在本轮直接执行完毕时，必须路由到 closeout-and-sync 并标 gate=auto，生成并自动推进 ,1；严禁在正文反问确认并输出 scene=NONE 或 gate=pause。\n'
-                                               '{{FEEDBACK_CLOSEOUT_BLOCK}}\n'
-                                               '3. 释放受控 Orca worker，按项目生命周期清理工作区；保留共享工作区和归属不明的文件。\n'
+                                               '   仓库定义了工单、反馈或告警的委派结案时，按已授权的领域技能办理。\n'
+                                               '3. 释放受控 Orca worker，按仓库工作区生命周期脚本清理工作区；保留共享工作区和归属不明的文件。\n'
                                                '4. 将已授权改动交付到目标分支；全部义务结清后输出 `<!-- pilot: '
                                                'scene=NONE -->`。\n'
                                                '\n'
                                                '## 回复示例\n'
                                                '\n'
                                                '- **,1（主推）**：`同步任务文档，完成已授权收尾并释放受控工作区资源`\n'
-                                               '{{FEEDBACK_REPLY_EXAMPLES}}\n'
                                                '\n'
                                                '{{CUSTOM_GUARDRAILS}}'}},
  'deliver_content': {'merge_dev_e2e': {'binding': '   - **`merge_dev_e2e`**：主推「合入 main → 发 dev → 定向 E2E」，跳过已完成步骤。'
@@ -335,8 +302,4 @@ DEFAULT_SPECS = {'entry_order': ['r', 'rt', 'd', 'pull'],
                                                             'E2E）；过程中若发现问题遵循最简架构设计进行修复，最后给我整体报告',
                                            're_review_progress': '按当前实际交付状态给出「合入 main → 本地实跑验收 → '
                                                                  '整体报告」的指令（不发布 dev、不执行 '
-                                                                 'E2E）。'}},
- 'feedback_closeout': {'false': {'block': '', 'examples': '', 'trigger': ''},
-                       'true': {'block': '   - 在已启用反馈通知授权的范围内，验证通过后按 gate=auto 自动完成结案与通知闭环，禁止在正文反问确认后输出 scene=NONE 或 gate=pause；缺少证据时等待用户。\n',
-                                'examples': '',
-                                'trigger': ''}}}
+                                                                 'E2E）。'}}}
