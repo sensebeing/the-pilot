@@ -24,6 +24,7 @@ import os
 import select
 import signal
 import stat
+from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -118,12 +119,23 @@ TAG_FIELDS = frozenset(
         "alt",
     }
 )
-# Orca's `terminal.program-status.v1` contract. The escape sequence is stripped
-# from terminal output before rendering, so it only feeds program activity.
-OSC_7501_WORKING = "\x1b]7501;state=working:app=antigravity\x07"
-OSC_7501_DONE = "\x1b]7501;state=done:app=antigravity\x07"
-OSC_7501_WAITING_QUESTION = "\x1b]7501;state=blocked:kind=question:app=antigravity\x07"
+# Orca retains titles across PTY output gaps. Write activity first so a
+# question blocks delivery before the neutral title clears the Ready title.
+OSC_7501_WORKING = "\x1b]7501;state=working:app=antigravity\x07\x1b]2;\u280b Antigravity Working\x07"
+OSC_7501_DONE = "\x1b]7501;state=done:app=antigravity\x07\x1b]2;Antigravity Ready\x07"
+OSC_7501_WAITING_QUESTION = "\x1b]7501;state=blocked:kind=question:app=antigravity\x07\x1b]2;Antigravity\x07"
 SHELL_WRAPPER_NAMES = frozenset({"sh", "dash", "bash", "zsh"})
+AGY_PRINT_FLAGS = frozenset({"p", "print", "prompt"})
+AGY_INTERACTIVE_PROMPT_FLAGS = frozenset({"i", "prompt-interactive"})
+AGY_BOOT_VALUE_FLAGS = AGY_PRINT_FLAGS | AGY_INTERACTIVE_PROMPT_FLAGS | {
+    "add-dir", "agent", "conversation", "effort", "input-format", "json-schema",
+    "log-file", "mode", "model", "output-format", "print-timeout", "project", "settings",
+}
+AGY_NON_SESSION_FLAGS = AGY_PRINT_FLAGS | {"h", "help", "v", "version"}
+AGY_MANAGEMENT_COMMANDS = frozenset({
+    "acp", "agent", "agents", "changelog", "help", "install", "mcp", "mic-serve",
+    "models", "plugin", "plugins", "remote-control", "update",
+})
 # A non-blocking PTY slave accepts status bytes only while its output ring
 # buffer has room; drain transient backpressure for this long, then fail.
 OSC_WRITE_TIMEOUT_SECONDS = 0.25
@@ -1632,17 +1644,16 @@ def _uses_orca_pane() -> bool:
     )
 
 
-def _resolve_osc_target() -> tuple[Path, bool] | None:
+def _resolve_osc_target(*, allow_predecessor_shell: bool = False) -> tuple[Path, bool] | None:
     """Resolve the Orca pane TTY that owns the agent process.
 
     Antigravity allocates child PTYs for subprocesses, so `os.ctermid()` inside
     this hook names the wrong terminal. Only the ancestor `agy` process's `ps`
     tty column points at Orca's pane; nested shell shims (`sh -> bash -> agy`)
     are walked for up to three hops after skipping the re-exec Python parent.
-    The next non-wrapper ancestor must be `agy`. Tests and non-Orca hosts resolve to None:
-    an explicit override or a captured pane binding wins, then Gemini-dir isolation stays inert
-    (never probing `ps` or writing host TTYs), then the Orca pane environment
-    gates the ancestor walk.
+    At boot, a shell's TTY can serve as the target before `agy` exists.
+    An explicit override or captured pane binding wins. Otherwise Gemini-root
+    isolation and non-Orca hosts return before probing processes or devices.
     """
     raw_override = os.environ.get("THE_PILOT_OSC_TARGET")
     if raw_override is not None:
@@ -1653,24 +1664,35 @@ def _resolve_osc_target() -> tuple[Path, bool] | None:
         return Path(stripped).expanduser(), is_override
     if not _uses_orca_pane():
         return None
-    skip_python_parent = _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1"
+    skip_python_parent = (
+        allow_predecessor_shell or _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1"
+    )
     pid = os.getppid()
-    shell_hops = 0
+    shell_ttys: list[str] = []
     while pid > 1:
         process = _ps_process(pid)
         if process is None:
-            return None
+            break
         ppid, tty, comm = process
         executable = Path(comm.strip().lstrip("-")).name
         if executable == "agy":
             return _osc_target_from_tty(tty)
         if not (skip_python_parent and executable.lower().startswith("python")):
-            if executable not in SHELL_WRAPPER_NAMES or shell_hops == 3:
-                return None
-            shell_hops += 1
+            if executable not in SHELL_WRAPPER_NAMES or len(shell_ttys) == 3:
+                break
+            shell_ttys.append(tty)
         skip_python_parent = False
         pid = ppid
+    if allow_predecessor_shell:
+        for tty in shell_ttys:
+            target = _osc_target_from_tty(tty)
+            if target is not None:
+                return target
     return None
+
+
+def _resolve_boot_osc_target() -> tuple[Path, bool] | None:
+    return _resolve_osc_target(allow_predecessor_shell=True)
 
 
 def _is_owned_character_device(status: os.stat_result) -> bool:
@@ -1727,11 +1749,11 @@ def _write_osc_bytes(fd: int, data: bytes) -> None:
         written += count
 
 
-def emit_osc_7501(frame: str) -> bool:
-    """Write one OSC 7501 frame to Orca's pane; never raise into hook output."""
+def emit_osc_7501(frame: str, *, boot: bool = False) -> bool:
+    """Write one paired activity/title frame to Orca's pane."""
     if not frame:
         return False
-    resolved = _resolve_osc_target()
+    resolved = _resolve_boot_osc_target() if boot else _resolve_osc_target()
     if resolved is None:
         return False
     target, is_override = resolved
@@ -1760,6 +1782,45 @@ def emit_osc_7501(frame: str) -> bool:
         log_event("osc_status_write_failed", target=str(target), error=str(exc))
         return False
     return True
+
+
+def classify_agy_boot_args(args: Sequence[str]) -> str | None:
+    """Resolve the initial frame from agy's Go flag and positional arguments."""
+    tokens = iter(args)
+    has_interactive_prompt = False
+    has_positional_prompt = False
+    for token in tokens:
+        if token == "--":
+            has_positional_prompt = any(value.strip() for value in tokens)
+            break
+        if token == "-" or not token.startswith("-"):
+            if token in AGY_MANAGEMENT_COMMANDS:
+                return None
+            has_positional_prompt = bool(token.strip()) or any(value.strip() for value in tokens)
+            break
+        flag = token[2:] if token.startswith("--") else token[1:]
+        name, separator, value = flag.partition("=")
+        if name in AGY_NON_SESSION_FLAGS:
+            return None
+        if name in AGY_BOOT_VALUE_FLAGS:
+            if not separator:
+                value = next(tokens, "")
+            if name in AGY_INTERACTIVE_PROMPT_FLAGS and value.strip():
+                has_interactive_prompt = True
+    return OSC_7501_WORKING if has_interactive_prompt or has_positional_prompt else OSC_7501_DONE
+
+
+def command_announce_boot(agy_args: Sequence[str]) -> int:
+    """Announce a prospective interactive launch without holding up agy."""
+    if os.environ.get("AGY_CLI_OSC7501", "").strip().lower() == "on":
+        return 0
+    try:
+        frame = classify_agy_boot_args(agy_args)
+        if frame is not None:
+            emit_osc_7501(frame, boot=True)
+    except Exception as exc:
+        log_event("osc_boot_failed", error=repr(exc))
+    return 0
 
 
 def _sync_and_maybe_reexec(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -2896,6 +2957,11 @@ def run_hook(event: str) -> int:
     if payload is None:
         return _hook_failure(event, "invalid_payload", payload_err)
     try:
+        if event == "SessionStart":
+            initial_input = extract_user_text(str(payload.get("lastUserInput") or ""))
+            emit_osc_7501(OSC_7501_WORKING if initial_input else OSC_7501_DONE)
+            print("{}", flush=True)
+            return 0
         if event == "PreInvocation":
             result = handle_pre_invocation(payload)
             osc_frame = OSC_7501_WORKING
@@ -2981,7 +3047,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode = subparsers.add_parser("mode", help="切换或查看 Pilot 模式")
     mode.add_argument("target", nargs="?", default="status", choices=(*MODES, "status"))
     hook = subparsers.add_parser("hook", help="运行 Antigravity 生命周期 Hook")
-    hook.add_argument("--event", required=True, choices=("PreInvocation", "Stop"))
+    hook.add_argument("--event", required=True, choices=("SessionStart", "PreInvocation", "Stop"))
     status = subparsers.add_parser("status", help="查看模式、场景与 Hook 状态")
     status.add_argument("--json", action="store_true")
     subparsers.add_parser("sync", help="按 scenes/*.md 刷新 GEMINI.md 场景段")
@@ -3001,7 +3067,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_args = sys.argv[1:] if argv is None else argv
+    if raw_args and raw_args[0] == "announce-boot":
+        agy_args = raw_args[1:]
+        return command_announce_boot(agy_args[1:] if agy_args[:1] == ["--"] else agy_args)
+    args = build_parser().parse_args(raw_args)
     if args.command == "worker":
         return command_worker(args.target, args.json)
     if args.command == "mode":

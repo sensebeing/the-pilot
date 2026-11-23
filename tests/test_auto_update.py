@@ -1,4 +1,5 @@
 """Focused contracts for the zero-touch update paths."""
+import io
 import json
 import os
 import shutil
@@ -256,6 +257,34 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout)["status"], "up_to_date")
             self.assertTrue((home / ".local/bin/pilot").is_file())
             self.assertEqual((home / "uv-args").read_text().splitlines(), ["tool", "install", "--force", str(checkout)])
+
+    def test_session_start_announces_without_loading_or_syncing_the_profile(self):
+        """SessionStart exposes the initial pane state before project maintenance.
+
+        Failure means an idle or prompted startup is unannounced or stalls
+        behind a project sync before reaching the composer.
+        resident-fact: status: SessionStart 只按初始输入宣告，不读取配置或同步项目。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "osc.log"
+            env = {"THE_PILOT_GEMINI_DIR": str(root / "gemini"),
+                   "THE_PILOT_OSC_TARGET": str(target)}
+            cases = (
+                ({}, runtime.OSC_7501_DONE),
+                ({"lastUserInput": "<USER_REQUEST>   </USER_REQUEST>"}, runtime.OSC_7501_DONE),
+                ({"lastUserInput": "<USER_REQUEST>Start</USER_REQUEST>"}, runtime.OSC_7501_WORKING),
+            )
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                runtime, "_sync_and_maybe_reexec", side_effect=AssertionError("startup sync")
+            ), mock.patch.object(runtime, "load_profile", side_effect=AssertionError("startup load")):
+                for initial, frame in cases:
+                    with self.subTest(initial=initial), mock.patch(
+                        "sys.stdin", io.StringIO(json.dumps({**initial, "workspacePaths": [str(root)]}))
+                    ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                        self.assertEqual(runtime.main(["hook", "--event", "SessionStart"]), 0)
+                        self.assertEqual(json.loads(stdout.getvalue()), {})
+            self.assertEqual(target.read_text(), "".join(frame for _, frame in cases))
 
     def test_stop_reexecs_updated_engine_on_the_same_turn(self):
         """An eligible Stop syncs once and preserves the updated engine's hook and pane decisions."""

@@ -6,7 +6,7 @@
 - `compiler.py`: pure rendering and managed-document merges; no IO.
 - `distill.py`: read-only sampling and pattern distillation across recent local agent chat logs, plus scene pipeline assessment of the installed profile and scene contracts.
 - `installer.py`: the sole owner of project discovery, workspace overlay synchronization, `self-update`, installation locking and atomic file writes.
-- `assets/runtime.py`: the standalone runtime, copied unchanged on install. It owns the single synchronous Stop submission, post-Stop turn-start observation from the session and transcript, and settlement of unconfirmed delivery, including status frames bound to the original pane. It forwards workspace context to the installer CLI.
+- `assets/runtime.py`: the standalone runtime, copied unchanged on install. It owns terminal lifecycle status and `agy` launch argument semantics, including pane resolution and the paired OSC 7501 activity and OSC 2 title write. It owns the single synchronous Stop submission, post-Stop turn-start observation from the session and transcript, and settlement of unconfirmed delivery in the original pane. It forwards workspace context to the installer CLI.
 - `runtime.py`: subprocess adapter to the installed runtime (no second engine).
 - `cli.py`: installer versus runtime command routing only.
 
@@ -73,14 +73,18 @@ The CLI can use a newer clean `~/the-pilot` main checkout immediately. Persisted
 `installed_sha` and `installed_tree_digest` keep the uv tool bundle aligned with
 the checkout, including after an external pull or a missing launcher.
 
-For the default Gemini root, the compiler renders the managed
-`AGY_CLI_OSC7501` block and the installer owns startup file selection.
+For the default Gemini root, the compiler renders the managed shell startup
+block and the installer owns startup file selection. The block defaults
+`AGY_CLI_OSC7501` to `off` and forwards interactive `agy` arguments to the
+installed runtime's internal `announce-boot` entry point before launching it.
+Account-switch recovery can call the same entry point before invoking `env agy`.
 `apply` (including `self-update`'s upgrade) manages `~/.zshenv` and any
 existing `~/.bash_profile`, `~/.bashrc`, or `~/.profile`. `status` reports
 shell block drift, and `uninstall` strips the block while retaining each file,
 its permissions, and any symlink. A skill root supplied to
 `self-update --home-dir` leaves shell ownership tied to the default Gemini root.
 
+`SessionStart` announces the initial pane state without requesting project sync.
 The PreInvocation and eligible Stop hooks request a local project sync before
 evaluating the turn. This sync can repair drifted installed artifacts even when
 the runtime matches the checkout. If the engine changes, the hook runs the

@@ -177,9 +177,14 @@ pilot status --json
 If your repository has a `.pilot/project.json` overlay, pass `--project /path/to/repo` during `pilot apply`.
 
 For the default `$HOME/.gemini` installation, `pilot apply` and upgrades manage
-`AGY_CLI_OSC7501` in `~/.zshenv` and any existing `~/.bash_profile`,
-`~/.bashrc`, and `~/.profile`. This disables Antigravity CLI's built-in OSC
-7501 status emitter by default in new shells and respects an explicit override.
+the shell startup block in `~/.zshenv` and any existing `~/.bash_profile`,
+`~/.bashrc`, and `~/.profile`. The block defaults `AGY_CLI_OSC7501` to `off`
+and wraps interactive `agy` launches to announce their initial state before
+starting or resuming a session. An explicit `on` skips the boot announcement.
+The `SessionStart` hook also announces new sessions without waiting for project
+sync. Pilot writes OSC 7501 activity followed by the OSC 2 title in one frame
+so Orca can retain readiness across terminal output gaps. A pending question
+or draft uses a neutral title to protect the input from delivery.
 
 ---
 
@@ -260,7 +265,7 @@ Check update status anytime via `pilot status --json` (`auto_update` field) or t
 | `pilot sync` | Re-sync the `GEMINI.md` scene block after editing installed `scenes/*.md` files. |
 | `pilot set <shortcut> <template>` | Persist a custom shortcut template override in `profile.json` and recompile `config.json`. |
 | `pilot log [--lines <n>]` | Inspect structured runtime delivery events from `state/pilot.log`. |
-| `pilot hook --event <PreInvocation\|Stop>` | Lifecycle Hook entrypoint invoked by the host agent runtime. |
+| `pilot hook --event <SessionStart\|PreInvocation\|Stop>` | Lifecycle Hook entrypoint invoked by the host agent runtime. |
 
 ---
 
