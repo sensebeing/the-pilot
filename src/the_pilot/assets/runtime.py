@@ -222,6 +222,61 @@ def is_entry_key(value: str) -> bool:
     return is_comma_alias(value) and value[0] in "abcdefghijklmnopqrstuvwxyz"
 
 
+def shortcut_override_name(name: str) -> str:
+    name = name.strip()
+    return name.lower() if name.startswith(",") else name
+
+
+def shortcut_override_owners(
+    enabled_entries: Any, entries: Any, comma_commands: Any,
+) -> tuple[dict[str, str], set[str]]:
+    """Reserve durable and active shortcut names ahead of secondary command IDs."""
+    entries = entries if isinstance(entries, dict) else {}
+    commands = comma_commands if isinstance(comma_commands, dict) else {}
+    enabled = enabled_entries if isinstance(enabled_entries, list) else []
+    primary: dict[str, set[str]] = {}
+    secondary: dict[str, set[str]] = {}
+
+    def claim_id(spec: dict[str, Any], owner: str) -> None:
+        command_id = spec.get("command_id")
+        if not isinstance(command_id, str):
+            return
+        name = shortcut_override_name(command_id)
+        if name.startswith(",") and (
+            not is_comma_alias(name[1:]) or name[1:] in RESERVED_COMMA_ALIASES
+        ):
+            return
+        if name:
+            secondary.setdefault(name, set()).add(owner)
+
+    for key in (*enabled, *entries):
+        if isinstance(key, str) and key:
+            primary.setdefault(key, set()).add(key)
+            primary.setdefault(f",{key}", set()).add(key)
+    for key, spec in entries.items():
+        if isinstance(key, str) and isinstance(spec, dict):
+            claim_id(spec, key)
+    for spec in commands.values():
+        if not isinstance(spec, dict):
+            continue
+        aliases = spec.get("aliases")
+        if not isinstance(aliases, list):
+            continue
+        names = [shortcut_override_name(alias) for alias in aliases if isinstance(alias, str)]
+        owner = spec.get("canonical_key") or (names[0].lstrip(",") if names else "")
+        if not isinstance(owner, str) or not owner:
+            continue
+        for name in (owner, *names):
+            primary.setdefault(name, set()).add(owner)
+        claim_id(spec, owner)
+
+    claims = {**secondary, **primary}
+    return (
+        {name: next(iter(owners)) for name, owners in claims.items() if len(owners) == 1},
+        {name for name, owners in claims.items() if len(owners) > 1},
+    )
+
+
 def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
     # Custom aliases do not allow whitespace between the comma and their name.
     raw = text[1:] if comma and text.startswith(",") else text
@@ -574,13 +629,14 @@ def workspace_config(
             commands[command_id] = entry_comma_command(key, entry)
         overrides = preferences.get("template_overrides")
         if isinstance(overrides, dict) and overrides:
-            overrides = {_workspace_override_name(alias): template for alias, template in overrides.items()}
+            owners, _ = shortcut_override_owners(enabled_entry, entries, commands)
+            overrides = {shortcut_override_name(alias): template for alias, template in overrides.items()}
             for key in specs:
                 entry = entries[key]
                 command_id = entry["command_id"]
-                for alias in _workspace_override_keys(effective, key, command_id):
+                for alias in (key, f",{key}", shortcut_override_name(command_id)):
                     template = overrides.get(alias)
-                    if isinstance(template, str) and template.strip():
+                    if owners.get(alias) == key and isinstance(template, str) and template.strip():
                         entry["template"] = commands[command_id]["template"] = template
                         break
         return effective
@@ -3042,21 +3098,6 @@ def _command_identity(
     return None
 
 
-def _workspace_override_name(name: str) -> str:
-    name = name.strip()
-    return name.lower() if name.startswith(",") else name
-
-
-def _workspace_override_keys(config: dict[str, Any], key: str, command_id: str) -> tuple[str, ...]:
-    names = (key, f",{key}")
-    command_name = _workspace_override_name(command_id)
-    owner = _command_identity(config, command_name)
-    # An ID is a secondary name, so it cannot claim another shortcut's alias.
-    if owner and owner[0] != key and (command_name.startswith(",") or owner[0] == command_name):
-        return names
-    return (*names, command_name)
-
-
 def _update_config_template(
     config: dict[str, Any], canonical: str, command_id: str, template: str,
 ) -> bool:
@@ -3141,9 +3182,11 @@ def command_set(target: str, template: str) -> int:
                 return 2
             if canonical not in enabled_entry:
                 enabled_entry.append(canonical)
-            aliases = _workspace_override_keys(workspace_catalog, canonical, command_id)
+            owners, _ = shortcut_override_owners(
+                enabled_entry, workspace_catalog["entry_shortcuts"], workspace_catalog["comma_commands"],
+            )
             for alias in list(overrides):
-                if _workspace_override_name(alias) in aliases:
+                if owners.get(shortcut_override_name(alias)) == canonical:
                     del overrides[alias]
         overrides[canonical] = template
         if not save_json(PROFILE_PATH, profile):

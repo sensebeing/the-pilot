@@ -29,7 +29,12 @@ from typing import Any
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
 from .assets.runtime import append_log_event
-from .profile import UnknownShortcutOverride, resolve_profile, validate_profile
+from .profile import (
+    has_shortcut_override_aliases,
+    migrate_installed_shortcut_overrides,
+    resolve_profile,
+    validate_profile,
+)
 from .defaults import (
     DEFAULT_SPECS,
     DELIVER_STRATEGIES,
@@ -395,15 +400,11 @@ def _installed_path(gemini_dir: Path, name: str) -> Path:
 def _resolve_installed_profile(
     gemini_dir: Path, raw: dict[str, Any], *, overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Read retired catalog identities only when profile aliases cannot resolve an override."""
-    try:
-        return resolve_profile(raw, preset=None, overrides=overrides)
-    except UnknownShortcutOverride:
+    """Bind legacy alias overrides before resolving the universal profile."""
+    if has_shortcut_override_aliases(raw):
         config = read_json_object(_installed_path(gemini_dir, "config.json"), "config.json") or {}
-        entries = config.get("entry_shortcuts")
-        if not isinstance(entries, dict) or not entries:
-            raise
-        return resolve_profile(raw, preset=None, overrides=overrides, installed_entries=entries)
+        raw = migrate_installed_shortcut_overrides(raw, config)
+    return resolve_profile(raw, preset=None, overrides=overrides)
 
 
 def default_install_home(gemini_dir: Path) -> Path | None:

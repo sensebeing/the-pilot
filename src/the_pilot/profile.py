@@ -4,7 +4,13 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .assets.runtime import RESERVED_COMMA_ALIASES, is_comma_alias, is_entry_key
+from .assets.runtime import (
+    RESERVED_COMMA_ALIASES,
+    is_comma_alias,
+    is_entry_key,
+    shortcut_override_name,
+    shortcut_override_owners,
+)
 from .defaults import (
     COORDINATOR_AGENT_ALIASES,
     COORDINATOR_AGENTS,
@@ -19,17 +25,12 @@ from .defaults import (
 from .project import ProfileError, project_specs
 
 
-class UnknownShortcutOverride(ProfileError):
-    """The override could not be resolved from the supplied shortcut identities."""
-
-
 def resolve_profile(
     base: dict[str, Any],
     *,
     preset: str | None = "recommended",
     overrides: dict[str, Any] | None = None,
     project: dict[str, Any] | None = None,
-    installed_entries: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge a base profile with one preset and the caller's overrides."""
     specs = project_specs(project)
@@ -44,115 +45,35 @@ def resolve_profile(
             merged,
             _normalize_pilot_section(_copy_mapping(overrides, "profile overrides")),
         )
-    return validate_profile(merged, project=project, installed_entries=installed_entries)
+    return validate_profile(merged, project=project)
 
 
-def _shortcut_override_aliases(
-    shortcuts: dict[str, Any], specs: dict[str, Any],
-    installed_entries: dict[str, Any] | None = None,
-) -> tuple[dict[str, str], set[str]]:
-    """Map every alias ``template_overrides`` accepts to its canonical key.
+def has_shortcut_override_aliases(raw: dict[str, Any]) -> bool:
+    """Canonical installed preferences can be validated without a compiled catalog."""
+    shortcuts = raw.get("shortcuts")
+    if not isinstance(shortcuts, dict):
+        return False
+    overrides = shortcuts.get("template_overrides")
+    if not isinstance(overrides, dict) or not overrides:
+        return False
+    owners, _ = shortcut_override_owners(
+        shortcuts.get("enabled_entry"), shortcuts.get("custom_entry"), shortcuts.get("custom_comma"),
+    )
+    return any(owners.get(name) != name for name in overrides)
 
-    Canonical keys and comma aliases are reserved before any ``command_id``,
-    so a secondary identity can never shadow another shortcut's primary name.
-    Conflicting primary or secondary claims are reported through the returned
-    ambiguous set instead of being resolved by iteration order. Accepts fresh
-    normalized sections or raw installed profile state; values that cannot be
-    read contribute no alias here, so validation reports them with a precise
-    error instead of silently treating them as absent shortcuts.
-    """
-    primary: dict[str, str] = {}
-    ambiguous: set[str] = set()
-    secondary: dict[str, str] = {}
-    secondary_ambiguous: set[str] = set()
 
-    def reserve(alias: str, canonical: str) -> None:
-        if not alias or alias in ambiguous:
-            return
-        owner = primary.get(alias)
-        if owner is None:
-            primary[alias] = canonical
-        elif owner != canonical:
-            del primary[alias]
-            ambiguous.add(alias)
-
-    def add_secondary(raw_command_id: str, canonical: str) -> None:
-        alias = raw_command_id.strip()
-        if not alias:
-            return
-        if alias.startswith(","):
-            try:
-                alias = normalize_comma_alias(alias)
-            except ProfileError:
-                return
-        if alias in primary or alias in ambiguous or alias in secondary_ambiguous:
-            return
-        owner = secondary.get(alias)
-        if owner is None:
-            secondary[alias] = canonical
-        elif owner != canonical:
-            del secondary[alias]
-            secondary_ambiguous.add(alias)
-
-    enabled_entry = shortcuts.get("enabled_entry")
-    if isinstance(enabled_entry, list):
-        for key in enabled_entry:
-            reserve(key, key)
-            reserve(f",{key}", key)
-    custom_entry = shortcuts.get("custom_entry")
-    if isinstance(custom_entry, dict):
-        for key in custom_entry:
-            if not isinstance(key, str):
-                continue
-            reserve(key, key)
-            reserve(f",{key}", key)
-    custom_comma = shortcuts.get("custom_comma")
-    if isinstance(custom_comma, dict):
-        for raw_key, spec in custom_comma.items():
-            if not isinstance(raw_key, str):
-                continue
-            try:
-                normalized_key = normalize_comma_alias(raw_key)
-            except ProfileError:
-                continue
-            key = normalized_key[1:]
-            reserve(key, key)
-            reserve(normalized_key, key)
-            if isinstance(spec, dict):
-                for alias in spec.get("aliases") or ():
-                    if not isinstance(alias, str):
-                        continue
-                    try:
-                        normalized_alias = normalize_comma_alias(alias)
-                    except ProfileError:
-                        continue
-                    reserve(normalized_alias, key)
-
-    if isinstance(enabled_entry, list):
-        for key in enabled_entry:
-            spec = specs["entry_specs"].get(key) if isinstance(key, str) else None
-            if isinstance(spec, dict):
-                add_secondary(spec["command_id"], key)
-            installed = installed_entries.get(key) if installed_entries else None
-            if isinstance(installed, dict) and isinstance(installed.get("command_id"), str):
-                add_secondary(installed["command_id"], key)
-    if isinstance(custom_entry, dict):
-        for key, spec in custom_entry.items():
-            if not isinstance(key, str):
-                continue
-            add_secondary(_custom_entry_command_id(key, spec), key)
-    if isinstance(custom_comma, dict):
-        for raw_key, spec in custom_comma.items():
-            if not isinstance(raw_key, str):
-                continue
-            try:
-                normalized_key = normalize_comma_alias(raw_key)
-            except ProfileError:
-                continue
-            key = normalized_key[1:]
-            add_secondary(_custom_comma_command_id(key, spec), key)
-
-    return {**secondary, **primary}, ambiguous | secondary_ambiguous
+def migrate_installed_shortcut_overrides(
+    raw: dict[str, Any], catalog: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebind legacy aliases to the installed owners before applying universal defaults."""
+    shortcuts = raw["shortcuts"]
+    aliases, ambiguous = shortcut_override_owners(
+        shortcuts.get("enabled_entry"), catalog.get("entry_shortcuts"), catalog.get("comma_commands"),
+    )
+    overrides = _normalize_overrides(
+        shortcuts.get("template_overrides"), aliases, ambiguous, keep_unresolved=True,
+    )
+    return {**raw, "shortcuts": {**shortcuts, "template_overrides": overrides}}
 
 
 def _custom_entry_command_id(key: str, spec: Any = None) -> str:
@@ -169,10 +90,7 @@ def _custom_comma_command_id(alias: str, spec: Any = None) -> str:
     )
 
 
-def validate_profile(
-    raw: Any, *, project: dict[str, Any] | None = None,
-    installed_entries: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a normalized copy of ``raw`` or raise ``ProfileError``."""
     specs = project_specs(project)
     profile = _copy_mapping(raw, "profile")
@@ -257,14 +175,10 @@ def validate_profile(
     for alias in custom_aliases:
         if alias in entry_aliases:
             raise ProfileError(f"自定义口令 {alias} 与开局口令冲突")
-    override_aliases, ambiguous_aliases = _shortcut_override_aliases(
-        {
-            "enabled_entry": enabled_entry,
-            "custom_entry": custom_entry,
-            "custom_comma": custom_comma,
-        },
-        specs,
-        installed_entries,
+    override_aliases, ambiguous_aliases = shortcut_override_owners(
+        enabled_entry,
+        {**{key: specs["entry_specs"][key] for key in global_entries}, **custom_entry},
+        custom_comma,
     )
     active_command_ids: set[str] = set()
     for command_id in (
@@ -478,8 +392,9 @@ def _resolve_override_alias(
     claimed by more than one owner fails closed instead
     of depending on iteration order.
     """
-    key = raw_key.strip()
-    lookup = normalize_comma_alias(key) if key.startswith(",") else key
+    lookup = shortcut_override_name(raw_key)
+    if lookup.startswith(","):
+        lookup = normalize_comma_alias(lookup)
     if lookup in ambiguous:
         raise ProfileError(
             f"template_overrides 的键 {raw_key!r} 指向多个口令，存在歧义"
@@ -501,7 +416,7 @@ def _record_override(
 
 
 def _normalize_overrides(
-    value: Any, aliases: dict[str, str], ambiguous: set[str]
+    value: Any, aliases: dict[str, str], ambiguous: set[str], *, keep_unresolved: bool = False,
 ) -> dict[str, str]:
     if value is None:
         return {}
@@ -511,9 +426,9 @@ def _normalize_overrides(
         if not isinstance(raw_key, str) or not raw_key.strip():
             raise ProfileError("template_overrides 的键必须是非空字符串")
         canonical = _resolve_override_alias(raw_key, aliases, ambiguous)
-        if canonical is None:
-            raise UnknownShortcutOverride(f"template_overrides 指向不存在的口令 {raw_key!r}")
-        _record_override(overrides, canonical, raw_key, item)
+        if canonical is None and not keep_unresolved:
+            raise ProfileError(f"template_overrides 指向不存在的口令 {raw_key!r}")
+        _record_override(overrides, canonical or raw_key, raw_key, item)
     return overrides
 
 
