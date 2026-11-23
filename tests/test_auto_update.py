@@ -10,6 +10,7 @@ from unittest import mock
 import subprocess
 import sys
 import time
+import zipfile
 
 from the_pilot import installer
 from the_pilot.assets import runtime
@@ -674,6 +675,96 @@ class AutoUpdateTest(unittest.TestCase):
                 local_report = json.loads((state / "auto_update.json").read_text())
                 self.assertEqual(local_report["last_checked_at"], 123456.0)
                 self.assertEqual(local_report["installed_sha"], sha)
+
+    def test_stale_build_staging_is_discarded_before_uv_reinstall_and_digest_converges(self):
+        """Deleted-module build residue cannot keep the same commit reinstalling."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, gemini = root / "home", root / "gemini"
+            checkout = home / "the-pilot"
+            checkout.mkdir(parents=True)
+            source = Path(__file__).parents[1]
+            for name in ("pyproject.toml", "setup.py", "README.md", ".gitignore"):
+                shutil.copyfile(source / name, checkout / name)
+            shutil.copytree(
+                source / "src", checkout / "src",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
+            for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
+                subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+            self.commit_checkout(checkout, "source")
+            stale = checkout / "build/lib/the_pilot/assets/autopilot.py"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("# deleted module residue\n", encoding="utf-8")
+            entry = home / ".local/bin/pilot"
+            entry.parent.mkdir(parents=True)
+            entry.write_text("#!/bin/sh\n")
+            entry.chmod(0o755)
+            package = home / ".local/share/uv/tools/the-pilot/lib/python3.12/site-packages/the_pilot"
+            shutil.copytree(checkout / "src/the_pilot", package)
+            (package / "assets/autopilot.py").write_text("# polluted install\n", encoding="utf-8")
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            (state / "auto_update.json").write_text(json.dumps({
+                "installed_sha": "old", "installed_tree_digest": "old",
+            }))
+            installs: list[Path] = []
+            real_run = installer.subprocess_run
+
+            def fake_run(command, timeout, *, env=None):
+                if command[:3] == ["uv", "tool", "install"]:
+                    checkout_arg = Path(command[-1])
+                    self.assertFalse((checkout_arg / "build").exists())
+                    shutil.rmtree(package)
+                    shutil.copytree(checkout_arg / "src/the_pilot", package)
+                    installs.append(checkout_arg)
+                    return ""
+                return real_run(command, timeout, env=env)
+
+            args = installer.build_parser().parse_args([
+                "self-update", "--local-only", "--gemini-dir", str(gemini),
+                "--home-dir", str(home), "--no-project", "--json",
+            ])
+            with mock.patch.object(installer.shutil, "which", return_value="/fake/uv"), \
+                    mock.patch.object(installer, "subprocess_run", side_effect=fake_run):
+                installer.self_update(args)
+                digest = installer._compute_source_tree_digest(checkout / "src/the_pilot")
+                self.assertEqual(len(installs), 1)
+                self.assertFalse((checkout / "build").exists())
+                self.assertFalse((package / "assets/autopilot.py").exists())
+                self.assertEqual(installer._compute_source_tree_digest(package), digest)
+                metadata = json.loads((state / "auto_update.json").read_text())
+                self.assertEqual(metadata["installed_tree_digest"], digest)
+                installer.self_update(args)
+                self.assertEqual(len(installs), 1)
+
+    @unittest.skipUnless(shutil.which("uv"), "uv is required to build a wheel")
+    def test_wheel_build_excludes_deleted_modules_left_in_build_staging(self):
+        """Stale gitignored build staging never reaches the distributable wheel."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            source = Path(__file__).parents[1]
+            for name in ("pyproject.toml", "setup.py", "README.md", "LICENSE"):
+                shutil.copyfile(source / name, checkout / name)
+            shutil.copytree(
+                source / "src", checkout / "src",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            stale = checkout / "build/lib/the_pilot/assets/autopilot.py"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("# deleted module residue\n", encoding="utf-8")
+            result = subprocess.run(
+                ["uv", "build", "--wheel", "--out-dir", str(root / "dist")],
+                cwd=checkout, capture_output=True, text=True, timeout=180,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            wheel = next((root / "dist").glob("*.whl"))
+            names = set(zipfile.ZipFile(wheel).namelist())
+            self.assertNotIn("the_pilot/assets/autopilot.py", names)
+            self.assertIn("the_pilot/assets/runtime.py", names)
 
     def test_project_only_zero_cooldown_syncs_clean_main_checkout_and_skips_dirty_or_branch(self):
         """Project-only sync updates clean main immediately and ignores dirty or feature branches."""
