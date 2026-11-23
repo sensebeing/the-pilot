@@ -86,8 +86,12 @@ class ProjectTest(unittest.TestCase):
                     self.assertTrue(bundle.gemini_block.endswith("\n"))
                     hooks = merge_hooks_json({"other": {"hooks": []}}, "/pilot/runtime.py")
                     self.assertEqual(hooks["other"], {"hooks": []})
-                    self.assertIn("the-pilot", hooks)
-                    self.assertIn("/pilot/runtime.py", json.dumps(hooks["the-pilot"]))
+                    for event in ("SessionStart", "PreInvocation", "Stop"):
+                        self.assertEqual(hooks["the-pilot"][event], [{
+                            "type": "command",
+                            "command": f"python3 /pilot/runtime.py hook --event {event}",
+                            "timeout": 10,
+                        }])
         original = copy.deepcopy(self.project)
         def compile_for(project):
             profile = resolve_profile(self.base, project=project)
