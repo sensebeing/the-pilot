@@ -25,6 +25,7 @@ import select
 import signal
 import stat
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 import shutil
 import subprocess
@@ -48,7 +49,8 @@ def _gemini_dir() -> Path:
     override = _env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
     if override:
         return Path(override).expanduser()
-    return Path(__file__).resolve().parents[2]
+    script = Path(__file__)
+    return (script.resolve() if __name__ == "__main__" else script.absolute()).parents[2]
 
 
 GEMINI_DIR = _gemini_dir()
@@ -69,7 +71,6 @@ LOCAL_SYNC_TIMEOUT_SECONDS = 45
 STOP_EXIT_TIMEOUT_SECONDS = 2.0
 CONFIRM_TIMEOUT_SECONDS = 2.0
 CONFIRM_DEADLINE_SECONDS = 5.0
-_RUNNING_SCRIPT_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 MODES = ("gate", "confirm", "off")
@@ -487,17 +488,26 @@ def workspace_config(
     config: dict[str, Any], profile: dict[str, Any], payload: dict[str, Any],
 ) -> dict[str, Any]:
     """Layer shortcut specs in memory, preserving the base on invalid input."""
+    preferences = profile.get("shortcuts")
+    preferences = preferences if isinstance(preferences, dict) else {}
+    enabled_entry = preferences.get("enabled_entry")
+    if isinstance(enabled_entry, list) and not enabled_entry:
+        return config
     try:
         overlay = _read_workspace_entries(payload)
         if overlay is None:
             return config
         path, specs = overlay
+        if isinstance(enabled_entry, list):
+            specs = {
+                key: spec for key, spec in specs.items()
+                if key not in UNIVERSAL_ENTRY_KEYS or key in enabled_entry
+            }
         if not specs:
             return config
         entries = dict(config.get("entry_shortcuts") or {})
         commands = dict(config.get("comma_commands") or {})
-        preferences = profile.get("shortcuts")
-        overrides = preferences.get("template_overrides") if isinstance(preferences, dict) else None
+        effective = {**config, "entry_shortcuts": entries, "comma_commands": commands}
         for key in specs.keys() & entries.keys():
             existing = entries[key]
             if isinstance(existing, dict) and isinstance(existing.get("command_id"), str):
@@ -505,13 +515,22 @@ def workspace_config(
         for key, spec in specs.items():
             entry = {**spec, "canonical_key": key}
             command_id = entry["command_id"]
-            if command_id in commands or find_comma_command({"comma_commands": commands}, f",{key}"):
+            if command_id in commands or find_comma_command(effective, f",{key}"):
                 raise ValueError(f"{path}: shortcut {key!r} conflicts with an installed command")
-            if isinstance(overrides, dict) and isinstance(overrides.get(key), str) and overrides[key].strip():
-                entry["template"] = overrides[key]
             entries[key] = entry
             commands[command_id] = entry_comma_command(key, entry)
-        return {**config, "entry_shortcuts": entries, "comma_commands": commands}
+        overrides = preferences.get("template_overrides")
+        if isinstance(overrides, dict) and overrides:
+            overrides = {_workspace_override_name(alias): template for alias, template in overrides.items()}
+            for key in specs:
+                entry = entries[key]
+                command_id = entry["command_id"]
+                for alias in _workspace_override_keys(effective, key, command_id):
+                    template = overrides.get(alias)
+                    if isinstance(template, str) and template.strip():
+                        entry["template"] = commands[command_id]["template"] = template
+                        break
+        return effective
     except (OSError, ValueError, RuntimeError) as exc:
         log_event("project_overlay_invalid", cid=payload.get("conversationId"), error=str(exc))
         return config
@@ -1886,18 +1905,25 @@ def emit_osc_7501(frame: str) -> bool:
     return True
 
 
+@cache
+def _running_script_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 def _sync_and_maybe_reexec(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     # The supervised child uses the updated engine without starting another
     # repair that its parent could interrupt when the re-exec times out.
     if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1":
         return None
-    if not maybe_sync_local_engine():
-        return None
     updated_engine = PILOT_DIR / "runtime.py"
     try:
+        # Capture the running script before the updater can replace it.
+        running_sha256 = _running_script_sha256()
+        if not maybe_sync_local_engine():
+            return None
         if not updated_engine.is_file():
             return None
-        if hashlib.sha256(updated_engine.read_bytes()).hexdigest() == _RUNNING_SCRIPT_SHA256:
+        if hashlib.sha256(updated_engine.read_bytes()).hexdigest() == running_sha256:
             return None
         result = subprocess.run(
             [sys.executable, str(updated_engine), "hook", "--event", event],
@@ -2914,6 +2940,49 @@ def _command_identity(
     return None
 
 
+def _workspace_override_name(name: str) -> str:
+    name = name.strip()
+    return name.lower() if name.startswith(",") else name
+
+
+def _workspace_override_keys(config: dict[str, Any], key: str, command_id: str) -> tuple[str, ...]:
+    names = (key, f",{key}")
+    command_name = _workspace_override_name(command_id)
+    owner = _command_identity(config, command_name)
+    # An ID is a secondary name, so it cannot claim another shortcut's alias.
+    if owner and owner[0] != key and (command_name.startswith(",") or owner[0] == command_name):
+        return names
+    return (*names, command_name)
+
+
+def _update_config_template(
+    config: dict[str, Any], canonical: str, command_id: str, template: str,
+) -> bool:
+    entry_shortcuts = config.get("entry_shortcuts")
+    entry_shortcuts = entry_shortcuts if isinstance(entry_shortcuts, dict) else {}
+    commands = config.get("comma_commands")
+    commands = commands if isinstance(commands, dict) else {}
+    updated = False
+    for key, entry in entry_shortcuts.items():
+        if not isinstance(entry, dict):
+            continue
+        if key == canonical or (command_id and entry.get("command_id") == command_id):
+            entry["template"] = template
+            updated = True
+    for key, command in commands.items():
+        if not isinstance(command, dict):
+            continue
+        aliases = [str(item).lower() for item in command.get("aliases") or []]
+        if (
+            key == command_id
+            or command.get("command_id") == command_id
+            or f",{canonical}".lower() in aliases
+        ):
+            command["template"] = template
+            updated = True
+    return updated
+
+
 def command_set(target: str, template: str) -> int:
     template = template.strip()
     if not template:
@@ -2946,43 +3015,39 @@ def command_set(target: str, template: str) -> int:
                 file=sys.stderr,
             )
             return 2
+        workspace_catalog = None
         identity = _command_identity(config, target)
+        if identity is None:
+            workspace_catalog = workspace_config(config, profile, {})
+            identity = _command_identity(workspace_catalog, target)
         if identity is None:
             print(f"未知口令 {target!r}；请用 status 查看可用口令。", file=sys.stderr)
             return 2
         canonical, command_id = identity
-        entry_shortcuts = config.get("entry_shortcuts")
-        entry_shortcuts = entry_shortcuts if isinstance(entry_shortcuts, dict) else {}
-        commands = config.get("comma_commands")
-        commands = commands if isinstance(commands, dict) else {}
-        updated = False
-        for key, entry in entry_shortcuts.items():
-            if not isinstance(entry, dict):
-                continue
-            if key == canonical or (command_id and entry.get("command_id") == command_id):
-                entry["template"] = template
-                updated = True
-        for key, command in commands.items():
-            if not isinstance(command, dict):
-                continue
-            aliases = [str(item).lower() for item in command.get("aliases") or []]
-            if (
-                key == command_id
-                or command.get("command_id") == command_id
-                or f",{canonical}".lower() in aliases
-            ):
-                command["template"] = template
-                updated = True
-        if not updated:
+        if workspace_catalog is None and not _update_config_template(config, canonical, command_id, template):
             print(f"未知口令 {target!r}；请用 status 查看可用口令。", file=sys.stderr)
             return 2
         shortcuts = profile.setdefault("shortcuts", {})
         overrides = shortcuts.setdefault("template_overrides", {})
+        if workspace_catalog is not None:
+            installed_entries = config.get("entry_shortcuts") or {}
+            enabled_entry = shortcuts.setdefault(
+                "enabled_entry", [key for key in UNIVERSAL_ENTRY_KEYS if key in installed_entries],
+            )
+            if not isinstance(enabled_entry, list):
+                print("profile.json 的 shortcuts.enabled_entry 必须是列表。", file=sys.stderr)
+                return 2
+            if canonical not in enabled_entry:
+                enabled_entry.append(canonical)
+            aliases = _workspace_override_keys(workspace_catalog, canonical, command_id)
+            for alias in list(overrides):
+                if _workspace_override_name(alias) in aliases:
+                    del overrides[alias]
         overrides[canonical] = template
         if not save_json(PROFILE_PATH, profile):
             print("profile.json 写入失败。", file=sys.stderr)
             return 2
-        if not save_json(CONFIG_PATH, config):
+        if workspace_catalog is None and not save_json(CONFIG_PATH, config):
             print("config.json 写入失败；下次 apply --upgrade 会重新编译。", file=sys.stderr)
             return 2
         log_event("template_set", target=target, key=canonical, command_id=command_id)

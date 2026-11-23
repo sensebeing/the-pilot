@@ -46,6 +46,99 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0 if ok else 2, result.stderr)
         return json.loads(result.stdout)
 
+    def workspace_overlay(self, workspace, project):
+        path = workspace / ".pilot/project.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(project), encoding="utf-8")
+
+    def runtime_cli(self, *args, cwd=None, payload=None):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "bin/pilot"), *args],
+            input=json.dumps(payload) if payload is not None else None,
+            env=self.env, cwd=cwd or self.root, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def pre(self, workspace, command, cid):
+        return json.loads(self.runtime_cli(
+            "hook", "--event", "PreInvocation",
+            payload={"conversationId": cid, "lastUserInput": command, "workspacePaths": [str(workspace)]},
+        ).stdout)
+
+    def test_workspace_shortcuts_respect_profile_entry_selection(self):
+        """Workspace entries honor an empty selection and preserve disabled built-in keys."""
+        repo = self.root / "repo"
+        review = dict(self.project["entry_specs"]["fb"], command_id="CMD_LOCAL_REVIEW",
+                      template="Local review {arg}")
+        project = dict(self.project, entry_specs={**self.project["entry_specs"], "r": review})
+        self.workspace_overlay(repo, project)
+        for index, args in enumerate((("--preset", "orchestration-only"), ("--entry-shortcuts", ""))):
+            self.cli("apply", *args, cwd=repo)
+            for command in ("fb", ",fb", "r", ",r"):
+                with self.subTest(args=args, command=command):
+                    self.assertEqual(self.pre(repo, f"{command} sample", f"{index}-{command}"), {})
+        self.cli("apply", "--entry-shortcuts", "pull", cwd=repo)
+        for command in ("r", ",r"):
+            self.assertEqual(self.pre(repo, f"{command} sample", f"partial-{command}"), {})
+        self.assertIn("$alter-feedback", json.dumps(self.pre(repo, "fb sample", "partial-fb")))
+        self.cli("apply", "--entry-shortcuts", "r,pull", cwd=repo)
+        self.assertIn("Local review sample", json.dumps(self.pre(repo, ",r sample", "enabled-r")))
+
+    def test_workspace_shortcut_overrides_use_all_supported_identities(self):
+        """A profile override can name a workspace shortcut by key, alias, or command ID."""
+        repo = self.root / "repo"
+        self.workspace_overlay(repo, self.project)
+        self.cli("apply", cwd=repo)
+        path = self.gemini / "config/the-pilot/profile.json"
+        profile = json.loads(path.read_text())
+        for target in ("fb", ",fb", " ,FB ", self.project["entry_specs"]["fb"]["command_id"]):
+            profile["shortcuts"]["template_overrides"] = {target: "Custom feedback {arg}"}
+            path.write_text(json.dumps(profile), encoding="utf-8")
+            for command in ("fb", ",fb"):
+                with self.subTest(target=target, command=command):
+                    output = self.pre(repo, f"{command} sample", f"{target}-{command}")
+                    self.assertIn("Custom feedback sample", json.dumps(output))
+        for command_id in ("fb", ",FB"):
+            alert = dict(self.project["entry_specs"]["al"], command_id=command_id)
+            self.workspace_overlay(repo, dict(
+                self.project, entry_specs={**self.project["entry_specs"], "al": alert},
+            ))
+            profile["shortcuts"]["template_overrides"] = {command_id: "Custom feedback {arg}"}
+            path.write_text(json.dumps(profile), encoding="utf-8")
+            with self.subTest(command_id=command_id):
+                self.assertIn("Custom feedback sample", json.dumps(self.pre(repo, "fb sample", f"owner-{command_id}")))
+                output = self.pre(repo, "al sample", f"collision-{command_id}")
+                self.assertIn("$alter-alert", json.dumps(output))
+                self.assertNotIn("Custom feedback", json.dumps(output))
+
+    def test_pilot_set_keeps_workspace_override_across_upgrade(self):
+        """Setting a project template changes only personal preferences and survives recompile."""
+        repo, neutral = self.root / "repo", self.root / "neutral"
+        neutral.mkdir()
+        self.workspace_overlay(repo, self.project)
+        self.cli("apply", cwd=repo)
+        pilot = self.gemini / "config/the-pilot"
+        profile = pilot / "profile.json"
+        preferences = json.loads(profile.read_text())
+        preferences["shortcuts"]["template_overrides"] = {
+            " ,FB ": "Old alias {arg}",
+            self.project["entry_specs"]["fb"]["command_id"]: "Old command ID {arg}",
+        }
+        profile.write_text(json.dumps(preferences), encoding="utf-8")
+        config = pilot / "config.json"
+        before = config.read_bytes(), config.stat().st_mtime_ns
+        self.runtime_cli("set", ",fb", "Custom feedback {arg}", cwd=repo)
+        self.assertEqual((config.read_bytes(), config.stat().st_mtime_ns), before)
+        self.cli("apply", "--upgrade", cwd=repo)
+        self.assertEqual(config.read_bytes(), before[0])
+        preferences = json.loads(profile.read_text())["shortcuts"]
+        self.assertIn("fb", preferences["enabled_entry"])
+        self.assertEqual(preferences["template_overrides"], {"fb": "Custom feedback {arg}"})
+        for command in ("fb", ",fb"):
+            self.assertIn("Custom feedback sample", json.dumps(self.pre(repo, f"{command} sample", command)))
+            self.assertEqual(self.pre(neutral, f"{command} sample", f"neutral-{command}"), {})
+
     def test_workspace_shortcuts_stay_out_of_global_artifacts(self):
         """Each turn sees its nearest overlay and no other workspace's entries."""
         repo_a, repo_b, repo_c = (self.root / name for name in ("alpha", "beta", "neutral"))

@@ -15,6 +15,21 @@ from the_pilot.assets import runtime
 
 
 class AutoUpdateTest(unittest.TestCase):
+    def test_shared_runtime_helpers_load_without_reading_the_script(self):
+        """Package callers can use shared helpers without a readable runtime script."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script_path = root / "runtime.py"
+            gemini = root / "gemini"
+            loaded_code = compile(Path(runtime.__file__).read_bytes(), str(script_path), "exec")
+            module = {"__name__": "shared_pilot_runtime", "__file__": str(script_path)}
+            with mock.patch.dict(os.environ, {
+                "HOME": str(root / "home"), "THE_PILOT_GEMINI_DIR": str(gemini),
+            }):
+                exec(loaded_code, module)
+            self.assertTrue(module["is_entry_key"]("deploy-check"))
+            self.assertFalse(gemini.exists())
+
     def test_hook_and_auto_update_logs_rotate_at_512_kib(self):
         """A writer replaces the previous archive and starts a fresh log at 512 KiB."""
         with tempfile.TemporaryDirectory() as directory:

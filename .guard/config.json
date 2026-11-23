@@ -59,7 +59,7 @@
           "the_pilot.cli"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "project.py may only depend on defaults.py."
+        "message": "project.py may only depend on defaults.py and pure schema helpers in assets/runtime.py."
       },
       {
         "scope_prefixes": [
@@ -73,7 +73,7 @@
           "the_pilot.cli"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "profile.py may only depend on defaults.py and project.py."
+        "message": "profile.py may only depend on defaults.py, project.py, and pure schema helpers in assets/runtime.py."
       },
       {
         "scope_prefixes": [

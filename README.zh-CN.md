@@ -236,7 +236,7 @@ pilot status --json
 | `pilot mode [status\|gate\|confirm\|off]` | 查看或切换 Turn Pilot 模式（`gate`、`confirm`、`off`）。 |
 | `pilot worker [status\|codex\|claude\|cc]` | 查看或持久化子会话执行器优先级（`codex > claude` 或 `claude > codex`），并在下一轮热加载。 |
 | `pilot sync` | 手工编辑已安装的 `scenes/*.md` 后，将其同步刷新到 `GEMINI.md` 场景段。 |
-| `pilot set <shortcut> <template>` | 在 `profile.json` 中持久化自定义口令模板并重新编译 `config.json`。 |
+| `pilot set <shortcut> <template>` | 将口令模板保存到 `profile.json`。修改仓库口令时，在对应工作区运行。 |
 | `pilot log [--lines <n>]` | 查看 `state/pilot.log` 中的结构化运行时投递日志。 |
 | `pilot hook --event <PreInvocation\|Stop>` | 供宿主 Agent 运行时调用的生命周期 Hook 入口。 |
 

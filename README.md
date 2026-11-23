@@ -240,7 +240,7 @@ Check update status anytime via `pilot status --json` (`auto_update` field) or t
 | `pilot mode [status\|gate\|confirm\|off]` | Inspect or switch Turn Pilot mode (`gate`, `confirm`, `off`). |
 | `pilot worker [status\|codex\|claude\|cc]` | Inspect or persist worker priority (`codex > claude` vs. `claude > codex`) and schedule next-turn hot reload. |
 | `pilot sync` | Re-sync the `GEMINI.md` scene block after editing installed `scenes/*.md` files. |
-| `pilot set <shortcut> <template>` | Persist a custom shortcut template override in `profile.json` and recompile `config.json`. |
+| `pilot set <shortcut> <template>` | Save a template override in `profile.json`. Run it from the workspace for repository shortcuts. |
 | `pilot log [--lines <n>]` | Inspect structured runtime delivery events from `state/pilot.log`. |
 | `pilot hook --event <PreInvocation\|Stop>` | Lifecycle Hook entrypoint invoked by the host agent runtime. |
 
