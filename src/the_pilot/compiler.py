@@ -166,21 +166,21 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
     review_priority = " > ".join(AGENT_LABELS[item] for item in review_agents)
     return f"""{LEGACY_ORCHESTRATION_HEADING}{priority}）
 
-编排前执行 `orca skills get orchestration`，遵循技能及按需 references。
+先读 `orca skills get orchestration` 及所需 references。
 
 1. **职责分离**：
-   - **Tier-1 主会话（Coordinator，无 Orca Task ID / Dispatch ID preamble）**：原生 **{coordinator_label}**（`antigravity`），直接 `agy --dangerously-skip-permissions`，账户池由 Orca 与 `agy-switch` 管理，禁用 `magpie agy`。顶层工作区先登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`。**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障查同链路历史与端到端拓扑，禁叠黑白名单、局部重试或特判。
-   - **Tier-2 子会话（Dispatched Worker，有 Orca live Task ID / Dispatch ID preamble）**：除极简单改动，实施交 Orca worker。独立分支修改、定向验证、提交并报 `worker_done`；禁止嵌套派工。
-2. **Orca 编排（执行器优先级：{priority}）**：禁用 `invoke_subagent` 和无监督裸终端。先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定 Run。{executor}。Task spec 自包含 Target、Contracts、Files、Boundaries、Ownership、Acceptance，载明业务目标、Anchor 0、最简模型及「未经主会话 Review 不得合入或推送 `main`」。
-3. **工作区层级与回调**：
+   - **Tier-1 主会话（无 Orca Task/Dispatch ID 前导）**：用原生 **{coordinator_label}**（`antigravity`）直接跑 `agy --dangerously-skip-permissions`。Orca/`agy-switch` 管账户池，禁 `magpie agy`。顶层工作区先登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`。**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障查同链路历史与端到端拓扑，禁叠黑白名单、局部重试或特判。
+   - **Tier-2 子会话（有 Orca Task/Dispatch ID 前导）**：除极简改动均派 Orca worker。独立分支实施、定向验证、提交并报 `worker_done`，禁嵌套派工。
+2. **Orca 编排**。禁用 `invoke_subagent` 和无监督裸终端。先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定 Run。{executor}。Task spec 自含 Target、Contracts、Files、Boundaries、Ownership、Acceptance、业务目标、Anchor 0、最简模型及「未经主会话 Review 不得合入或推送 `main`」。
+3. **工作区层级与回调**。长/多行契约用 `--spec-file <路径>`，纯文档/只读子任务可用 `--setup skip`。
    - 同工作区 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）。
-   - 同仓子工作区 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须指定 `--parent-worktree active` 或 `path:<当前路径>`）。
-   - 跨仓回传 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，`worker_done` 唤醒主会话。
-   - 禁止平级 `--worktree new-top-level`/`--no-parent`。仅用户明确要求独立长期 Tier-1 可用 `--no-parent`（原生 {coordinator_label}），需回执则绑定 Dealer thread 或 `orca orchestration send`。
+   - 同仓子工作区 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建用 `--parent-worktree active` 或 `path:<当前路径>`）。
+   - 跨仓 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`。
+   - 禁平级 `--worktree new-top-level`/`--no-parent`。仅用户明确要求独立长期 Tier-1 可用 `--no-parent`（原生 {coordinator_label}），需回执则绑定 Dealer thread 或 `orca orchestration send`。
 4. **交互与验收**：
-   - `orca orchestration check --wait --types "worker_done,escalation,question" --timeout-ms 900000 --json` 等回执，`reply`/`send` 裁决和指导，`--ack` 确认消费。
-   - `worker_done` 后主会话亲审：对照业务目标与 Anchor 0 蓝图，核查真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，并检查 `peq.*`（唯一真源、无循环依赖/函数内联导入/行内抑制、职责、测试、门禁）。代码落地后的独立架构审查优先级：**`{review_priority}`**（文档/方案阶段在当前主会话内完成，不拉起单独审查子会话）。
-   - 未达标用 `worker-show` 取已验证终端，建整改 Task，`worker-start --worktree path:<子工作区路径> --terminal <handle>` 派回；通过后同终端 follow-up 通知合入并推送 `main`。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
+   - `worker-start`/`reply`/`send` 后即以 `scene=NONE` 结束回合，等 Orca 原生唤醒。醒后按需 `orca orchestration check --environment local --json`，消费时自动标记已处理。`reply --id <msg_id>` 裁决。禁后台 `--wait` 查信、`manage_task` 轮询、`sleep`。
+   - `worker_done` 后主会话对照业务目标与 Anchor 0 蓝图，亲审真实 diff 与改动后模块全貌。按 `architecture-re-review` 重读起点、盘点现状、零基对账，查 `peq.*`。先过秒级本地静态门禁（文档结构、静态策略）再跑模型 `guard review`。独立代码复审优先 **`{review_priority}`**，文档/方案仅主会话审。
+   - 整改或审过后通知合入推送 `main` 用 `orca orchestration send --environment local --to dispatch:<dispatch_id> --subject "<主题>" --body-file <路径> --json`。多行用 `--body-file`，禁 `python3 -c` 拼引号。`worker-start --terminal <handle>` 省略 `--worktree`。结算后 `worker-release`（禁用 `orca terminal close` 替代），确认 `worker-list --terminal-state reclaimable` 无遗留后清理子工作区及已合入分支。"""
 
 
 def render_orchestration_block(profile: dict[str, Any]) -> str:
