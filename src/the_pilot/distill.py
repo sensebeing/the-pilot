@@ -25,7 +25,7 @@ from .defaults import (
     SCENE_ORDER,
 )
 from .profile import validate_profile
-from .project import ProfileError, project_specs
+from .project import ProfileError
 
 DISTILL_SCHEMA = "the-pilot-distillation/v1"
 DEFAULT_DAYS = 7
@@ -225,7 +225,6 @@ def distill_chat_history(
     evidence_complete = (
         config_status.get("status") != "error"
         and installed_pipeline["profile_status"] != "error"
-        and installed_pipeline["project_status"] != "error"
         and installed_pipeline["scenes_status"] != "error"
         and all(
             src["status"] != "degraded"
@@ -1000,13 +999,11 @@ def _is_machine_message(text: str) -> bool:
     return False
 
 
-def _effective_stage_contracts(
-    specs: dict[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Pair universal stage obligations with the effective project scene specs."""
+def _installed_stage_contracts() -> dict[str, dict[str, Any]]:
+    """Pair stage obligations with the universal scene metadata."""
     contracts: dict[str, dict[str, Any]] = {}
     for stage, contract in PIPELINE_STAGE_CONTRACTS.items():
-        scene_spec = specs["scene_specs"][stage]
+        scene_spec = DEFAULT_SPECS["scene_specs"][stage]
         merged = copy.deepcopy(contract)
         merged["order"] = scene_spec["order"]
         merged["title"] = scene_spec["title"]
@@ -1026,13 +1023,11 @@ def _installed_path(gemini_dir: Path, name: str) -> Path:
 def _inspect_installed_pipeline(
     gemini_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """Inspect the installed project overlay, profile, and scenes without guessing."""
+    """Inspect the installed profile and scenes against the universal catalog."""
     profile_path = _installed_path(gemini_dir, "profile.json")
-    project_path = _installed_path(gemini_dir, "project.json")
     scenes_dir = _installed_path(gemini_dir, "scenes")
     result: dict[str, Any] = {
         "profile_status": "absent" if not profile_path.is_file() else "ok",
-        "project_status": "absent" if not project_path.is_file() else "ok",
         "scenes_status": "absent" if not scenes_dir.is_dir() else "ok",
         "mode": None,
         "max_consecutive_auto_turns": None,
@@ -1045,24 +1040,10 @@ def _inspect_installed_pipeline(
         "guardrail_count": 0,
         "redundant_guardrails": [],
     }
-    specs = DEFAULT_SPECS
-    project_raw = None
-    if project_path.is_file():
-        try:
-            project_raw = json.loads(project_path.read_text(encoding="utf-8"))
-            specs = project_specs(project_raw)
-        except (OSError, ProfileError, json.JSONDecodeError) as exc:
-            result["project_status"] = "error"
-            result["error"] = str(exc)
-            if profile_path.is_file():
-                result["profile_status"] = "error"
-            # The project overlay owns the effective scene specs. Without it the
-            # profile and scene contracts must not be validated against defaults.
-            return result, {}
     if profile_path.is_file():
         try:
             raw_profile = json.loads(profile_path.read_text(encoding="utf-8"))
-            profile = validate_profile(raw_profile, project=project_raw)
+            profile = validate_profile(raw_profile)
         except (OSError, ProfileError, json.JSONDecodeError) as exc:
             result["profile_status"] = "error"
             result["error"] = str(exc)
@@ -1079,9 +1060,9 @@ def _inspect_installed_pipeline(
                 "guardrail_count": len(scenes["guardrails"]),
             })
             required_guardrails = {
-                specs["scene_specs"][stage]["required_guardrail"].strip()
+                DEFAULT_SPECS["scene_specs"][stage]["required_guardrail"].strip()
                 for stage in enabled_scenes
-                if specs["scene_specs"][stage]["required_guardrail"]
+                if DEFAULT_SPECS["scene_specs"][stage]["required_guardrail"]
             }
             guardrail_counts = Counter(
                 guardrail.strip() for guardrail in scenes["guardrails"]
@@ -1093,7 +1074,7 @@ def _inspect_installed_pipeline(
             )
 
     stage_by_file = {
-        spec["file"]: stage for stage, spec in specs["scene_specs"].items()
+        spec["file"]: stage for stage, spec in DEFAULT_SPECS["scene_specs"].items()
     }
     incomplete: set[str] = set()
     present_files: set[str] = set()
@@ -1120,7 +1101,7 @@ def _inspect_installed_pipeline(
                     broken_contract = (
                         meta_name != stage
                         or str(meta.get("required_guardrail") or "").strip()
-                        != specs["scene_specs"][stage]["required_guardrail"]
+                        != DEFAULT_SPECS["scene_specs"][stage]["required_guardrail"]
                     )
                 if (
                     not str(meta.get("description") or "").strip()
@@ -1138,11 +1119,11 @@ def _inspect_installed_pipeline(
             result.setdefault("error", str(exc))
     if result["profile_status"] == "ok" and result["scenes_status"] != "error":
         for stage in result["enabled_scenes"]:
-            scene_file = specs["scene_specs"][stage]["file"]
+            scene_file = DEFAULT_SPECS["scene_specs"][stage]["file"]
             if scene_file not in present_files:
                 incomplete.add(scene_file)
     result["incomplete_scene_contracts"] = sorted(incomplete)
-    return result, _effective_stage_contracts(specs)
+    return result, _installed_stage_contracts()
 
 
 def _analyze_pipeline_flow(
@@ -1523,7 +1504,7 @@ def _classify_pattern(signature: str, turn_role: str, count: int) -> tuple[str, 
     if any(kw in lower for kw in ("收尾", "文档", "working.md", "worker-release", "工作区", "closeout", "cleanup")):
         return "closeout_and_sync", {
             "target": "scenes.closeout-and-sync",
-            "action": "Keep `closeout-and-sync` enabled and codify project closeout steps in `.pilot/project.json` (`scene_specs.closeout-and-sync.fallback_prompt`).",
+            "action": "Keep `closeout-and-sync` enabled and record project closeout steps in the repository instructions or runbook.",
             "scene": "closeout-and-sync",
         }
     if turn_role == "entry":
@@ -1576,7 +1557,6 @@ def _build_recommendations(
         evidence_complete
         and config_status.get("status") == "absent"
         and pipeline_assessment.get("installed_pipeline", {}).get("profile_status") != "error"
-        and pipeline_assessment.get("installed_pipeline", {}).get("project_status") != "error"
         and pipeline_assessment.get("installed_pipeline", {}).get("scenes_status") != "error"
         and not pilot_counts
         and manual_records

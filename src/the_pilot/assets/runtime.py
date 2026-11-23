@@ -10,8 +10,8 @@ The engine is deliberately small and mechanical:
 * Everything durable lives in `profile.json` (preferences) and a per-session
   JSON file (conversation turn state). No delivery ledger, no install marker.
 
-All settings are read from the installed `config/the-pilot` directory; no
-personal paths are hard-coded.
+Global settings come from the installation. Repository shortcuts come from
+the active workspace and live only for the current PreInvocation.
 """
 from __future__ import annotations
 
@@ -62,9 +62,10 @@ STATE_DIR = Path(
     or str(PILOT_DIR / "state")
 ).expanduser()
 LOG_PATH = STATE_DIR / "pilot.log"
+LOG_ROTATE_BYTES = 512 * 1024
 # The installer gives its own ``apply`` child 30 s; this outer deadline must be
 # longer so a legitimate repair always finishes before the hook may kill it.
-PROJECT_SYNC_TIMEOUT_SECONDS = 45
+LOCAL_SYNC_TIMEOUT_SECONDS = 45
 STOP_EXIT_TIMEOUT_SECONDS = 2.0
 CONFIRM_TIMEOUT_SECONDS = 2.0
 CONFIRM_DEADLINE_SECONDS = 5.0
@@ -74,6 +75,10 @@ AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 MODES = ("gate", "confirm", "off")
 PROFILE_SCHEMA = "the-pilot-profile/v1"
 LEGACY_PROFILE_SCHEMA = "orca-autopilot-profile/v1"
+PROJECT_SCHEMA = "the-pilot-project/v1"
+UNIVERSAL_ENTRY_KEYS = ("r", "rt", "d", "pull")
+RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent", "pilot", "autopilot"})
+LEGACY_PROJECT_FIELDS = frozenset({"presets", "scene_specs", "deliver_content", "feedback_closeout"})
 RECOVERY_FAILED_MESSAGE = (
     "【Pilot 恢复失败】状态文件未能安全重建，自动投递保持暂停；"
     "请用一句话告知用户，无需执行其他操作。"
@@ -161,6 +166,16 @@ def _named_command(text: str, names: set[str], targets: set[str], default: str =
     return target if target in targets else ""
 
 
+def is_comma_alias(value: str) -> bool:
+    return bool(value) and value[0] in "abcdefghijklmnopqrstuvwxyz0123456789" and all(
+        char in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in value
+    )
+
+
+def is_entry_key(value: str) -> bool:
+    return is_comma_alias(value) and value[0] in "abcdefghijklmnopqrstuvwxyz"
+
+
 def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
     # Custom aliases do not allow whitespace between the comma and their name.
     raw = text[1:] if comma and text.startswith(",") else text
@@ -191,17 +206,23 @@ def read_payload() -> tuple[dict[str, Any] | None, str]:
 
 
 def log_event(event: str, **fields: Any) -> None:
-    record = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "event": event,
-        **fields,
-    }
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_log_event(LOG_PATH, event, **fields)
     except OSError:
         return
+
+
+def append_log_event(path: Path, event: str, /, **fields: Any) -> None:
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event, **fields}
+    archive = path.with_name(f"{path.name}.1")
+    with _file_lock(path.with_name(f"{path.name}.lock")):
+        try:
+            if path.stat().st_size >= LOG_ROTATE_BYTES:
+                os.replace(path, archive)
+        except FileNotFoundError:
+            pass
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def load_json(path: Path) -> tuple[dict[str, Any] | None, str, str]:
@@ -274,8 +295,8 @@ def _pilot_binary() -> str:
     return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else ""
 
 
-def _run_project_sync(command: list[str]) -> tuple[int, str, str] | None:
-    """Run one project sync and kill the whole process group if it overruns.
+def _run_local_sync(command: list[str]) -> tuple[int, str, str] | None:
+    """Run one local engine sync and kill the whole process group if it overruns.
 
     The updater may spawn an ``apply`` child that writes the installation. Its
     own 30 s budget fits inside this deadline, so a healthy repair finishes; if
@@ -292,10 +313,10 @@ def _run_project_sync(command: list[str]) -> tuple[int, str, str] | None:
             start_new_session=True,
         )
     except OSError as exc:
-        log_event("project_auto_sync_failed", error=str(exc))
+        log_event("local_auto_sync_failed", error=str(exc))
         return None
     try:
-        stdout, stderr = process.communicate(timeout=PROJECT_SYNC_TIMEOUT_SECONDS)
+        stdout, stderr = process.communicate(timeout=LOCAL_SYNC_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -303,21 +324,18 @@ def _run_project_sync(command: list[str]) -> tuple[int, str, str] | None:
             pass
         process.kill()
         process.communicate()
-        log_event("project_auto_sync_timeout")
+        log_event("local_auto_sync_timeout")
         return None
     return process.returncode, stdout, stderr
 
 
-def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
-    """Sync the project overlay and report whether no repair is outstanding.
+def maybe_sync_local_engine() -> bool:
+    """Sync the local engine and report whether no repair is outstanding.
 
     A ``False`` result means a repair was started but did not confirm
     completion, so callers must not inspect or re-execute the installed engine
     this turn.
     """
-    workspace_paths = payload.get("workspacePaths")
-    if not isinstance(workspace_paths, list):
-        workspace_paths = []
     if (_env_value("THE_PILOT_GEMINI_DIR", "ORCA_AUTOPILOT_GEMINI_DIR")
             and _env_value("THE_PILOT_ENABLE_AUTO_UPDATE", "ORCA_AUTOPILOT_ENABLE_AUTO_UPDATE") != "1"
             and not _env_value("THE_PILOT_BIN", "ORCA_AUTOPILOT_PILOT_BIN")):
@@ -325,20 +343,15 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
     pilot_bin = _pilot_binary()
     if not pilot_bin:
         return True
-    workspace = str(workspace_paths[0]) if workspace_paths else ""
-    command = [pilot_bin, "self-update", "--project-only"]
-    if workspace:
-        command.extend(["--workspace", workspace])
-    command.extend(["--gemini-dir", str(GEMINI_DIR), "--json"])
-    completed = _run_project_sync(command)
+    command = [pilot_bin, "self-update", "--project-only", "--gemini-dir", str(GEMINI_DIR), "--json"]
+    completed = _run_local_sync(command)
     if completed is None:
-        log_event("project_auto_sync_failed", workspace=workspace, error="project_sync_incomplete")
+        log_event("local_auto_sync_failed", error="local_sync_incomplete")
         return False
     returncode, stdout, stderr = completed
     if returncode != 0:
         log_event(
-            "project_auto_sync_failed",
-            workspace=workspace,
+            "local_auto_sync_failed",
             returncode=returncode,
             error=(stderr or stdout).strip()[-300:],
         )
@@ -346,16 +359,16 @@ def maybe_sync_project_overlay(payload: dict[str, Any]) -> bool:
     try:
         receipt = json.loads(stdout) if stdout.strip() else {}
     except ValueError as exc:
-        log_event("project_auto_sync_failed", workspace=workspace, error=str(exc))
+        log_event("local_auto_sync_failed", error=str(exc))
         return False
     if not isinstance(receipt, dict):
-        log_event("project_auto_sync_failed", workspace=workspace, error="receipt_not_object")
+        log_event("local_auto_sync_failed", error="receipt_not_object")
         return False
     if receipt.get("error"):
-        log_event("project_auto_sync_failed", workspace=workspace, error=str(receipt["error"]))
+        log_event("local_auto_sync_failed", error=str(receipt["error"]))
         return False
-    if receipt.get("project_status") == "updated" or receipt.get("local_source_status") == "updated":
-        log_event("project_auto_synced", workspace=workspace)
+    if receipt.get("local_source_status") == "updated":
+        log_event("local_auto_synced")
     return True
 
 
@@ -391,6 +404,117 @@ def load_profile() -> tuple[dict[str, Any] | None, str, str]:
 
 def load_config() -> tuple[dict[str, Any] | None, str, str]:
     return load_json(CONFIG_PATH)
+
+
+def validate_project_entries(raw: Any) -> dict[str, dict[str, Any]]:
+    """Validate the v1 overlay envelope and its executable shortcut specs."""
+    if not isinstance(raw, dict) or raw.get("schema") != PROJECT_SCHEMA:
+        raise ValueError(f"project.schema must be {PROJECT_SCHEMA}")
+    allowed = {"schema", "projectId", "description", "entry_order", "entry_specs", *LEGACY_PROJECT_FIELDS}
+    if set(raw) - allowed:
+        raise ValueError(f"Unknown project fields: {sorted(set(raw) - allowed)}")
+    if not isinstance(raw.get("projectId"), str) or not raw["projectId"].strip():
+        raise ValueError("projectId must be a nonempty string")
+    if "description" in raw and not isinstance(raw["description"], str):
+        raise ValueError("project.description must be a string")
+    specs = raw.get("entry_specs", {})
+    order = raw.get("entry_order", list(UNIVERSAL_ENTRY_KEYS))
+    for field in LEGACY_PROJECT_FIELDS | {"entry_specs"}:
+        if field in raw and not isinstance(raw[field], dict):
+            raise ValueError(f"project.{field} must be an object")
+    if (not isinstance(order, list) or not all(isinstance(key, str) for key in order)
+            or len(order) != len(set(order)) or set(specs) - set(order)
+            or set(order) - set(specs) - set(UNIVERSAL_ENTRY_KEYS)):
+        raise ValueError("entry_order must list each entry spec once and may include built-in entries")
+    identities = set()
+    required = {"command_id", "description", "requires_arg", "usage", "template"}
+    for key, spec in specs.items():
+        if not is_entry_key(key) or key in RESERVED_COMMA_ALIASES:
+            raise ValueError(f"Invalid or reserved entry key: {key}")
+        if not isinstance(spec, dict) or not required <= set(spec) or set(spec) - required - {"workflow_type"}:
+            raise ValueError(f"Invalid entry spec: {key}")
+        if not isinstance(spec["requires_arg"], bool):
+            raise ValueError(f"{key}.requires_arg must be boolean")
+        for field in set(spec) - {"requires_arg"}:
+            if not isinstance(spec[field], str) or not spec[field].strip():
+                raise ValueError(f"{key}.{field} must be nonempty text")
+        if spec["command_id"] in identities:
+            raise ValueError("Project entry command IDs must be unique")
+        identities.add(spec["command_id"])
+    return {key: specs[key] for key in order if key in specs}
+
+
+def entry_comma_command(key: str, shortcut: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "command_id": shortcut["command_id"],
+        "canonical_key": key,
+        "aliases": [f",{key}"],
+        "scene": "",
+        "title": shortcut["description"],
+        "template": shortcut["template"],
+        **({"workflow_type": shortcut["workflow_type"]} if "workflow_type" in shortcut else {}),
+    }
+
+
+def _workspace_directory(payload: dict[str, Any]) -> Path:
+    paths = payload.get("workspacePaths")
+    if isinstance(paths, list):
+        for path in paths:
+            if isinstance(path, str) and path.strip():
+                return Path(path)
+    cwd = payload.get("cwd")
+    return Path(cwd) if isinstance(cwd, str) and cwd.strip() else Path.cwd()
+
+
+def _read_workspace_entries(
+    payload: dict[str, Any],
+) -> tuple[Path, dict[str, dict[str, Any]]] | None:
+    workspace = _workspace_directory(payload).resolve()
+    for directory in (workspace, *workspace.parents):
+        path = directory / ".pilot/project.json"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        try:
+            return path, validate_project_entries(json.loads(text))
+        except (ValueError, RecursionError) as exc:
+            raise ValueError(f"{path}: {exc}") from exc
+    return None
+
+
+def workspace_config(
+    config: dict[str, Any], profile: dict[str, Any], payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Layer shortcut specs in memory, preserving the base on invalid input."""
+    try:
+        overlay = _read_workspace_entries(payload)
+        if overlay is None:
+            return config
+        path, specs = overlay
+        if not specs:
+            return config
+        entries = dict(config.get("entry_shortcuts") or {})
+        commands = dict(config.get("comma_commands") or {})
+        preferences = profile.get("shortcuts")
+        overrides = preferences.get("template_overrides") if isinstance(preferences, dict) else None
+        for key in specs.keys() & entries.keys():
+            existing = entries[key]
+            if isinstance(existing, dict) and isinstance(existing.get("command_id"), str):
+                commands.pop(existing["command_id"], None)
+        for key, spec in specs.items():
+            entry = {**spec, "canonical_key": key}
+            command_id = entry["command_id"]
+            if command_id in commands or find_comma_command({"comma_commands": commands}, f",{key}"):
+                raise ValueError(f"{path}: shortcut {key!r} conflicts with an installed command")
+            if isinstance(overrides, dict) and isinstance(overrides.get(key), str) and overrides[key].strip():
+                entry["template"] = overrides[key]
+            entries[key] = entry
+            commands[command_id] = entry_comma_command(key, entry)
+        return {**config, "entry_shortcuts": entries, "comma_commands": commands}
+    except (OSError, ValueError, RuntimeError) as exc:
+        log_event("project_overlay_invalid", cid=payload.get("conversationId"), error=str(exc))
+        return config
 
 
 def _installed_config_failure(
@@ -1767,7 +1891,7 @@ def _sync_and_maybe_reexec(event: str, payload: dict[str, Any]) -> dict[str, Any
     # repair that its parent could interrupt when the re-exec times out.
     if _env_value("THE_PILOT_REEXEC", "ORCA_AUTOPILOT_REEXEC") == "1":
         return None
-    if not maybe_sync_project_overlay(payload):
+    if not maybe_sync_local_engine():
         return None
     updated_engine = PILOT_DIR / "runtime.py"
     try:
@@ -1823,6 +1947,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
     config, config_status, config_err = load_config()
     profile, profile_status, profile_err = load_profile()
+    if config is not None and profile is not None:
+        config = workspace_config(config, profile, payload)
     scenes, scene_errors = scan_scenes()
     user_turn = turn_user_identity(steps)
     recovery_requested = bool(_named_command(text, {"pilot", "autopilot"}, {"recover"}))

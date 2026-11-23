@@ -38,12 +38,16 @@ Do not invent authorization from a scene or change existing write safety gates.
 
 Runtime commands select the installation with `THE_PILOT_GEMINI_DIR`.
 For tests use a temporary root. Never use real user directories as fixtures.
-Project overlays and long-term preferences are managed by `pilot apply`;
-re-running it (including with `--project` or `--no-project`) keeps the installed
-`profile.json` unless `--preset` or `--profile` is passed. Use
-`pilot apply --upgrade` to recompile from an existing installed profile.
+Global files stay project-neutral. `PreInvocation` reads the nearest
+`.pilot/project.json` above the active workspace and applies its shortcut entries
+and comma aliases in memory for that turn. Follow the repository's instructions,
+runbooks and authorized skills for delivery and closeout.
+Re-running `pilot apply` preserves the installed `profile.json` preferences.
+Use `pilot apply --upgrade` to recompile and remove any obsolete project snapshot.
 The Pilot does not dispatch network work or run background Dealer daemons.
 
 ## Automatic updates
 
-The runtime may start `pilot self-update` once per six hour cooldown. It preserves user profile and project preferences and records the result for `pilot status --json`. Set `THE_PILOT_DISABLE_AUTO_UPDATE=1` to disable it.
+Eligible hooks can hot-sync the installed engine from a clean local checkout and
+schedule a background update on a six-hour cooldown. Use `pilot status --json`
+for update results. Set `THE_PILOT_DISABLE_AUTO_UPDATE=1` to disable background checks.

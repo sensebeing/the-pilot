@@ -516,28 +516,22 @@ class CompilerTest(unittest.TestCase):
         self.assertIn("必须补测试", bundle.gemini_block)
         self.assertIn("不得新增账本", bundle.gemini_block)
 
-    def test_feedback_email_closeout_respects_explicit_opt_in(self) -> None:
-        # Failure means the generated workflow either stalls authorized email or sends without opt-in.
-        for enabled in (False, True):
-            with self.subTest(enable_feedback_email=enabled):
-                bundle = compile_bundle(
-                    resolve_profile(
-                        self.base, preset="recommended",
-                        overrides={"scenes": {"enable_feedback_email": enabled}},
-                    )
-                )
-                for text in (bundle.scenes["04-closeout-and-sync.md"], bundle.gemini_block):
-                    self.assertNotIn("发送前仍标 ", text)
-                    self.assertNotIn("外部发信除外", text)
-                    if enabled:
-                        self.assertIn("全程标 `gate=auto` 自动闭环", text)
-                        self.assertIn("review_verification_email", text)
-                        self.assertIn("fill_batch_email_copy", text)
-                        self.assertIn("本轮确认发送同样标 `gate=auto`", text)
-                        self.assertIn("不用让我预览确认了", text)
-                    else:
-                        self.assertIn("不生成发信入口；发信需用户当轮明确授权", text)
-                        self.assertNotIn("不用让我预览确认了", text)
+    def test_delivery_and_closeout_follow_the_active_repository_workflows(self) -> None:
+        """Global scenes follow local repository rules and current authorization."""
+        bundle = profile_compiler.compile_bundle(resolve_user_profile(self.base))
+        delivery = bundle.scenes["03-deliver-and-verify.md"]
+        closeout = bundle.scenes["04-closeout-and-sync.md"]
+        for scene in (delivery, closeout):
+            self.assertIn("AGENTS.md", scene)
+            self.assertIn("CLAUDE.md", scene)
+            self.assertIn("runbook", scene)
+        self.assertIn("scenes.deliver_strategy", delivery)
+        self.assertIn("发布交接", delivery)
+        self.assertIn("台账", closeout)
+        self.assertIn("当尚有已授权的结案", closeout)
+        self.assertIn("外部发送仍遵循当前授权", closeout)
+        self.assertIn("已授权的领域技能", closeout)
+        self.assertIn("工作区生命周期脚本", closeout)
 
     def test_orchestration_text_carries_required_rules(self) -> None:
         bundle = compile_bundle(
@@ -546,7 +540,7 @@ class CompilerTest(unittest.TestCase):
         text = bundle.gemini_block
         self.assertIn(HARNESS_ORCHESTRATION_SENTENCE, text)
         self.assertIn("Agent 单一语义 Owner 三步判断模型", text)
-        self.assertIn("不死板锁死文件清单", text)
+        self.assertIn("仅文件组织可调整，理由在 worker_done 汇报", text)
         self.assertIn("worker_done", text)
         self.assertIn("未经确认改变安全门禁、内部跨模块/外部合同及状态机边界", text)
         self.assertIn("不改变未获授权的安全门禁或跨模块/外部合同边界", text)
@@ -1381,10 +1375,10 @@ class SetupTest(unittest.TestCase):
             {"mode": "confirm", "max_consecutive_auto_turns": 5},
         )
         self.assertEqual(applied["scenes"]["deliver_strategy"], "local_verify_only")
-        self.assertTrue(applied["scenes"]["enable_feedback_email"])
+        self.assertNotIn("enable_feedback_email", applied["scenes"])
         self.assertEqual(
             applied["shortcuts"]["enabled_entry"],
-            ["cq", "fb", "al", "r", "rt", "d"],
+            ["r", "rt", "d", "cq", "fb", "al"],
         )
         self.assertEqual(
             applied["shortcuts"]["custom_entry"]["req"]["template"], "request {arg}"
@@ -1480,7 +1474,7 @@ class SetupTest(unittest.TestCase):
         )
         self.assertEqual(replaced["scenes"]["enabled_scenes"], ["plan-and-orchestrate"])
         self.assertEqual(replaced["scenes"]["deliver_strategy"], "local_verify_only")
-        self.assertFalse(replaced["scenes"]["enable_feedback_email"])
+        self.assertNotIn("enable_feedback_email", replaced["scenes"])
         self.assertEqual(replaced["shortcuts"]["enabled_entry"], ["r"])
 
     def test_reapply_fails_closed_on_corrupt_installed_profile(self) -> None:
@@ -1640,7 +1634,7 @@ class EngineTest(unittest.TestCase):
         self.gemini = self.root / "gemini"
         self.state = self.root / "state"
         self.workspace = self.root / "ws"
-        self.workspace.mkdir()
+        write_json(self.workspace / ".pilot/project.json", PROJECT)
         fake_orca(self.root)
         apply_profile(self.root, self.gemini, "--preset", "recommended")
 
@@ -2480,6 +2474,25 @@ class EngineTest(unittest.TestCase):
         self.assertIn("先看边界", message)
         self.assertEqual(read_state(self.state, "c-cand")["candidates"], [])
         self.assertEqual(json.loads(self.pre("c-cand", ",2").stdout), {})
+
+    def test_invalid_workspace_overlay_fails_closed_without_disabling_universal_commands(self) -> None:
+        """Universal control and candidate expansion survive bad workspace shortcut data."""
+        reserved = dict(PROJECT["entry_specs"]["fb"], command_id="CMD_RESERVED")
+        invalid = dict(PROJECT, entry_order=[*PROJECT["entry_order"], "mode"],
+                       entry_specs={**PROJECT["entry_specs"], "mode": reserved})
+        for name, content in (("malformed", "{"), ("reserved", json.dumps(invalid))):
+            with self.subTest(name=name):
+                (self.workspace / ".pilot/project.json").write_text(content, encoding="utf-8")
+                self.assertEqual(json.loads(self.pre(f"{name}-fb", ",fb private").stdout), {})
+                self.assertIn("Pilot 状态", self.injection(self.pre(f"{name}-mode", ",mode status")))
+                self.assertIn("worker", self.injection(self.pre(f"{name}-worker", ",worker status")).lower())
+                candidate = f"{name}-candidate"
+                self.stop(candidate, suggestion("等待确认", gate="pause"))
+                self.assertIn("等待确认", self.injection(self.pre(candidate, ",1")))
+        events = [json.loads(line) for line in (self.state / "pilot.log").read_text().splitlines()]
+        self.assertTrue({"malformed-fb", "reserved-fb"} <= {
+            item["cid"] for item in events if item["event"] == "project_overlay_invalid"
+        })
 
     def test_entry_shortcut_and_custom_comma_expand(self) -> None:
         apply_profile(

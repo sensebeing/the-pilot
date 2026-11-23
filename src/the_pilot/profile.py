@@ -4,7 +4,18 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .defaults import COORDINATOR_AGENT_ALIASES, COORDINATOR_AGENTS, is_comma_alias, DELIVER_STRATEGIES, is_entry_key, LEGACY_PROFILE_SCHEMA, MODES, PROFILE_SCHEMA, RESERVED_COMMA_ALIASES, REVIEW_AGENT_ORDER, SCENE_ORDER, WORKER_AGENT_ORDER
+from .assets.runtime import RESERVED_COMMA_ALIASES, is_comma_alias, is_entry_key
+from .defaults import (
+    COORDINATOR_AGENT_ALIASES,
+    COORDINATOR_AGENTS,
+    DELIVER_STRATEGIES,
+    LEGACY_PROFILE_SCHEMA,
+    MODES,
+    PROFILE_SCHEMA,
+    REVIEW_AGENT_ORDER,
+    SCENE_ORDER,
+    WORKER_AGENT_ORDER,
+)
 from .project import ProfileError, project_specs
 
 
@@ -32,7 +43,7 @@ def resolve_profile(
 
 
 def _shortcut_override_aliases(
-    shortcuts: dict[str, Any], specs: dict[str, Any]
+    shortcuts: dict[str, Any], specs: dict[str, Any],
 ) -> tuple[dict[str, str], set[str]]:
     """Map every alias ``template_overrides`` accepts to its canonical key.
 
@@ -80,9 +91,6 @@ def _shortcut_override_aliases(
     enabled_entry = shortcuts.get("enabled_entry")
     if isinstance(enabled_entry, list):
         for key in enabled_entry:
-            spec = specs["entry_specs"].get(key) if isinstance(key, str) else None
-            if not isinstance(spec, dict):
-                continue
             reserve(key, key)
             reserve(f",{key}", key)
     custom_entry = shortcuts.get("custom_entry")
@@ -153,149 +161,6 @@ def _custom_comma_command_id(alias: str, spec: Any = None) -> str:
     )
 
 
-def migrate_project_shortcuts(
-    base: dict[str, Any],
-    installed_project: dict[str, Any] | None,
-    project: dict[str, Any] | None,
-    *,
-    explicit_entries: list[str] | None = None,
-) -> dict[str, Any]:
-    """Keep installed shortcut state valid when the effective project changes.
-
-    Reusing an installed profile must preserve every personal preference while
-    the project tier adds, removes, renames or rebinds shortcut entries. Custom
-    shortcuts that a new overlay now owns become built-in entries, entries the
-    user already decided about keep their decision, and template overrides
-    follow the shortcut identity they were written for.
-    """
-    migrated = copy.deepcopy(base)
-    shortcuts = migrated.get("shortcuts")
-    if not isinstance(shortcuts, dict):
-        return migrated
-    explicit_entry_override = explicit_entries is not None
-    previous_specs = project_specs(installed_project)
-    effective_specs = project_specs(project)
-    previous_order = set(previous_specs["entry_order"])
-    entry_order_set = set(effective_specs["entry_order"])
-    retired_overlay_entries = previous_order - entry_order_set
-    previous_aliases, previous_ambiguous = _shortcut_override_aliases(
-        shortcuts, previous_specs
-    )
-    enabled_entry = shortcuts.get("enabled_entry")
-    custom_entry = shortcuts.get("custom_entry")
-
-    # A custom shortcut whose key now names a built-in entry is promoted, so
-    # the user keeps using the same word for the overlay-provided workflow.
-    if isinstance(custom_entry, dict):
-        for key in list(custom_entry):
-            if key not in entry_order_set:
-                continue
-            del custom_entry[key]
-            if (
-                not explicit_entry_override
-                and isinstance(enabled_entry, list)
-                and key not in enabled_entry
-            ):
-                enabled_entry.append(key)
-
-    if retired_overlay_entries and not explicit_entry_override and isinstance(
-        enabled_entry, list
-    ):
-        enabled_entry[:] = [
-            key for key in enabled_entry if key not in retired_overlay_entries
-        ]
-
-    # Recommended entries that a newly attached overlay introduces are adopted;
-    # keys the user already had stay exactly as enabled or disabled.
-    if not explicit_entry_override and isinstance(enabled_entry, list):
-        recommended_enabled = effective_specs["presets"]["recommended"]["shortcuts"].get(
-            "enabled_entry", ()
-        )
-        for key in recommended_enabled:
-            if (
-                key in entry_order_set
-                and key not in previous_order
-                and key not in enabled_entry
-            ):
-                enabled_entry.append(key)
-
-    # Overrides follow the shortcut that owned them in the installed profile,
-    # not whichever shortcut happens to reuse their alias next.
-    template_overrides = shortcuts.get("template_overrides")
-    if isinstance(template_overrides, dict):
-        shortcuts["template_overrides"] = _reconcile_template_overrides(
-            template_overrides,
-            shortcuts,
-            previous_aliases,
-            previous_ambiguous,
-            effective_specs,
-            explicit_entries if explicit_entries is not None else enabled_entry,
-            retired_overlay_entries,
-        )
-    return migrated
-
-
-def _reconcile_template_overrides(
-    template_overrides: dict[Any, Any],
-    shortcuts: dict[str, Any],
-    previous_aliases: dict[str, str],
-    previous_ambiguous: set[str],
-    effective_specs: dict[str, Any],
-    effective_enabled_entry: Any,
-    retired_overlay_entries: set[str],
-) -> dict[Any, Any]:
-    """Rebind installed overrides to the shortcut that owned them before.
-
-    An alias can be reused by a different entry after a project switch, so a
-    raw key is resolved against the installed profile first. Overrides whose
-    previous owner retired are dropped, overrides whose owner survived are
-    re-keyed to that owner, and genuinely invalid keys are left in place for
-    validate_profile to reject. A disabled owner whose alias now belongs to a
-    different surviving shortcut fails closed instead of retargeting that
-    shortcut's template.
-    """
-    surviving_aliases, surviving_ambiguous = _shortcut_override_aliases(
-        {**shortcuts, "enabled_entry": effective_enabled_entry}, effective_specs
-    )
-    surviving_targets = set(surviving_aliases.values())
-    passthrough: dict[Any, Any] = {}
-    canonical_overrides: dict[str, str] = {}
-    for raw_key, item in template_overrides.items():
-        if not isinstance(raw_key, str) or not raw_key.strip():
-            passthrough[raw_key] = item
-            continue
-        try:
-            previous_owner = _resolve_override_alias(
-                raw_key, previous_aliases, previous_ambiguous
-            )
-            new_owner = _resolve_override_alias(
-                raw_key, surviving_aliases, surviving_ambiguous
-            )
-        except ProfileError:
-            passthrough[raw_key] = item
-            continue
-        if previous_owner is None:
-            passthrough[raw_key] = item
-        elif (
-            previous_owner in retired_overlay_entries
-            and previous_owner not in surviving_targets
-        ):
-            if not isinstance(item, str) or not item.strip():
-                passthrough[raw_key] = item
-        elif previous_owner not in surviving_targets:
-            if new_owner is not None and isinstance(effective_enabled_entry, list):
-                raise ProfileError(
-                    f"template_overrides 指向不存在的口令 {raw_key!r}"
-                )
-            if new_owner is not None:
-                passthrough[previous_owner] = item
-            else:
-                passthrough[raw_key] = item
-        else:
-            _record_override(canonical_overrides, previous_owner, raw_key, item)
-    return {**passthrough, **canonical_overrides}
-
-
 def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a normalized copy of ``raw`` or raise ``ProfileError``."""
     specs = project_specs(project)
@@ -344,9 +209,6 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         raise ProfileError(
             f"scenes.deliver_strategy 必须是 {DELIVER_STRATEGIES} 之一，实际为 {strategy!r}"
         )
-    feedback_email = scenes.get("enable_feedback_email")
-    if not isinstance(feedback_email, bool):
-        raise ProfileError("scenes.enable_feedback_email 必须是布尔值")
     guardrails = _string_list(
         scenes.get("guardrails"), "scenes.guardrails", allow_empty=True
     )
@@ -371,11 +233,15 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         shortcuts.get("enabled_entry"),
         "shortcuts.enabled_entry",
         allow_empty=True,
-        allowed=specs['entry_order'],
+        allowed=specs['entry_order'] if project is not None else None,
     )
+    if any(not is_entry_key(key) or key in RESERVED_COMMA_ALIASES for key in enabled_entry):
+        raise ProfileError("shortcuts.enabled_entry 包含无效或保留的口令")
+    global_entries = [key for key in specs["entry_order"] if key in enabled_entry]
+    workspace_entries = [key for key in enabled_entry if key not in specs["entry_specs"]]
     custom_entry = _normalize_custom_entries(shortcuts.get("custom_entry"), project=project)
     custom_comma, custom_aliases = _normalize_custom_comma(shortcuts.get("custom_comma"), enabled_scenes)
-    entry_aliases = {f",{key}" for key in enabled_entry}
+    entry_aliases = {f",{key}" for key in global_entries}
     entry_aliases |= {f",{key}" for key in custom_entry}
     for alias in custom_aliases:
         if alias in entry_aliases:
@@ -390,7 +256,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     )
     active_command_ids: set[str] = set()
     for command_id in (
-        *[specs["entry_specs"][key]["command_id"] for key in enabled_entry],
+        *[specs["entry_specs"][key]["command_id"] for key in global_entries],
         *[spec["command_id"] for spec in custom_entry.values()],
         *[spec["command_id"] for spec in custom_comma.values()],
     ):
@@ -411,11 +277,10 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         "scenes": {
             "enabled_scenes": [item for item in SCENE_ORDER if item in enabled_scenes],
             "deliver_strategy": strategy,
-            "enable_feedback_email": feedback_email,
             "guardrails": guardrails,
         },
         "shortcuts": {
-            "enabled_entry": [item for item in specs['entry_order'] if item in enabled_entry],
+            "enabled_entry": [*global_entries, *workspace_entries],
             "custom_entry": {key: custom_entry[key] for key in sorted(custom_entry)},
             "custom_comma": {key: custom_comma[key] for key in sorted(custom_comma)},
             "template_overrides": {
@@ -597,9 +462,8 @@ def _resolve_override_alias(
 ) -> str | None:
     """Resolve one ``template_overrides`` key to its canonical shortcut key.
 
-    Whitespace and comma-alias case are normalized exactly as validation does,
-    so hand-edited installed state and project-switch migration share one
-    resolution rule. A key claimed by more than one owner fails closed instead
+    Whitespace and comma-alias case are normalized before lookup. A key
+    claimed by more than one owner fails closed instead
     of depending on iteration order.
     """
     key = raw_key.strip()

@@ -14,7 +14,7 @@ Check Python >= 3.11 and `pilot --help`. If the CLI is not installed, install it
 To register the skills globally across coding agents, run
 `npx skills add sensebeing/the-pilot --global --agent '*'` or symlink `skills/the-pilot*`.
 
-1. Run `pilot probe --json` (add `--project <repo>` for a project overlay) and
+1. Run `pilot probe --json` and
    `pilot distill --days 7 --json`. Inspect installed preferences, available CLIs,
    and the user's last 7 days of chat history across Antigravity, Claude Code,
    Codex, and Cursor without writing files.
@@ -30,23 +30,24 @@ To register the skills globally across coding agents, run
    `deliver_strategy`, or `.pilot/project.json` overlay updates) from that
    evidence. Ask about the four dimensions, keeping an existing profile as the
    starting point: orchestration worker/review priorities; pilot mode/turn
-   limit; enabled scenes/delivery policy/notification preference/guardrails;
+   limit; enabled scenes/delivery policy/guardrails;
    entry shortcuts/custom commands/template overrides. Present a recommended
    option first. Do not assume permission to send mail or deploy production.
 3. Apply the confirmed preferences with `pilot apply --preset recommended
-   --project <repo> --profile <json-or-file> --json`. Omit the project flag for
-   discovery, or use `--no-project` to explicitly choose universal defaults.
-   Re-running `pilot apply` (also with `--project` or `--no-project`) preserves
-   the installed profile; only `--preset` or `--profile` resets it. Upgrade with
-   `pilot apply --upgrade --json` to recompile from an existing installed
-   `profile.json` and retain the installed project link from any directory.
+   --profile <json-or-file> --json`. Global artifacts stay project-neutral.
+   Put repository shortcuts in `.pilot/project.json` for in-memory resolution
+   during each workspace's `PreInvocation`. Document delivery and closeout in
+   the repository's guidance and runbooks. Re-running `pilot apply` preserves
+   the installed profile preferences unless `--preset` or `--profile` is given.
+   Use `pilot apply --upgrade --json` to recompile from the installed profile and
+   remove any obsolete global project snapshot.
 4. Run `pilot status --json`; explain any drift. Give a personalized cheatsheet
    of enabled shortcuts, modes, worker selection, sync and recovery.
 
 `apply` preserves other Hook groups, unmanaged GEMINI.md prose and custom scenes.
 On the default Gemini root, it adds the `AGY_CLI_OSC7501` block to `~/.zshenv`
 and existing bash or POSIX shell startup files. `pilot status` reports block drift.
-`pilot uninstall` removes owned files, including the installed project link.
+`pilot uninstall` removes owned files, including any obsolete project snapshot.
 It strips the shell block while retaining the startup files.
 Tests and demonstrations must pass explicit temporary `--gemini-dir` and
 `--home-dir` paths and set `THE_PILOT_GEMINI_DIR` for runtime operations.

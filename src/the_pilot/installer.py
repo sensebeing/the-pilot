@@ -28,8 +28,8 @@ from typing import Any
 
 from . import compiler as profile_compiler
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
-from .profile import migrate_project_shortcuts, resolve_profile, validate_profile
-from .project import ProfileError, normalize_project
+from .assets.runtime import append_log_event
+from .profile import resolve_profile, validate_profile
 from .defaults import (
     DEFAULT_SPECS,
     DELIVER_STRATEGIES,
@@ -52,6 +52,7 @@ ZSH_ENV_SUBPATH = Path(".zshenv")
 SHELL_ENV_SUBPATHS = (ZSH_ENV_SUBPATH, Path(".bash_profile"), Path(".bashrc"), Path(".profile"))
 SCENES_SUBDIR = "scenes"
 LOG_NAME = "pilot.log"
+AUTO_UPDATE_LOG_NAME = "auto_update.log"
 LEGACY_LOG_NAME = "autopilot.log"
 BUILTIN_SCENE_FILES = tuple(
     spec["file"] for spec in DEFAULT_SPECS["scene_specs"].values()
@@ -84,10 +85,6 @@ LOCAL_SYNC_INTERVAL_SECONDS = 30
 
 class SetupError(Exception):
     """The requested install cannot be completed safely."""
-
-
-class _OverlayHistoryUnknown(Exception):
-    """Git history was inconclusive, so overlay synchronization must not write."""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--scenes")
     apply_parser.add_argument("--deliver-strategy", choices=DELIVER_STRATEGIES)
     apply_parser.add_argument(
-        "--feedback-email", action=argparse.BooleanOptionalAction, default=None
+        "--feedback-email", action=argparse.BooleanOptionalAction, help=argparse.SUPPRESS
     )
     apply_parser.add_argument("--entry-shortcuts")
     apply_parser.add_argument("--guardrail", action="append")
@@ -196,9 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(update_parser)
     update_parser.add_argument("--checkout-dir", help="本地 the-pilot checkout（测试或开发覆盖）")
     update_parser.add_argument("--home-dir", help="技能链接根目录")
-    update_parser.add_argument("--workspace", help="workspace directory for project overlay synchronization")
+    update_parser.add_argument("--workspace", help=argparse.SUPPRESS)
     update_mode = update_parser.add_mutually_exclusive_group()
-    update_mode.add_argument("--project-only", action="store_true", help="仅同步 workspace project overlay")
+    update_mode.add_argument("--project-only", action="store_true", help="执行本地 checkout 快速同步并安排后台更新")
     update_mode.add_argument("--local-only", action="store_true", help="仅同步本地 checkout，不执行远端检查")
     update_mode.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
 
@@ -214,14 +211,13 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="Antigravity 配置目录（默认 ~/.gemini；也可用 THE_PILOT_GEMINI_DIR 覆盖）",
     )
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--project", help="Repository root or project JSON path")
-    selection.add_argument("--no-project", action="store_true", help="Use universal defaults")
+    selection.add_argument("--project", help=argparse.SUPPRESS)
+    selection.add_argument("--no-project", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
 
 
 def probe(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
-    project = discover_project(args, gemini_dir)
     pilot_dir = gemini_dir / PILOT_SUBDIR
     profile_path = _installed_path(gemini_dir, "profile.json")
     engine_path = pilot_dir / ENGINE_NAME
@@ -251,7 +247,7 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
             "gemini_block": profile_compiler.GEMINI_BEGIN in read_text(gemini_md),
         },
         "recommended_profile": resolve_profile(
-            load_default_profile(), preset="recommended", project=project
+            load_default_profile(), preset="recommended"
         ),
     }
     if hooks_error:
@@ -263,7 +259,7 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
         installed_profile = None
     if installed_profile is not None:
         try:
-            report["installed_profile"] = validate_profile(installed_profile, project=project)
+            report["installed_profile"] = validate_profile(installed_profile)
         except profile_compiler.ProfileError as exc:
             report["installed_profile_error"] = str(exc)
     return report
@@ -287,7 +283,6 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
 
 def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
-    project = discover_project(args, gemini_dir)
     pilot_dir = gemini_dir / PILOT_SUBDIR
     profile_path = pilot_dir / "profile.json"
     config_path = pilot_dir / "config.json"
@@ -316,31 +311,14 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     else:
         base = load_default_profile()
         reusing_installed = False
-    if reusing_installed:
-        installed_project = None
-        installed_project_path = _installed_path(gemini_dir, "project.json")
-        if installed_project_path.is_file():
-            installed_project = normalize_project(
-                read_json_object(installed_project_path, "project.json")
-            )
-        base = migrate_project_shortcuts(
-            base,
-            installed_project,
-            project,
-            explicit_entries=(
-                split_list(args.entry_shortcuts, allow_empty=True)
-                if args.entry_shortcuts is not None
-                else None
-            ),
-        )
     preset = args.preset if args.preset is not None else (
         None if reusing_installed else "recommended"
     )
     profile = resolve_profile(
-        base, preset=preset, overrides=overrides_from_args(args), project=project
+        base, preset=preset, overrides=overrides_from_args(args)
     )
 
-    bundle = profile_compiler.compile_bundle(profile, project=project)
+    bundle = profile_compiler.compile_bundle(profile)
     current_gemini = read_text(gemini_md)
     hooks = read_json_object(hooks_path, "hooks.json") or {}
     engine_text = ENGINE_SOURCE_PATH.read_text(encoding="utf-8")
@@ -355,11 +333,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         if name not in bundle.scenes and (scenes_dir / name).is_file()
     ]
 
-    project_path = pilot_dir / "project.json"
-    if project is not None:
-        atomic_write_text(project_path, json_text(project))
-    elif project_path.exists():
-        project_path.unlink()
+    (pilot_dir / "project.json").unlink(missing_ok=True)
     atomic_write_text(profile_path, json_text(bundle.profile_json))
     atomic_write_text(config_path, json_text(bundle.config_json))
     for filename, text in bundle.scenes.items():
@@ -638,7 +612,6 @@ def _migrate_legacy_scenes(legacy_scenes: Path, scenes_dir: Path) -> None:
 
 def status(args: argparse.Namespace) -> dict[str, Any]:
     gemini_dir = gemini_dir_for(args)
-    project = discover_project(args, gemini_dir)
     pilot_dir = gemini_dir / PILOT_SUBDIR
     profile_path = pilot_dir / "profile.json"
     config_path = pilot_dir / "config.json"
@@ -664,6 +637,9 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         "drift": [],
     }
     report["drift"].extend(_shell_env_drift(gemini_dir, installed=profile is not None))
+    project_path = pilot_dir / "project.json"
+    if project_path.exists() or project_path.is_symlink():
+        report["drift"].append("检测到旧版 project.json，请运行 pilot apply --upgrade 移除")
     legacy_dir = gemini_dir / LEGACY_AUTOPILOT_SUBDIR
     if any((legacy_dir / name).exists() for name in LEGACY_MANAGED_FILES):
         report["drift"].append(
@@ -681,7 +657,7 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
         return report
 
     existing_config = read_json_object(config_path, "config.json") or {}
-    bundle = profile_compiler.compile_bundle(profile, project=project)
+    bundle = profile_compiler.compile_bundle(profile)
     report["drift"].extend(_global_guidance_drift(bundle.profile_json, gemini_dir))
     report.update(
         {
@@ -923,7 +899,7 @@ def maybe_activate_newer_checkout_package(package_path: list[str]) -> bool:
         return False
     package_path.insert(0, str(package))
     boot_package_dir = PACKAGE_DIR
-    for name in ("defaults", "project", "profile", "compiler", "distill", "runtime", "installer"):
+    for name in ("assets.runtime", "defaults", "project", "profile", "compiler", "distill", "runtime", "installer"):
         module = sys.modules.get(f"the_pilot.{name}")
         if module is not None:
             active = importlib.reload(module)
@@ -985,10 +961,7 @@ def _cooldown_elapsed(metadata: dict[str, Any], key: str, interval: int) -> bool
 
 
 def _log_auto_update(state_dir: Path, event: str, **details: Any) -> None:
-    with (state_dir / LOG_NAME).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event, **details,
-        }, ensure_ascii=False) + "\n")
+    append_log_event(state_dir / AUTO_UPDATE_LOG_NAME, event, **details)
 
 
 def _clean_local_source(checkout: Path | None) -> tuple[Path, str, str] | None:
@@ -1062,125 +1035,11 @@ def maybe_trigger_background_auto_update(gemini_dir: Path) -> str:
         )
 
 
-def _find_ancestor_overlay(start: Path) -> Path | None:
-    return next(
-        (
-            parent / ".pilot/project.json"
-            for parent in (start, *start.parents)
-            if (parent / ".pilot/project.json").is_file()
-        ),
-        None,
-    )
-
-
-def _is_older_committed_overlay(
-    overlay: Path, installed_project: dict[str, Any]
-) -> bool:
-    """Return whether a clean worktree overlay predates installed content."""
-    repo_root = overlay.parent.parent
-    if not (repo_root / ".git").exists():
-        return False
-
-    def git(*args: str) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo_root), *args],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return subprocess.CompletedProcess([], 1, "", "")
-
-    status = git("status", "--porcelain", "--", ".pilot/project.json")
-    if status.returncode != 0:
-        raise _OverlayHistoryUnknown("无法检查 workspace overlay 工作区状态")
-    if status.stdout.strip():
-        return False
-    overlay_commit = git("log", "-n", "1", "--format=%H", "HEAD", "--", ".pilot/project.json")
-    overlay_sha = overlay_commit.stdout.strip()
-    if overlay_commit.returncode != 0 or not overlay_sha:
-        raise _OverlayHistoryUnknown("无法定位 workspace overlay 提交")
-    commits = git("log", "--all", "-n", "50", "--format=%H", "--", ".pilot/project.json")
-    if commits.returncode != 0:
-        raise _OverlayHistoryUnknown("无法读取 workspace overlay Git 历史")
-    commit_list = [item.strip() for item in commits.stdout.splitlines() if item.strip()]
-    if len(commit_list) >= 50:
-        exhaustive = git("log", "--all", "--format=%H", "--", ".pilot/project.json")
-        if exhaustive.returncode != 0:
-            raise _OverlayHistoryUnknown("无法完整读取 workspace overlay Git 历史")
-        commit_list = [item.strip() for item in exhaustive.stdout.splitlines() if item.strip()]
-    if not commit_list:
-        raise _OverlayHistoryUnknown("workspace overlay 没有可验证的 Git 历史")
-    seen_blobs: dict[str, dict[str, Any] | None] = {}
-    for commit in commit_list:
-        if not commit or commit == overlay_sha:
-            continue
-        blob = git("rev-parse", f"{commit}:.pilot/project.json")
-        blob_sha = blob.stdout.strip()
-        if blob.returncode != 0:
-            raise _OverlayHistoryUnknown("无法读取 workspace overlay 提交对象")
-        if not blob_sha:
-            continue
-        if blob_sha not in seen_blobs:
-            content = git("show", blob_sha)
-            if content.returncode != 0:
-                raise _OverlayHistoryUnknown("无法读取 workspace overlay Git 对象")
-            else:
-                try:
-                    parsed = json.loads(content.stdout)
-                    seen_blobs[blob_sha] = normalize_project(parsed)
-                except (ValueError, ProfileError):
-                    seen_blobs[blob_sha] = None
-        if seen_blobs[blob_sha] != installed_project:
-            continue
-        ancestry = git("merge-base", "--is-ancestor", overlay_sha, commit)
-        if ancestry.returncode == 0:
-            return True
-        if ancestry.returncode != 1:
-            raise _OverlayHistoryUnknown("无法验证 workspace overlay 提交关系")
-    return False
-
-
-def _sync_workspace_overlay(workspace_arg: str | None, gemini_dir: Path, pilot_dir: Path) -> str:
-    if not workspace_arg:
-        return "none"
-    installed_path = _installed_path(gemini_dir, "project.json")
-    overlay = _find_ancestor_overlay(Path(workspace_arg).expanduser().resolve())
-    if overlay is None:
-        return "none"
-    with profile_lock(gemini_dir):
-        if not installed_path.is_file():
-            return "none"
-        installed_project = normalize_project(read_json_object(installed_path, "project.json"))
-        workspace_project = normalize_project(read_json_object(overlay, "project.json"))
-        if workspace_project["projectId"] != installed_project["projectId"]:
-            return "skipped_unmatched_project"
-        if workspace_project == installed_project:
-            return "up_to_date"
-        try:
-            older = _is_older_committed_overlay(overlay, installed_project)
-        except _OverlayHistoryUnknown:
-            return "skipped_unknown_worktree"
-        if older:
-            return "skipped_older_worktree"
-        apply_args = argparse.Namespace(
-            command="apply", gemini_dir=str(gemini_dir), project=str(overlay), no_project=False,
-            json=False, preset=None, profile=None, upgrade=True, mode=None, max_turns=None,
-            worker_agents=None, review_agents=None, scenes=None, deliver_strategy=None,
-            feedback_email=None, entry_shortcuts=None, guardrail=None,
-        )
-        _apply_unlocked(apply_args)
-    return "updated"
-
-
 def _checkout_artifact_command(checkout: Path, command: str, gemini_dir: Path, *options: str) -> str:
-    project_path = _installed_path(gemini_dir, "project.json")
-    project_args = ["--project", str(project_path)] if project_path.is_file() else ["--no-project"]
     return subprocess_run(
         [
             sys.executable, str(checkout / "bin/pilot"), command, *options,
-            "--gemini-dir", str(gemini_dir), *project_args, "--json",
+            "--gemini-dir", str(gemini_dir), "--no-project", "--json",
         ],
         30,
         env={**os.environ, "THE_PILOT_DISABLE_AUTO_UPDATE": "1"},
@@ -1192,8 +1051,7 @@ def _has_installed_artifact_drift(checkout: Path, checkout_digest: str, gemini_d
         report = json.loads(_checkout_artifact_command(checkout, "status", gemini_dir))
     else:
         args = argparse.Namespace(
-            command="status", gemini_dir=str(gemini_dir), project=None,
-            no_project=not _installed_path(gemini_dir, "project.json").is_file(), json=True,
+            command="status", gemini_dir=str(gemini_dir), json=True,
         )
         report = status(args)
     return bool(report["drift"])
@@ -1219,8 +1077,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "project_only", False):
         result = {
             "status": "none",
-            "source_status": "skipped_project_only",
-            "project_status": "none",
+            "source_status": "local_sync",
             "local_source_status": "none",
             "head_sha": None,
             "synced_skills": [],
@@ -1229,8 +1086,6 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         }
         with _file_lock(state_dir / "auto_update.lock"):
             try:
-                project_status = _sync_workspace_overlay(getattr(args, "workspace", None), gemini_dir, pilot_dir)
-                result["status"] = result["project_status"] = project_status
                 checkout, explicit = _discover_checkout(checkout_override, home_dir=home_dir)
                 local_source = _clean_local_source(checkout)
                 if local_source is not None and _installed_path(gemini_dir, "profile.json").is_file():
@@ -1245,7 +1100,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     if runtime_differs or _has_installed_artifact_drift(checkout, checkout_digest, gemini_dir):
                         _checkout_artifact_command(checkout, "apply", gemini_dir, "--upgrade")
-                        result["local_source_status"] = "updated"
+                        result["status"] = result["local_source_status"] = "updated"
                         result["head_sha"] = sha
                         existing["runtime_tree_digest"] = checkout_digest
                         atomic_write_text(metadata_path, json_text(existing))
@@ -1259,7 +1114,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
         return result
     report: dict[str, Any] = {
         "last_checked_at": time.time() if check_remote else None, "last_updated_at": None,
-        "status": "failed", "source_status": "failed", "project_status": "none",
+        "status": "failed", "source_status": "failed",
         "head_sha": None, "synced_skills": [], "error": None,
     }
     with _file_lock(state_dir / "auto_update.lock"):
@@ -1271,9 +1126,6 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
             if not check_remote:
                 report["last_checked_at"] = existing_metadata.get("last_checked_at")
             checkout_digest: str | None = None
-            report["project_status"] = _sync_workspace_overlay(
-                getattr(args, "workspace", None), gemini_dir, pilot_dir
-            )
             checkout, explicit = _discover_checkout(checkout_override, home_dir=home_dir)
             manages_uv_tool = maintenance_home is not None and _manages_uv_tool(home_dir, explicit=explicit)
             if checkout is not None:
@@ -1328,7 +1180,6 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
 
             profile_path = _installed_path(gemini_dir, "profile.json")
             if profile_path.is_file():
-                project_path = _installed_path(gemini_dir, "project.json")
                 apply_args = argparse.Namespace(**vars(args))
                 apply_args.command = "apply"
                 apply_args.upgrade = True
@@ -1336,10 +1187,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 apply_args.preset = apply_args.mode = apply_args.max_turns = None
                 apply_args.worker_agents = apply_args.review_agents = apply_args.scenes = None
                 apply_args.deliver_strategy = apply_args.entry_shortcuts = None
-                apply_args.feedback_email = None
                 apply_args.guardrail = None
-                apply_args.project = str(project_path) if project_path.is_file() else None
-                apply_args.no_project = not project_path.is_file()
                 if checkout is not None and (checkout / "bin" / "pilot").is_file():
                     _checkout_artifact_command(checkout, "apply", gemini_dir, "--upgrade")
                 else:
@@ -1441,7 +1289,7 @@ def _uninstall_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         (legacy_dir / "project.json", "legacy/project.json"),
         (legacy_dir / LEGACY_LOCK_NAME, f"legacy/{LEGACY_LOCK_NAME}"),
     ):
-        if path.is_file():
+        if path.is_file() or path.is_symlink():
             path.unlink()
             removed.append(label)
 
@@ -1493,8 +1341,6 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.deliver_strategy:
         overrides.setdefault("scenes", {})["deliver_strategy"] = args.deliver_strategy
-    if args.feedback_email is not None:
-        overrides.setdefault("scenes", {})["enable_feedback_email"] = args.feedback_email
     if args.entry_shortcuts is not None:
         overrides.setdefault("shortcuts", {})["enabled_entry"] = split_list(
             args.entry_shortcuts, allow_empty=True
@@ -1531,25 +1377,6 @@ def load_default_profile() -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise SetupError(f"无法读取默认 profile {DEFAULT_PROFILE_PATH}: {exc}") from exc
     return validate_profile(raw)
-
-
-def discover_project(args: argparse.Namespace, gemini_dir: Path) -> dict[str, Any] | None:
-    """Explicit choice, installed link, then nearest ancestor project."""
-    if args.no_project:
-        return None
-    if args.project:
-        path = Path(args.project).expanduser().resolve()
-        if path.is_dir():
-            path = path / ".pilot/project.json"
-        if not path.is_file():
-            raise SetupError(f"Project overlay not found: {path}")
-    else:
-        path = _installed_path(gemini_dir, "project.json")
-        if not path.is_file():
-            path = _find_ancestor_overlay(Path.cwd())
-            if path is None:
-                return None
-    return normalize_project(read_json_object(path, "project.json"))
 
 
 def gemini_dir_for(args: argparse.Namespace) -> Path:

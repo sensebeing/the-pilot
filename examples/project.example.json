@@ -1,10 +1,15 @@
 {
   "schema": "the-pilot-project/v1",
   "projectId": "example",
-  "description": "A project-specific closeout instruction.",
-  "scene_specs": {
-    "closeout-and-sync": {
-      "fallback_prompt": "Update project documentation and release owned resources."
+  "description": "Deployment checks for this repository.",
+  "entry_order": ["deploy-check"],
+  "entry_specs": {
+    "deploy-check": {
+      "command_id": "CMD_DEPLOY_CHECK",
+      "description": "Check deployment readiness",
+      "requires_arg": true,
+      "usage": "deploy-check <environment>",
+      "template": "Check whether {arg} is ready for deployment using the repository runbook. Report any blockers."
     }
   }
 }

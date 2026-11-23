@@ -168,13 +168,11 @@ In Claude Code, you can also install from the plugin marketplace:
 3. **Distill your history and apply a preset**:
 
 ```sh
-pilot probe --no-project --json
+pilot probe --json
 pilot distill --days 7 --json
-pilot apply --no-project --preset recommended --json
+pilot apply --preset recommended --json
 pilot status --json
 ```
-
-If your repository has a `.pilot/project.json` overlay, pass `--project /path/to/repo` during `pilot apply`.
 
 For the default `$HOME/.gemini` installation, `pilot apply` and upgrades manage
 `AGY_CLI_OSC7501` in `~/.zshenv` and any existing `~/.bash_profile`,
@@ -189,8 +187,8 @@ For the default `$HOME/.gemini` installation, `pilot apply` and upgrades manage
 
 | Preset | Pilot mode | Max auto turns | Enabled scenes | Delivery strategy | Default shortcuts | Best fit |
 | --- | --- | --- | --- | --- | --- | --- |
-| `recommended` | `gate` | `8` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` (+ project overlay) | Default: auto-advances routine stages, pauses on design decisions and prod gates. |
-| `conservative` | `confirm` | `4` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` (+ project overlay) | Prefills the next prompt after every turn and always waits for you to press `Enter`. |
+| `recommended` | `gate` | `8` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` | Default: auto-advances routine stages, pauses on design decisions and prod gates. |
+| `conservative` | `confirm` | `4` | All 4 scenes | `merge_dev_e2e` | `r`, `rt`, `d`, `pull` | Prefills the next prompt after every turn and always waits for you to press `Enter`. |
 | `orchestration-only` | `off` | `4` | None (`[]`) | `merge_dev_e2e` | None (`[]`) | Installs Coordinator/Worker orchestration rules only, with no end-of-turn prefill. |
 
 ### Four customization dimensions (`the-pilot-profile/v1`)
@@ -199,47 +197,31 @@ For the default `$HOME/.gemini` installation, `pilot apply` and upgrades manage
 | --- | --- | --- | --- |
 | 1. Orchestration | `coordinator_agent`<br>`worker_agents`<br>`review_agents` | Coordinator: `agy` (alias `antigravity`)<br>Workers: `["codex", "claude"]` or `["claude", "codex"]`<br>Reviewers: `["codex", "claude", "agy"]` | Tier-1 native AGY Coordinator (design & review) vs. Tier-2 Dispatched Workers (branch implementation), child-worktree isolation, cross-repo callbacks, and worker priority. |
 | 2. Pilot | `mode`<br>`max_consecutive_auto_turns` | Mode: `gate` \| `confirm` \| `off`<br>Turn cap: `1..50` (default `8`) | Whether `gate=auto` turns submit automatically or fall back to prefill once consecutive auto turns hit the cap. |
-| 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`enable_feedback_email`<br>`guardrails` | Strategies: `merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only`<br>Feedback email: `false` \| `true` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
+| 3. Scenes | `enabled_scenes`<br>`deliver_strategy`<br>`guardrails` | Strategies: `merge_dev_e2e` \| `merge_dev_only` \| `local_verify_only` | Which of the 4 scenes are active, what delivery steps are generated, and custom per-scene quality guardrails. |
 | 4. Shortcuts | `enabled_entry`<br>`custom_entry`<br>`custom_comma`<br>`template_overrides` | Universal entries: `r`, `rt`, `d`, `pull`<br>Plus project entries and custom aliases | Short aliases expanded on `PreInvocation` into full review, design, or workflow prompts. |
 
 ---
 
 ## Project extension tier (`.pilot/project.json`)
 
-Universal mode stays project-neutral (`r`, `rt`, `d`, `pull`). A repository can add team-specific shortcuts, presets, delivery rules, and closeout steps by placing `.pilot/project.json` (`schema: "the-pilot-project/v1"`) at the repo root (see [examples/project.example.json](examples/project.example.json)):
+The managed `GEMINI.md`, `CLAUDE.md`, and `AGENTS.md` blocks, built-in scenes, and base shortcut catalog are project-neutral. Commit a [`.pilot/project.json` overlay](examples/project.example.json) to add repository-specific shortcuts.
 
-```json
-{
-  "schema": "the-pilot-project/v1",
-  "projectId": "example",
-  "description": "A project-specific closeout instruction.",
-  "scene_specs": {
-    "closeout-and-sync": {
-      "fallback_prompt": "Update project documentation and release owned resources."
-    }
-  }
-}
-```
+On each `PreInvocation`, Pilot takes the first nonempty workspace path (then the hook's working directory), walks up to the nearest overlay, and expands its declared shortcuts such as `deploy-check` and `,deploy-check`. Changes take effect on the next turn. The overlay lives in memory for that turn, so multiple workspaces can use different shortcuts with the same installation. Invalid overlays are logged and the universal commands remain available.
 
-```sh
-pilot apply --project /path/to/repo --preset recommended --json  # First install: explicitly choose a preset
-pilot apply --project /path/to/repo --json  # Re-apply: attaches the overlay and keeps installed preferences
-pilot apply --upgrade --json       # Recompiles from the installed profile.json (must exist; cannot be combined with --preset/--profile)
-pilot apply --no-project --json    # Detaches the overlay; personal preferences are preserved
-```
+The overlay uses `the-pilot-project/v1` with `projectId`, optional `description`, `entry_order`, and `entry_specs`. To customize a project's template, include its key in your profile's `shortcuts.enabled_entry` and set the matching `shortcuts.template_overrides` value. The override applies when the workspace declares that key. Keep project delivery and closeout instructions in repository guidance, runbooks, and authorized skills.
 
-Re-running `pilot apply` — including with `--project` or `--no-project` — preserves the installed `profile.json`, so your personal preferences survive overlay changes. Only `--preset` or `--profile` explicitly resets or replaces them.
+`pilot apply --upgrade --json` recompiles the managed files from the installed profile and removes any obsolete installed project snapshot. Legacy `--project` and `--no-project` options are accepted for compatibility.
 
 ---
 
 ## Automatic updates
 
-Once installed, `the-pilot` stays up to date automatically with two non-blocking mechanisms:
+Once installed, `the-pilot` stays up to date automatically with two mechanisms:
 
-1. **6-hour background self-update**: On `Stop` hook execution, if at least 6 hours have passed since the last check, `runtime.py` spawns `pilot self-update --quiet` in a detached background process. If `~/the-pilot` exists and is clean on `main`, it runs `git pull --ff-only`, refreshes the `uv` CLI when `HEAD` advances, re-syncs global skill symlinks (`~/.agents/skills`, `~/.claude/skills`, `~/.gemini/config/skills`), and runs `pilot apply --upgrade` while preserving your `profile.json`. Dirty checkouts or non-`main` branches are never modified.
-2. **Active workspace `.pilot/project.json` hot-sync**: When your active workspace updates `.pilot/project.json` (detected by SHA-256 hash change), `runtime.py` triggers `pilot self-update --project-only --workspace <cwd>` in the background so new project shortcuts or scene rules take effect automatically.
+1. **6-hour background self-update**: Eligible hooks and install or runtime changes can schedule a detached update when the six-hour cooldown expires. If `~/the-pilot` exists and is clean on `main`, it runs `git pull --ff-only`, refreshes the `uv` CLI when `HEAD` advances, re-syncs global skill symlinks (`~/.agents/skills`, `~/.claude/skills`, `~/.gemini/config/skills`), and runs `pilot apply --upgrade` while preserving your `profile.json`. Dirty checkouts or non-`main` branches are never modified.
+2. **Local engine hot-sync**: Eligible hooks check a clean local `~/the-pilot` checkout using `pilot self-update --project-only`. If managed files drift, the updater recompiles them and the hook uses the new runtime for the current event.
 
-Check update status anytime via `pilot status --json` (`auto_update` field) or trigger an immediate update with `pilot self-update --json`. Set `THE_PILOT_DISABLE_AUTO_UPDATE=1` to disable background checks.
+Check update status anytime via `pilot status --json` (`auto_update` field) or trigger an immediate update with `pilot self-update --json`. Set `THE_PILOT_DISABLE_AUTO_UPDATE=1` to disable background checks. `state/pilot.log` and `state/auto_update.log` each rotate to a single `.1` archive at 512 KiB.
 
 `pilot apply --upgrade` also performs the one-way migration from a pre-rename `config/autopilot` installation: managed files move to `config/the-pilot`, `state/autopilot.log` becomes `state/pilot.log`, the legacy `orca-agy-autopilot` hook group is removed, and custom scenes and state are preserved. Sessions already open with pre-rename `<!-- autopilot: ... -->` tags and `,autopilot recover` continue to work during the transition.
 
@@ -249,11 +231,11 @@ Check update status anytime via `pilot status --json` (`auto_update` field) or t
 
 | Command | Purpose |
 | --- | --- |
-| `pilot probe [--project <repo> \| --no-project] --json` | Read-only discovery of installed profile, project overlay, and available agent CLIs (`codex`, `claude`, `agy`). |
+| `pilot probe --json` | Read-only discovery of installed profile and available agent CLIs (`codex`, `claude`, `agy`). |
 | `pilot distill [--days 7] [--max-sessions 80] --json` | Read-only distillation of recent local agent chat logs (`antigravity`, `claude`, `codex`, `cursor`) into recurring prompt patterns and pipeline health diagnostics. |
-| `pilot apply [--preset <name>] [--project <repo>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, the `the-pilot` Hook group, and the default-home shell block. Installed preferences are preserved unless `--preset` or `--profile` is given. |
-| `pilot self-update [--project-only] [--workspace <path>] --json` | Pull clean `main`, refresh CLI and global skill symlinks, and run `pilot apply --upgrade` under an exclusive file lock. |
-| `pilot status [--project <repo>] --json` | Verify installation health, active mode, worker priority, `auto_update` status, and artifact drift, including the default-home shell block. |
+| `pilot apply [--preset <name>] [--profile <json>] [--upgrade] --json` | Compile and atomically install `<gemini-dir>/config/the-pilot/runtime.py`, `profile.json`, `config.json`, `scenes/*.md`, the `GEMINI.md` block, the `the-pilot` Hook group, and the default-home shell block. Installed preferences are preserved unless `--preset` or `--profile` is given. |
+| `pilot self-update [--project-only] --json` | Pull clean `main`, refresh CLI and skill symlinks, and recompile under an exclusive lock. `--project-only` runs the local hook sync and can schedule a background update. |
+| `pilot status --json` | Verify installation health, active mode, worker priority, `auto_update` status, and artifact drift, including the default-home shell block. |
 | `pilot uninstall --json` | Remove managed files, `GEMINI.md` and shell blocks, and Hook entries while preserving unrelated user config and shell startup files. |
 | `pilot mode [status\|gate\|confirm\|off]` | Inspect or switch Turn Pilot mode (`gate`, `confirm`, `off`). |
 | `pilot worker [status\|codex\|claude\|cc]` | Inspect or persist worker priority (`codex > claude` vs. `claude > codex`) and schedule next-turn hot reload. |

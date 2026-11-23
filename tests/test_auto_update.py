@@ -15,6 +15,28 @@ from the_pilot.assets import runtime
 
 
 class AutoUpdateTest(unittest.TestCase):
+    def test_hook_and_auto_update_logs_rotate_at_512_kib(self):
+        """A writer replaces the previous archive and starts a fresh log at 512 KiB."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gemini = root / "gemini"
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            limit = 512 * 1024
+            hook_log = state / "pilot.log"
+            for path in (hook_log, state / "auto_update.log"):
+                path.write_bytes(b"a" * limit)
+                path.with_suffix(".log.1").write_bytes(b"older")
+            with mock.patch.dict(os.environ, {"THE_PILOT_GEMINI_DIR": str(gemini)}), \
+                    mock.patch.object(runtime, "STATE_DIR", state), \
+                    mock.patch.object(runtime, "LOG_PATH", hook_log):
+                runtime.log_event("hook_after_rotation")
+                installer._log_auto_update(state, "update_after_rotation")
+            for path, event in ((hook_log, "hook_after_rotation"),
+                                (state / "auto_update.log", "update_after_rotation")):
+                self.assertEqual(path.with_suffix(".log.1").read_bytes(), b"a" * limit)
+                self.assertEqual(json.loads(path.read_text())["event"], event)
+
     def make_checkout(self, home: Path) -> Path:
         checkout = home / "the-pilot"
         checkout.mkdir(parents=True)
@@ -325,130 +347,6 @@ class AutoUpdateTest(unittest.TestCase):
                 self.assertEqual((root / "reexecs").read_text(), "reexec\n")
                 self.assertEqual(osc_target.read_text() if osc_target.exists() else "", osc)
 
-    def test_project_only_skips_older_clean_worktree_but_updates_dirty_or_newer(self):
-        """Overlay sync compares normalized committed content and protects newer installs."""
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            repo = root / "repo"
-            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-            for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
-                subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
-            fixture = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
-            fixture["projectId"] = "overlay-test"
-            pilot_dir = repo / ".pilot"
-            pilot_dir.mkdir()
-            (pilot_dir / "project.json").write_text("{invalid json\n")
-            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "ancient-invalid"], check=True, capture_output=True)
-            (pilot_dir / "project.json").write_text(json.dumps(fixture))
-            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "v1"], check=True, capture_output=True)
-            older = root / "older-wt"
-            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", "old-topic", str(older), "HEAD"], check=True, capture_output=True)
-            v2 = dict(fixture, description="v2")
-            (pilot_dir / "project.json").write_text(json.dumps(v2, indent=2) + "\n")
-            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "v2"], check=True, capture_output=True)
-            gemini = root / "gemini"
-            installer.apply(installer.build_parser().parse_args([
-                "apply", "--gemini-dir", str(gemini), "--project", str(repo), "--json",
-            ]))
-            args = installer.build_parser().parse_args([
-                "self-update", "--project-only", "--workspace", str(older),
-                "--gemini-dir", str(gemini), "--json",
-            ])
-            self.assertEqual(installer.self_update(args)["project_status"], "skipped_older_worktree")
-            installed = json.loads((gemini / "config/the-pilot/project.json").read_text())
-            self.assertEqual(installed, installer.normalize_project(v2) if hasattr(installer, "normalize_project") else v2)
-
-            dirty = dict(fixture, description="dirty-v3")
-            (older / ".pilot/project.json").write_text(json.dumps(dirty))
-            self.assertEqual(installer.self_update(args)["project_status"], "updated")
-            self.assertEqual(json.loads((gemini / "config/the-pilot/project.json").read_text())["description"], "dirty-v3")
-
-            newer = root / "newer-wt"
-            subprocess.run(["git", "-C", str(repo), "worktree", "add", str(newer), "-b", "new-topic"], check=True, capture_output=True)
-            newest = dict(v2, description="newer-v3")
-            (newer / ".pilot/project.json").write_text(json.dumps(newest, indent=2) + "\n")
-            subprocess.run(["git", "-C", str(newer), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(newer), "commit", "-m", "newer"], check=True, capture_output=True)
-            newer_args = installer.build_parser().parse_args([
-                "self-update", "--project-only", "--workspace", str(newer),
-                "--gemini-dir", str(gemini), "--json",
-            ])
-            self.assertEqual(installer.self_update(newer_args)["project_status"], "updated")
-
-    def test_single_overlay_commit_does_not_block_clean_sync(self):
-        """A clean one-commit overlay remains synchronizable when installed data differs."""
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            repo = root / "repo"
-            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-            for key, value in (("user.email", "test@example.com"), ("user.name", "Test")):
-                subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
-            project = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
-            project["projectId"] = "single-commit"
-            (repo / ".pilot").mkdir()
-            (repo / ".pilot/project.json").write_text(json.dumps(project, separators=(",", ":")))
-            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "overlay"], check=True, capture_output=True)
-            gemini = root / "gemini"
-            installer.apply(installer.build_parser().parse_args([
-                "apply", "--gemini-dir", str(gemini), "--project", str(repo), "--json",
-            ]))
-            installed = gemini / "config/the-pilot/project.json"
-            altered = dict(project, description="manually installed")
-            installed.write_text(json.dumps(altered, indent=2) + "\n")
-            args = installer.build_parser().parse_args([
-                "self-update", "--project-only", "--workspace", str(repo),
-                "--gemini-dir", str(gemini), "--json",
-            ])
-            self.assertEqual(installer.self_update(args)["project_status"], "updated")
-            self.assertEqual(json.loads(installed.read_text())["description"], project["description"])
-    def test_workspace_overlay_sync_is_invoked_before_runtime_load(self):
-        """Matching project IDs sync the workspace overlay on the same turn."""
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            overlay = root / ".pilot/project.json"
-            overlay.parent.mkdir()
-            overlay.write_text(json.dumps({"projectId": "p", "shortcuts": {"x": "new"}}))
-            old = root / "project.json"
-            old.write_text(json.dumps({"projectId": "p", "shortcuts": {"x": "old"}}))
-            pilot_bin = root / "bin/pilot"
-            pilot_bin.parent.mkdir()
-            pilot_bin.write_text("#!/bin/sh\n")
-            pilot_bin.chmod(0o755)
-            env = {
-                "HOME": str(root / "home"),
-                "THE_PILOT_BIN": str(pilot_bin),
-                "THE_PILOT_GEMINI_DIR": str(root),
-            }
-            with mock.patch.object(runtime, "PILOT_DIR", root), mock.patch.object(runtime, "GEMINI_DIR", root), \
-                 mock.patch.object(runtime, "STATE_DIR", root / "state"), mock.patch.object(runtime, "LOG_PATH", root / "state/log"), \
-                 mock.patch.dict(os.environ, env), mock.patch.object(runtime, "subprocess") as proc:
-                process = mock.Mock(returncode=0)
-                process.communicate.return_value = ('{"project_status":"updated"}', "")
-                proc.Popen.return_value = process
-                self.assertTrue(runtime.maybe_sync_project_overlay({"workspacePaths": [str(root)]}))
-                proc.Popen.assert_called_once()
-                self.assertIn("project_auto_synced", (root / "state/log").read_text())
-
-    def test_corrupt_overlay_is_logged_without_writing(self):
-        """Corrupt workspace JSON fails closed in the installer and logs failure in the runtime."""
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            gemini = root / "gemini"
-            pilot_dir = gemini / "config/the-pilot"
-            pilot_dir.mkdir(parents=True)
-            source = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
-            (pilot_dir / "project.json").write_text(json.dumps(source))
-            (root / ".pilot").mkdir()
-            (root / ".pilot/project.json").write_text("{")
-            with mock.patch.object(runtime, "GEMINI_DIR", gemini), mock.patch.object(runtime, "PILOT_DIR", pilot_dir), mock.patch.object(runtime, "STATE_DIR", root / "state"), mock.patch.object(runtime, "LOG_PATH", root / "state/log"), mock.patch.dict(os.environ, {"HOME": str(root / "home"), "THE_PILOT_BIN": str(Path(__file__).parents[1] / "bin/pilot")}):
-                runtime.maybe_sync_project_overlay({"workspacePaths": [str(root)]})
-                self.assertEqual(json.loads((pilot_dir / "project.json").read_text())["projectId"], source["projectId"])
-                self.assertIn("project_auto_sync_failed", (root / "state/log").read_text())
-
     def test_cooldown_suppresses_background_spawn(self):
         """The six hour TTL prevents duplicate background self-update processes."""
         with tempfile.TemporaryDirectory() as root:
@@ -546,7 +444,7 @@ class AutoUpdateTest(unittest.TestCase):
             ])
             report = installer.self_update(args)
             self.assertEqual(report["source_status"], "up_to_date")
-            log_record = (gemini / "config/the-pilot/state/pilot.log").read_text().splitlines()[-1]
+            log_record = (gemini / "config/the-pilot/state/auto_update.log").read_text().splitlines()[-1]
             self.assertIsInstance(json.loads(log_record)["ts"], str)
 
     def test_self_update_skips_dirty_and_non_main_checkouts(self):
@@ -626,45 +524,7 @@ class AutoUpdateTest(unittest.TestCase):
                 self.assertEqual(record["last_checked_at"], old)
                 self.assertEqual(record["status"], "failed")
                 self.assertEqual(record["error"], "spawn")
-            self.assertIn("auto_update_spawn_failed", (state / "pilot.log").read_text())
-
-    def test_overlay_sync_uses_real_installer_and_v2_template(self):
-        """Workspace overlay changes are compiled through the installer runtime."""
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            gemini = root_path / "gemini"
-            workspace = root_path / "workspace"
-            source = json.loads((Path(__file__).parent / "fixtures/alter-service.json").read_text())
-            source["projectId"] = "p"
-            overlay = workspace / ".pilot/project.json"
-            overlay.parent.mkdir(parents=True)
-            overlay.write_text(json.dumps(source))
-            args = installer.build_parser().parse_args([
-                "apply", "--gemini-dir", str(gemini), "--project", str(overlay), "--max-turns", "9", "--json",
-            ])
-            installer.apply(args)
-            source["entry_specs"]["cq"]["template"] = "V2 {arg}"
-            overlay.write_text(json.dumps(source))
-            transcript = root_path / "transcript.jsonl"
-            transcript.write_text(json.dumps({"type": "USER_INPUT", "content": "cq hello"}) + "\n")
-            state_dir = gemini / "config/the-pilot/state"
-            with mock.patch.dict(os.environ, {
-                "HOME": str(root_path / "home"),
-                "THE_PILOT_BIN": str(Path(__file__).parents[1] / "bin/pilot"),
-                "THE_PILOT_GEMINI_DIR": str(gemini),
-                "THE_PILOT_STATE_DIR": str(state_dir),
-                "THE_PILOT_DISABLE_AUTO_UPDATE": "1",
-            }), mock.patch.object(runtime, "GEMINI_DIR", gemini), mock.patch.object(runtime, "PILOT_DIR", gemini / "config/the-pilot"), mock.patch.object(runtime, "PROFILE_PATH", gemini / "config/the-pilot/profile.json"), mock.patch.object(runtime, "CONFIG_PATH", gemini / "config/the-pilot/config.json"), mock.patch.object(runtime, "STATE_DIR", state_dir), mock.patch.object(runtime, "LOG_PATH", state_dir / "pilot.log"):
-                result = runtime.handle_pre_invocation({
-                    "conversationId": "c1", "lastUserInput": "cq hello", "workspacePaths": [str(workspace)],
-                    "transcriptPath": str(transcript),
-                })
-            self.assertIn("V2 hello", json.dumps(result, ensure_ascii=False))
-            self.assertEqual(json.loads((gemini / "config/the-pilot/profile.json").read_text())["pilot"]["max_consecutive_auto_turns"], 9)
-            self.assertEqual(json.loads((gemini / "config/the-pilot/project.json").read_text())["entry_specs"]["cq"]["template"], "V2 {arg}")
-            log_text = (state_dir / "pilot.log").read_text()
-            self.assertIn("project_auto_synced", log_text)
-            self.assertNotIn("project_auto_sync_failed", log_text)
+            self.assertIn("auto_update_spawn_failed", (state / "auto_update.log").read_text())
 
     def test_self_update_pulls_new_commit_syncs_skills_and_preserves_profile(self):
         """A clean main checkout pulls upstream commits, syncs skill symlinks, and preserves profile.json."""
@@ -829,50 +689,41 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(installer.self_update(args)["local_source_status"], "none")
 
     def test_pilot_pre_invocation_reexecs_updated_engine_on_same_turn(self):
-        """A changed on-disk engine is delegated once so the current turn uses new behavior."""
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            gemini = root / "gemini"
+        """A clean local checkout repairs the installed engine and runs it on the same turn."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, gemini = root / "home", root / "gemini"
+            checkout = self.make_checkout(home)
+            installer.apply(installer.build_parser().parse_args([
+                "apply", "--gemini-dir", str(gemini), "--json",
+            ]))
             pilot_dir = gemini / "config/the-pilot"
-            pilot_dir.mkdir(parents=True)
-            source = Path(__file__).parents[1] / "src/the_pilot/assets/runtime.py"
             engine = pilot_dir / "runtime.py"
-            engine.write_bytes(source.read_bytes())
-            installer.apply(installer.build_parser().parse_args(["apply", "--gemini-dir", str(gemini), "--no-project", "--json"]))
-            shim = root / "pilot-shim.py"
-            sync_count = root / "sync-count.txt"
-            shim.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, os, pathlib, sys\n"
-                "counter = pathlib.Path(os.environ['SYNC_COUNT_FILE'])\n"
-                "counter.write_text(counter.read_text() + '1\\n' if counter.exists() else '1\\n')\n"
-                "if sys.argv[1:3] == ['self-update', '--project-only']:\n"
-                "    d = pathlib.Path(os.environ['THE_PILOT_GEMINI_DIR']) / 'config/the-pilot'\n"
-                "    (d / 'runtime.py').write_text((d / 'runtime.py').read_text() + '\\n# upgraded\\n')\n"
-                "    config = json.loads((d / 'config.json').read_text())\n"
-                "    config['entry_shortcuts']['ping'] = {'template': 'upgraded shortcut body', 'requires_arg': False}\n"
-                "    (d / 'config.json').write_text(json.dumps(config))\n"
-                "    print(json.dumps({'local_source_status': 'updated'}))\n"
-                "else:\n"
-                "    print(json.dumps({}))\n"
-            )
-            shim.chmod(0o755)
-            payload = {"conversationId": "c", "lastUserInput": "ping", "workspacePaths": []}
+            source = checkout / "src/the_pilot/assets/runtime.py"
+            source.write_text(source.read_text().replace("【Pilot 启动口令", "【Upgraded engine"), encoding="utf-8")
+            self.commit_checkout(checkout, "change hook output")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "python3").symlink_to(sys.executable)
+            payload = {"conversationId": "local-sync", "lastUserInput": "r auth",
+                       "workspacePaths": [], "cwd": str(root)}
             env = {
                 **os.environ,
-                "HOME": str(root / "home"),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "HOME": str(home),
                 "THE_PILOT_GEMINI_DIR": str(gemini),
-                "THE_PILOT_BIN": str(shim),
+                "THE_PILOT_BIN": str(checkout / "bin/pilot"),
                 "THE_PILOT_DISABLE_AUTO_UPDATE": "1",
-                "SYNC_COUNT_FILE": str(sync_count),
             }
             result = subprocess.run(
                 [sys.executable, str(engine), "hook", "--event", "PreInvocation"],
                 input=json.dumps(payload), text=True, capture_output=True, env=env, check=True,
             )
-            receipt = json.loads(result.stdout)
-            self.assertIn("upgraded shortcut body", json.dumps(receipt, ensure_ascii=False))
-            self.assertEqual(sync_count.read_text().count("1"), 1)
+            self.assertIn("Upgraded engine", result.stdout)
+            self.assertEqual(engine.read_bytes(), source.read_bytes())
+            log = (pilot_dir / "state/pilot.log").read_text()
+            self.assertEqual(log.count('"event": "local_auto_synced"'), 1)
+            self.assertFalse((pilot_dir / "project.json").exists())
 
     def test_pilot_reexec_failure_is_reported_as_hook_failure(self):
         """A failing or malformed upgraded engine fails the hook instead of faking success."""
@@ -921,7 +772,7 @@ class AutoUpdateTest(unittest.TestCase):
                 self.assertEqual(failure["error"], expected_error)
                 self.assertIn(expected_detail, failure["detail"])
 
-    def test_pilot_project_sync_timeout_kills_the_updater_process_group(self):
+    def test_pilot_local_sync_timeout_kills_the_updater_process_group(self):
         """An overrunning updater is unconfirmed and leaves no installation writer behind."""
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -947,9 +798,9 @@ class AutoUpdateTest(unittest.TestCase):
                     mock.patch.object(runtime, "PILOT_DIR", gemini / "config/the-pilot"), \
                     mock.patch.object(runtime, "STATE_DIR", state_dir), \
                     mock.patch.object(runtime, "LOG_PATH", state_dir / "pilot.log"), \
-                    mock.patch.object(runtime, "PROJECT_SYNC_TIMEOUT_SECONDS", 0.5):
+                    mock.patch.object(runtime, "LOCAL_SYNC_TIMEOUT_SECONDS", 0.5):
                 started = time.time()
-                confirmed = runtime.maybe_sync_project_overlay({"workspacePaths": []})
+                confirmed = runtime.maybe_sync_local_engine()
                 elapsed = time.time() - started
             self.assertFalse(confirmed)
             self.assertLess(elapsed, 10)
@@ -962,6 +813,6 @@ class AutoUpdateTest(unittest.TestCase):
                 except ProcessLookupError:
                     break
                 if time.time() >= deadline:
-                    self.fail("project sync timeout left its child writer running")
+                    self.fail("local sync timeout left its child writer running")
                 time.sleep(0.05)
 
