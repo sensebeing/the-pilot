@@ -107,6 +107,47 @@ class AutoUpdateTest(unittest.TestCase):
         subprocess.run([*git, "commit", "-m", message], check=True, capture_output=True)
         return subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
 
+    def install_fake_uv(
+        self, root: Path, *, json_log: bool = False, copy_wheel: Path | None = None,
+    ) -> Path:
+        """Write a uv stub that installs the given wheel into the uv tool layout.
+
+        The installer passes ``UV_TOOL_DIR`` and ``UV_TOOL_BIN_DIR`` to uv, so
+        the stub extracts ``the_pilot/`` into the matching site-packages and
+        writes the launcher where uv would. ``UV_LOG`` receives one line per
+        call, either JSON arguments or the space-joined argument list.
+        """
+        log_expression = "json.dumps(arguments)" if json_log else "' '.join(arguments)"
+        lines = [
+            "#!/usr/bin/env python3",
+            "import json, os, shutil, sys, zipfile",
+            "from pathlib import Path",
+            "arguments = sys.argv[1:]",
+            "with open(os.environ['UV_LOG'], 'a', encoding='utf-8') as log:",
+            f"    log.write({log_expression} + '\\n')",
+            "wheel = Path(arguments[-1])",
+        ]
+        if copy_wheel is not None:
+            lines.append(f"shutil.copyfile(wheel, {str(copy_wheel)!r})")
+        lines.extend([
+            "site_packages = Path(os.environ['UV_TOOL_DIR']) / 'the-pilot/lib/python3.12/site-packages'",
+            "shutil.rmtree(site_packages / 'the_pilot', ignore_errors=True)",
+            "site_packages.mkdir(parents=True, exist_ok=True)",
+            "with zipfile.ZipFile(wheel) as archive:",
+            "    for name in archive.namelist():",
+            "        if name.startswith('the_pilot/'):",
+            "            archive.extract(name, site_packages)",
+            "launcher = Path(os.environ['UV_TOOL_BIN_DIR']) / 'pilot'",
+            "launcher.parent.mkdir(parents=True, exist_ok=True)",
+            "launcher.write_text('#!/bin/sh\\n')",
+            "launcher.chmod(0o755)",
+            "",
+        ])
+        uv = root / "uv"
+        uv.write_text("\n".join(lines), encoding="utf-8")
+        uv.chmod(0o755)
+        return uv
+
     def test_installed_package_uses_newer_main_for_imports_and_cli(self):
         """A proven clean main checkout supplies newer code to imports and CLI calls."""
         for vcs_metadata in (True, False):
@@ -224,15 +265,11 @@ class AutoUpdateTest(unittest.TestCase):
             global_skills.mkdir(parents=True)
             local_skills = gemini / "config/skills"
             local_skills.mkdir(parents=True)
-            uv = root / "uv"
-            uv.write_text(
-                '#!/bin/sh\n'
-                'printf "%s\\n" "$@" > "$HOME/uv-args"\n'
-                'mkdir -p "$HOME/.local/bin"\n'
-                'touch "$HOME/.local/bin/pilot"\n'
-            )
-            uv.chmod(0o755)
-            env = {"HOME": str(home), "PATH": f"{root}:{os.environ['PATH']}"}
+            self.install_fake_uv(root)
+            env = {
+                "HOME": str(home), "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "UV_LOG": str(home / "uv-args"),
+            }
             subprocess.run(
                 [sys.executable, str(checkout / "bin/pilot"), "apply", "--gemini-dir", str(gemini), "--no-project"],
                 cwd=root, env=env, check=True, capture_output=True, timeout=10,
@@ -247,7 +284,7 @@ class AutoUpdateTest(unittest.TestCase):
 
             subprocess.run([*command, "--home-dir", str(home)], cwd=root, env=env, check=True, capture_output=True, timeout=10)
             self.assertTrue((global_skills / "the-pilot").is_symlink())
-            self.assertIn("install\n--force", (home / "uv-args").read_text())
+            self.assertIn("install --force", (home / "uv-args").read_text())
 
     def test_cli_background_checks_keep_local_and_remote_cooldowns_separate(self):
         """Stale local code can repair immediately without postponing its remote check."""
@@ -259,6 +296,9 @@ class AutoUpdateTest(unittest.TestCase):
             launcher = home / ".local/bin/pilot"
             launcher.parent.mkdir(parents=True)
             launcher.touch()
+            installed = home / ".local/share/uv/tools/the-pilot/lib/python3.12/site-packages/the_pilot"
+            installed.parent.mkdir(parents=True)
+            shutil.copytree(checkout / "src/the_pilot", installed)
             state = gemini / "config/the-pilot/state"
             state.mkdir(parents=True)
             metadata_path = state / "auto_update.json"
@@ -317,25 +357,26 @@ class AutoUpdateTest(unittest.TestCase):
                 ).strip(),
                 "installed_tree_digest": installer._compute_source_tree_digest(checkout / "src/the_pilot"),
             }))
-            uv = root / "uv"
-            uv.write_text(
-                '#!/bin/sh\n'
-                'printf "%s\\n" "$@" > "$HOME/uv-args"\n'
-                'mkdir -p "$HOME/.local/bin"\n'
-                'touch "$HOME/.local/bin/pilot"\n'
-            )
-            uv.chmod(0o755)
+            self.install_fake_uv(root)
             result = subprocess.run(
                 [sys.executable, str(checkout / "bin/pilot"), "self-update",
                  "--local-only", "--gemini-dir", str(gemini), "--json"],
-                cwd=root, env={"HOME": str(home), "PATH": f"{root}:{os.environ['PATH']}"},
+                cwd=root, env={
+                    "HOME": str(home), "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                    "UV_LOG": str(home / "uv-args"),
+                },
                 text=True, capture_output=True, check=True,
             )
             self.assertEqual(json.loads(result.stdout)["status"], "up_to_date")
             self.assertTrue((home / ".local/bin/pilot").is_file())
-            arguments = (home / "uv-args").read_text().splitlines()
+            arguments = (home / "uv-args").read_text().split()
             self.assertEqual(arguments[:3], ["tool", "install", "--force"])
             self.assertTrue(arguments[-1].endswith(".whl"), arguments[-1])
+            installed = home / ".local/share/uv/tools/the-pilot/lib/python3.12/site-packages/the_pilot"
+            self.assertEqual(
+                packaging.compute_source_tree_digest(installed),
+                installer._compute_source_tree_digest(checkout / "src/the_pilot"),
+            )
 
     def test_session_start_announces_without_loading_or_syncing_the_profile(self):
         """SessionStart exposes the initial pane state before project maintenance.
@@ -695,9 +736,7 @@ class AutoUpdateTest(unittest.TestCase):
             (home / ".local/bin/pilot").write_text("#!/bin/sh\n")
             (home / ".local/bin/pilot").chmod(0o755)
             uv_log = root / "uv.log"
-            uv = root / "uv"
-            uv.write_text("#!/bin/sh\necho \"$@\" >> \"$UV_LOG\"\nexit 0\n")
-            uv.chmod(0o755)
+            self.install_fake_uv(root)
             gemini = root / "gemini"
             state = gemini / "config/the-pilot/state"
             state.mkdir(parents=True)
@@ -742,11 +781,12 @@ class AutoUpdateTest(unittest.TestCase):
             egg_info = checkout / "src/the_pilot.egg-info/stale.txt"
             egg_info.parent.mkdir(parents=True)
             egg_info.write_text("stale metadata\n", encoding="utf-8")
-            site_packages = home / ".local/share/uv/tools/the-pilot/lib/python3.12/site-packages"
+            tools, bin_dir = root / "tools", root / "bin"
+            site_packages = tools / "the-pilot/lib/python3.12/site-packages"
             polluted = site_packages / "the_pilot/assets"
             polluted.mkdir(parents=True)
             (polluted / "autopilot.py").write_text("# polluted install\n", encoding="utf-8")
-            launcher = home / ".local/bin/pilot"
+            launcher = bin_dir / "pilot"
             launcher.parent.mkdir(parents=True)
             launcher.write_text("#!/bin/sh\n# live launcher\n", encoding="utf-8")
             launcher.chmod(0o755)
@@ -757,37 +797,14 @@ class AutoUpdateTest(unittest.TestCase):
             }))
             uv_log = root / "uv.log"
             uv_wheel = root / "installed.whl"
-            uv = root / "uv"
-            uv.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json, os, shutil, sys, zipfile\n"
-                "from pathlib import Path\n"
-                "arguments = sys.argv[1:]\n"
-                "with open(os.environ['UV_LOG'], 'a', encoding='utf-8') as log:\n"
-                "    log.write(json.dumps(arguments) + '\\n')\n"
-                "wheel = Path(arguments[-1])\n"
-                "shutil.copyfile(wheel, os.environ['UV_WHEEL_COPY'])\n"
-                "site_packages = Path(os.environ['SITE_PACKAGES'])\n"
-                "shutil.rmtree(site_packages / 'the_pilot', ignore_errors=True)\n"
-                "with zipfile.ZipFile(wheel) as archive:\n"
-                "    for name in archive.namelist():\n"
-                "        if name.startswith('the_pilot/'):\n"
-                "            archive.extract(name, site_packages)\n"
-                "launcher = Path(os.environ['LAUNCHER'])\n"
-                "launcher.parent.mkdir(parents=True, exist_ok=True)\n"
-                "launcher.write_text('#!/bin/sh\\n')\n"
-                "launcher.chmod(0o755)\n",
-                encoding="utf-8",
-            )
-            uv.chmod(0o755)
+            uv = self.install_fake_uv(root, json_log=True, copy_wheel=uv_wheel)
             args = installer.build_parser().parse_args([
                 "self-update", "--local-only", "--gemini-dir", str(gemini),
                 "--home-dir", str(home), "--json",
             ])
             env = {
                 "HOME": str(root / "process-home"), "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
-                "UV_LOG": str(uv_log), "UV_WHEEL_COPY": str(uv_wheel),
-                "SITE_PACKAGES": str(site_packages), "LAUNCHER": str(launcher),
+                "UV_LOG": str(uv_log), "UV_TOOL_DIR": str(tools), "UV_TOOL_BIN_DIR": str(bin_dir),
             }
             before = tree_paths(checkout)
             with mock.patch.dict(os.environ, env), \
@@ -1075,6 +1092,102 @@ class AutoUpdateTest(unittest.TestCase):
             self.assertEqual(
                 launcher.read_text(encoding="utf-8"), "#!/bin/sh\n# live launcher\n"
             )
+
+    def test_uv_tool_layout_honors_overrides_and_missing_package_is_stale(self):
+        """UV_TOOL_DIR/UV_TOOL_BIN_DIR own tool paths and a missing package tree is stale.
+
+        Failure means a uv configured with custom directories is misread as
+        unmanaged or absent, or a launcher whose site-packages disappeared is
+        treated as current and never force-reinstalled.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            tools, bin_dir = root / "tools", root / "bin"
+            with mock.patch.dict(
+                os.environ,
+                {"UV_TOOL_DIR": str(tools), "UV_TOOL_BIN_DIR": str(bin_dir)},
+                clear=True,
+            ):
+                self.assertEqual(installer._uv_tool_dir(home), tools)
+                self.assertEqual(installer._uv_tool_bin_dir(home), bin_dir)
+                package = tools / "the-pilot/lib/python3.12/site-packages/the_pilot"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text("", encoding="utf-8")
+                digest = packaging.compute_source_tree_digest(package)
+                metadata = {"installed_sha": "sha", "installed_tree_digest": digest}
+                self.assertEqual(installer._installed_uv_package_dir(home), package)
+                self.assertTrue(
+                    installer._uv_tool_stale(home, "sha", digest, metadata, managed=True)
+                )
+                launcher = bin_dir / "pilot"
+                launcher.parent.mkdir(parents=True)
+                launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+                self.assertFalse(
+                    installer._uv_tool_stale(home, "sha", digest, metadata, managed=True)
+                )
+                package.rename(root / "removed-package")
+                self.assertTrue(
+                    installer._uv_tool_stale(home, "sha", digest, metadata, managed=True)
+                )
+            with mock.patch.dict(
+                os.environ, {"UV_TOOL_DIR": "", "UV_TOOL_BIN_DIR": "  "}, clear=True
+            ):
+                self.assertEqual(installer._uv_tool_dir(home), home / ".local/share/uv/tools")
+                self.assertEqual(installer._uv_tool_bin_dir(home), home / ".local/bin")
+
+    def test_missing_installed_package_tree_fails_closed_after_uv_install(self):
+        """An install that leaves no package tree must fail without recording success.
+
+        Failure means self-update records installed_sha/installed_tree_digest
+        after uv only wrote a launcher, so the next check believes an
+        unverified tool tree is current and never repairs it.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, gemini = root / "home", root / "gemini"
+            self.make_package_checkout(home)
+            launcher = home / ".local/bin/pilot"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\n# live launcher\n", encoding="utf-8")
+            uv_log = root / "uv.log"
+            uv = root / "uv"
+            uv.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$@\" >> \"$UV_LOG\"\n"
+                "mkdir -p \"$UV_TOOL_BIN_DIR\"\n"
+                "touch \"$UV_TOOL_BIN_DIR/pilot\"\n"
+            )
+            uv.chmod(0o755)
+            state = gemini / "config/the-pilot/state"
+            state.mkdir(parents=True)
+            (state / "auto_update.json").write_text(json.dumps({
+                "installed_sha": "old", "installed_tree_digest": "old",
+            }))
+            args = installer.build_parser().parse_args([
+                "self-update", "--local-only", "--gemini-dir", str(gemini),
+                "--home-dir", str(home), "--json",
+            ])
+            env = {
+                "HOME": str(root / "process-home"),
+                "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "UV_LOG": str(uv_log),
+            }
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(installer.shutil, "which", return_value=str(uv)):
+                with self.assertRaises(installer.SetupError) as caught:
+                    installer.self_update(args)
+            failure = str(caught.exception)
+            self.assertIn("did not create an installed package", failure)
+            self.assertIn("site-packages", failure)
+            self.assertEqual(
+                launcher.read_text(encoding="utf-8"), "#!/bin/sh\n# live launcher\n"
+            )
+            metadata = json.loads((state / "auto_update.json").read_text())
+            self.assertEqual(metadata["status"], "failed")
+            self.assertEqual(metadata["installed_sha"], "old")
+            self.assertEqual(metadata["installed_tree_digest"], "old")
+            self.assertTrue(uv_log.exists())
 
     def test_subprocess_timeout_decodes_byte_stderr_into_the_error(self):
         """A timed-out command's raw byte stderr must become readable diagnostics.

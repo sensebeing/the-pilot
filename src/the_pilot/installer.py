@@ -768,9 +768,23 @@ def _discover_checkout(explicit: str | None, *, home_dir: Path | None = None) ->
     return None, False
 
 
+def _uv_tool_dir(home_dir: Path, env: Mapping[str, str] | None = None) -> Path:
+    """Resolve uv's tool root, honoring a non-empty ``UV_TOOL_DIR``."""
+    eff_env = os.environ if env is None else env
+    configured = eff_env.get("UV_TOOL_DIR", "").strip()
+    return Path(configured).expanduser() if configured else home_dir / ".local/share/uv/tools"
+
+
+def _uv_tool_bin_dir(home_dir: Path, env: Mapping[str, str] | None = None) -> Path:
+    """Resolve uv's tool executable directory, honoring ``UV_TOOL_BIN_DIR``."""
+    eff_env = os.environ if env is None else env
+    configured = eff_env.get("UV_TOOL_BIN_DIR", "").strip()
+    return Path(configured).expanduser() if configured else home_dir / ".local/bin"
+
+
 def _installed_uv_package_dir(home_dir: Path) -> Path | None:
-    root = home_dir / ".local/share/uv/tools/the-pilot"
-    matches = sorted(root.glob("lib/python*/site-packages/the_pilot"))
+    root = _uv_tool_dir(home_dir) / "the-pilot"
+    matches = sorted(root.glob(f"lib/python*/site-packages/{packaging.PACKAGE_NAME}"))
     return matches[0] if matches else None
 
 
@@ -778,17 +792,19 @@ def _manages_uv_tool(home_dir: Path, *, explicit: bool = False) -> bool:
     if explicit or not shutil.which("uv"):
         return False
     is_real_home = home_dir.expanduser().resolve() == Path.home().resolve()
+    launcher = _uv_tool_bin_dir(home_dir) / "pilot"
     if _in_test_harness():
-        return not is_real_home and (home_dir / ".local/bin/pilot").exists()
-    return is_real_home or (home_dir / ".local/bin/pilot").exists()
+        return not is_real_home and launcher.exists()
+    return is_real_home or launcher.exists()
 
 
 def _uv_tool_stale(
     home_dir: Path, sha: str, digest: str, metadata: dict[str, Any], *, managed: bool,
 ) -> bool:
     package = _installed_uv_package_dir(home_dir)
+    launcher = _uv_tool_bin_dir(home_dir) / "pilot"
     return (
-        (managed and not (home_dir / ".local/bin/pilot").exists())
+        (managed and (not launcher.exists() or package is None))
         or metadata.get("installed_sha") != sha
         or metadata.get("installed_tree_digest") != digest
         or (package is not None and _compute_source_tree_digest(package) != digest)
@@ -804,8 +820,9 @@ def _install_uv_tool_from_checkout(
     and enforces that its package tree digest equals the checkout digest. That
     step never touches the live launcher, so an unbuildable or inconsistent
     checkout leaves ``~/.local/bin/pilot`` exactly as it was. Stage 2 makes the
-    single ``uv tool install --force <wheel>`` call and verifies the launcher
-    and installed package afterwards.
+    single ``uv tool install --force <wheel>`` call in the resolved tool and
+    executable directories, then requires both the launcher and a package tree
+    whose digest equals the checkout digest.
     """
     with tempfile.TemporaryDirectory(prefix="the-pilot-wheel-") as directory:
         try:
@@ -817,18 +834,28 @@ def _install_uv_tool_from_checkout(
             raise SetupError(
                 f"Built wheel digest {wheel_digest} does not match checkout digest {expected_digest}"
             )
-        subprocess_run(["uv", "tool", "install", "--force", str(wheel_path)], 30)
-    launcher = home_dir / ".local/bin/pilot"
+        install_env = {
+            **os.environ,
+            "UV_TOOL_DIR": str(_uv_tool_dir(home_dir)),
+            "UV_TOOL_BIN_DIR": str(_uv_tool_bin_dir(home_dir)),
+        }
+        subprocess_run(["uv", "tool", "install", "--force", str(wheel_path)], 30, env=install_env)
+    launcher = _uv_tool_bin_dir(home_dir) / "pilot"
     if not launcher.exists():
         raise SetupError(f"uv tool install did not create {launcher}")
     installed_package = _installed_uv_package_dir(home_dir)
-    if installed_package is not None:
-        installed_digest = packaging.compute_source_tree_digest(installed_package)
-        if installed_digest != expected_digest:
-            raise SetupError(
-                f"Installed package digest {installed_digest} does not match "
-                f"checkout digest {expected_digest}"
-            )
+    if installed_package is None:
+        searched = (
+            _uv_tool_dir(home_dir) / "the-pilot" / "lib" / "python*" / "site-packages"
+            / packaging.PACKAGE_NAME
+        )
+        raise SetupError(f"uv tool install did not create an installed package under {searched}")
+    installed_digest = packaging.compute_source_tree_digest(installed_package)
+    if installed_digest != expected_digest:
+        raise SetupError(
+            f"Installed package digest {installed_digest} does not match "
+            f"checkout digest {expected_digest}"
+        )
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:

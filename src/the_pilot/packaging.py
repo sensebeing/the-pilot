@@ -19,7 +19,7 @@ import csv
 import hashlib
 import io
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tarfile
 import tempfile
 import tomllib
@@ -38,23 +38,32 @@ WHEEL_FILE_TEXT = (
 )
 
 
+def is_package_file(relative: PurePosixPath) -> bool:
+    """Return whether a package-relative path belongs to the installed package.
+
+    This predicate is the single executable owner of the controlled-file
+    classification: the source digest, the wheel digest and every built
+    distribution call it, so their file sets can never diverge.
+    """
+    if "__pycache__" in relative.parts or relative.suffix in EXCLUDED_SUFFIXES:
+        return False
+    return relative.suffix == ".py" or relative.parts[:1] == ("assets",)
+
+
 def iter_package_files(src_root: Path) -> list[tuple[str, Path]]:
     """List the controlled package files in stable relative-path order.
 
-    Only ordinary ``.py`` files and everything directly under ``assets/``
-    belong to the package. Byte-code caches and non-package documents are
-    skipped so the same enumeration drives the digest and every wheel.
+    Only ordinary files accepted by :func:`is_package_file` belong to the
+    package, so the same enumeration drives the digest and every wheel.
     """
     if not src_root.is_dir():
         return []
     files: list[tuple[str, Path]] = []
     for path in src_root.rglob("*"):
-        if not path.is_file() or "__pycache__" in path.parts:
+        if not path.is_file():
             continue
-        if path.suffix in EXCLUDED_SUFFIXES:
-            continue
-        relative = path.relative_to(src_root)
-        if relative.suffix == ".py" or relative.parts[:1] == ("assets",):
+        relative = PurePosixPath(path.relative_to(src_root).as_posix())
+        if is_package_file(relative):
             files.append((relative.as_posix(), path))
     return sorted(files)
 
@@ -84,13 +93,9 @@ def compute_wheel_tree_digest(wheel_path: Path) -> str:
             name = info.filename
             if not name.startswith(f"{PACKAGE_NAME}/") or name.endswith("/"):
                 continue
-            relative = name[len(PACKAGE_NAME) + 1:]
-            if "__pycache__" in relative.split("/"):
-                continue
-            if relative.endswith(EXCLUDED_SUFFIXES):
-                continue
-            if relative.endswith(".py") or relative.startswith("assets/"):
-                files.append((relative, archive.read(info)))
+            relative = PurePosixPath(name[len(PACKAGE_NAME) + 1:])
+            if is_package_file(relative):
+                files.append((relative.as_posix(), archive.read(info)))
     return _tree_digest(files)
 
 
