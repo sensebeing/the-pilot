@@ -675,14 +675,17 @@ class CompilerTest(unittest.TestCase):
         section = profile_compiler.render_orchestration_section(profile)
 
         for clause in (
-            "独立分支完成修改、定向测试与秒级本地静态预检",
-            "`check-doc-structure`/`product-quality`/`guard check`",
+            "独立分支完成修改、定向测试与秒级本地静态门禁",
             "待主会话零基复审",
-            "worker 执行模型级 `guard review`、原子落地（`git-land.py`）",
+            "worker 执行模型级 `guard review`、仓库原子合入流程",
             "长构建/部署/探测等待",
             "不挂后台 `guard review`、测试套件/构建轮询",
         ):
             self.assertIn(clause, section)
+        for repository_specific in (
+            "check-doc-structure", "product-quality", "git-land.py",
+        ):
+            self.assertNotIn(repository_specific, section)
 
         for clause in (
             '单段契约用 `--spec "<任务契约>"` 一轮发出',
@@ -696,14 +699,13 @@ class CompilerTest(unittest.TestCase):
         self.assertNotIn("多行契约用 `--spec-file <路径>`", section)
 
         for clause in (
-            "并行批量执行只读核查",
-            "`git diff --stat`",
-            "`-- <paths>`",
-            "`git show`/`git diff`",
-            "`--terminal-state reclaimable`",
-            "`--worktree path:<路径>`",
-            "`uv run --project ...`",
-            "`python3 -c`",
+            "主会话并行批量执行只读核查",
+            "查 diff 先 `git diff --stat` 再按 `-- <paths>` 限定",
+            "禁用整分支无界 `git show`/`git diff`",
+            "Orca 查询用有界选择器（`--terminal-state reclaimable`、`--worktree path:<路径>`）",
+            "多行 Python 用 `uv run --project ...`/`.py`",
+            "禁嵌套引号 `python3 -c`",
+            "不挂后台 `guard review`、测试套件/构建轮询",
         ):
             self.assertIn(clause, section)
 

@@ -163,7 +163,7 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
 
 1. **职责分离**：
    - **Tier-1 主会话（Coordinator，无 Orca Task ID / Dispatch ID preamble）**：原生 **{coordinator_label}**（`antigravity`），直接 `agy --dangerously-skip-permissions`，账户池由 Orca 与 `agy-switch` 管理，禁用 `magpie agy`。顶层工作区先登记到 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`。**严禁以 `claude`/`codex` 启动或降级充当 Tier-1 主会话**。{HARNESS_ORCHESTRATION_SENTENCE}。排障查同链路历史与端到端拓扑，禁叠黑白名单、局部重试或特判。
-   - **Tier-2 子会话（Dispatched Worker，有 live Task ID / Dispatch ID preamble）**：除极简单改动，实施交 Orca worker。独立分支完成修改、定向测试与秒级本地静态预检（`check-doc-structure`/`product-quality`/`guard check`）后报 `worker_done`，待主会话零基复审；通过后由 worker 执行模型级 `guard review`、原子落地（`git-land.py`）与长构建/部署/探测等待，再 `worker_done` 唤醒。禁止嵌套派工。
+   - **Tier-2 子会话（Dispatched Worker，有 live Task ID / Dispatch ID preamble）**：除极简单改动，实施交 Orca worker。独立分支完成修改、定向测试与秒级本地静态门禁后报 `worker_done`，待主会话零基复审；通过后由 worker 执行模型级 `guard review`、仓库原子合入流程与长构建/部署/探测等待，再 `worker_done` 唤醒。禁止嵌套派工。
 2. **Orca 编排（执行器优先级：{priority}）**：禁用 `invoke_subagent` 和无监督裸终端。先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定 Run。{executor}。Task spec 自包含 Target/Contracts/Files/Boundaries/Ownership/Acceptance、业务目标、Anchor 0、最简模型，载明「未经主会话 Review 不得合入或推送 `main`」。
 3. **工作区层级与回调**：
    - 同工作区 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）。
