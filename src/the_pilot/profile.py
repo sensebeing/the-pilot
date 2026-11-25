@@ -11,7 +11,9 @@ from .assets.runtime import (
     WORKER_EFFORT_LEVELS,
     is_comma_alias,
     is_entry_key,
+    is_worker_model_id,
     normalize_worker_agent,
+    parse_worker_effort,
     shortcut_override_name,
     shortcut_override_owners,
 )
@@ -248,8 +250,8 @@ def canonical_worker_model_keys(raw: Any) -> dict[str, Any]:
 
 
 def normalize_worker_effort(value: Any, where: str) -> str:
-    effort = value.strip().lower() if isinstance(value, str) else None
-    if effort not in WORKER_EFFORT_LEVELS:
+    effort = parse_worker_effort(value)
+    if effort is None:
         raise ProfileError(f"{where} 必须是 {WORKER_EFFORT_LEVELS} 之一，实际为 {value!r}")
     return effort
 
@@ -267,8 +269,7 @@ def _normalize_worker_models(
         spec = _require_mapping(spec, where)
         _reject_unknown(spec, ("model", "effort"), where)
         model = spec.get("model")
-        if (not isinstance(model, str) or not model or not model.isprintable()
-                or any(char.isspace() for char in model) or "`" in model):
+        if not is_worker_model_id(model):
             raise ProfileError(f"{where}.model 必须是无空白、控制字符或反引号的非空字符串")
         config: dict[str, str | None] = {"model": model}
         if spec.get("effort") is not None:

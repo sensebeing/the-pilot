@@ -33,7 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, TypeGuard
 
 
 PILOT_SUBDIR = Path("config") / "the-pilot"
@@ -741,10 +741,40 @@ def normalize_worker_agent(raw: str) -> str | None:
     return WORKER_AGENT_ALIASES.get(raw.strip().lower())
 
 
+def is_worker_model_id(value: Any) -> TypeGuard[str]:
+    return (
+        isinstance(value, str) and bool(value) and value.isprintable()
+        and not any(char.isspace() for char in value) and "`" not in value
+    )
+
+
+def parse_worker_effort(value: Any) -> str | None:
+    effort = value.strip().lower() if isinstance(value, str) else None
+    return effort if effort in WORKER_EFFORT_LEVELS else None
+
+
 def current_worker_models(profile: dict[str, Any]) -> dict[str, dict[str, str]]:
     orchestration = profile.get("orchestration")
     models = orchestration.get("worker_models") if isinstance(orchestration, dict) else None
-    return models if isinstance(models, dict) else {}
+    if not isinstance(models, dict):
+        return {}
+
+    valid: dict[str, dict[str, str]] = {}
+    for agent, spec in models.items():
+        if agent not in WORKER_AGENT_ORDER or not isinstance(spec, dict):
+            continue
+        model = spec.get("model")
+        if not is_worker_model_id(model):
+            continue
+        raw_effort = spec.get("effort")
+        effort = parse_worker_effort(raw_effort)
+        if raw_effort is not None and effort is None:
+            continue
+        config = {"model": model}
+        if effort is not None:
+            config["effort"] = effort
+        valid[agent] = config
+    return valid
 
 
 def format_agent_order(agents: Sequence[str]) -> str:

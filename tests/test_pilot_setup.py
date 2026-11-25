@@ -2713,6 +2713,32 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(json.loads(self.pre("agy-dispatched-worker", preamble).stdout), {})
         self.assertFalse(state_path(self.state, "agy-dispatched-worker").exists())
 
+    def test_worker_hook_ignores_invalid_model_entries_in_installed_profile(self) -> None:
+        """An invalid launch preference must not crash the hook or suppress valid entries."""
+        apply_profile(self.root, self.gemini, "--worker-agents", "agy,codex,claude")
+        path = self.gemini / PROFILE_REL
+        profile = read_json(path)
+        for agy_spec in (None, "bad", {"model": 123}, {"model": "bad\nvalue"}):
+            with self.subTest(agy_spec=agy_spec):
+                profile["orchestration"]["worker_models"] = {
+                    "agy": agy_spec,
+                    "claude": {"model": "wrong", "effort": "extreme"},
+                    "codex": {"model": "valid", "effort": " HIGH "},
+                    "unknown": {"model": "unrecognized"},
+                }
+                write_json(path, profile)
+                result = self.pre("worker-invalid-model", ",worker status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                message = self.injection(result)
+                self.assertNotIn("--agent antigravity --model", message)
+                self.assertNotIn("--agent claude --model", message)
+                self.assertIn("--agent codex --model valid --effort high", message)
+        report = run_engine(self.root, self.gemini, self.state, "worker", "status", "--json")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(json.loads(report.stdout)["worker_models"], {
+            "codex": {"model": "valid", "effort": "high"},
+        })
+
     def test_worker_chat_switch_and_reserved_aliases(self) -> None:
         for target in ("codex", "claude"):
             message = self.injection(self.pre("worker-chat", f",worker {target}"))
