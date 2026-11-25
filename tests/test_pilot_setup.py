@@ -2566,6 +2566,40 @@ class EngineTest(unittest.TestCase):
         self.stop("c-worker-stop", "", steps=worker_steps)
         self.assertEqual(send_calls(self.root), [])
 
+    def test_orca_worker_preamble_bypasses_pilot_but_coordinator_wake_runs(self) -> None:
+        """Only coordinators record turns and require a Pilot tag on Stop.
+
+        Failure means worker turns enter the Pilot pipeline or coordinator
+        wake messages incorrectly bypass it.
+        """
+        worker_intro = (
+            "You are working inside Orca, a multi-agent IDE. You are a dispatched worker.\n"
+            "Your coordinator receives mail you send with no recipient.\n"
+        )
+        for cid, text, runs_pilot in (
+            ("c-orca-task", worker_intro + "Your task ID is: task_57857793e846", False),
+            ("c-orca-dispatch", worker_intro + "Your dispatch ID is: ctx_af21f906ac72", False),
+            ("c-orca-wake", "You have 1 orchestration message. Run orca orchestration check.", True),
+        ):
+            with self.subTest(cid=cid, hook="PreInvocation"):
+                result = self.pre(cid, text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if not runs_pilot:
+                    self.assertEqual(json.loads(result.stdout), {})
+                self.assertEqual(state_path(self.state, cid).exists(), runs_pilot)
+
+            with self.subTest(cid=cid, hook="Stop"):
+                result = self.stop(cid, "Task complete.")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"decision": "allow"})
+                self.assertEqual(state_path(self.state, cid).exists(), runs_pilot)
+                log_path = self.state / "pilot.log"
+                log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+                self.assertEqual(
+                    f'"event": "stop_invalid_tag", "cid": "{cid}", "reason": "missing_tag"' in log,
+                    runs_pilot,
+                )
+
     def test_candidate_switch_expands_and_clears(self) -> None:
         self.stop("c-cand", suggestion("主推方案", alt="稳妥方案", gate="pause"))
         message = self.injection(self.pre("c-cand", ",2 先看边界"))
@@ -5295,27 +5329,36 @@ class OscTargetResolutionTest(unittest.TestCase):
     def test_announce_boot_writes_the_interactive_entry_state(self) -> None:
         """Boot honors agy's flag arity and stops parsing flags at the first prompt.
 
-        Failure means an idle resume appears to be working, or a prompt or
-        one-shot CLI command leaves a false idle signal in the pane.
-        resident-fact: status: 启动参数遵守 Go flag 位置参数规则，一次性命令不发帧。
+        Failure means Orca can see a false Ready signal for a fresh or prompted
+        launch, or an idle resume can lose its Ready signal.
+        resident-fact: status: 带初始提示词时宣告 working，仅恢复空闲会话时宣告 done。
         """
         cases = (
-            ([], runtime.OSC_7501_DONE),
+            ([], ""),
+            (["--dangerously-skip-permissions", "--model", "gemini-4-neon-high", "--effort", "high"], ""),
             (["-c"], runtime.OSC_7501_DONE),
             (["--continue"], runtime.OSC_7501_DONE),
+            (["-c=false"], ""),
+            (["--continue=F"], ""),
+            (["--continue=0"], ""),
+            (["-r", "cid"], runtime.OSC_7501_DONE),
+            (["--resume", "cid"], runtime.OSC_7501_DONE),
+            (["--resume=cid"], runtime.OSC_7501_DONE),
+            (["--resume="], ""),
             (["--conversation=cid"], runtime.OSC_7501_DONE),
             (["--conversation", "cid"], runtime.OSC_7501_DONE),
             (["-model", "Gemini 4 Carbon (High)", "-conversation", "cid"], runtime.OSC_7501_DONE),
             (["--dangerously-skip-permissions", "--model", "Gemini 4 Carbon (High)",
               "--conversation", "cid"], runtime.OSC_7501_DONE),
-            (["--prompt-interactive", "   "], runtime.OSC_7501_DONE),
+            (["--prompt-interactive", "   "], ""),
             (["--prompt-interactive", "go"], runtime.OSC_7501_WORKING),
+            (["--resume", "cid", "--prompt-interactive", "go"], runtime.OSC_7501_WORKING),
             (["-i=go"], runtime.OSC_7501_WORKING),
             (["-"], runtime.OSC_7501_WORKING),
             (["go", "--help"], runtime.OSC_7501_WORKING),
             (["go", "--", "mcp"], runtime.OSC_7501_WORKING),
             (["--", "mcp"], runtime.OSC_7501_WORKING),
-            (["--model", "--help"], runtime.OSC_7501_DONE),
+            (["--model", "--help"], ""),
             *(([flag], "") for flag in ("-h", "--help", "-help", "-v", "--version", "-version")),
             *(([flag, "go"], "") for flag in ("-p", "--print", "-print", "--prompt", "-prompt")),
             *(([subcommand, "list"], "") for subcommand in ("mcp", "models", "update")),

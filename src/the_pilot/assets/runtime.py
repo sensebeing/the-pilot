@@ -175,10 +175,14 @@ OSC_7501_WAITING_QUESTION = "\x1b]7501;state=blocked:kind=question:app=antigravi
 SHELL_WRAPPER_NAMES = frozenset({"sh", "dash", "bash", "zsh"})
 AGY_PRINT_FLAGS = frozenset({"p", "print", "prompt"})
 AGY_INTERACTIVE_PROMPT_FLAGS = frozenset({"i", "prompt-interactive"})
-AGY_BOOT_VALUE_FLAGS = AGY_PRINT_FLAGS | AGY_INTERACTIVE_PROMPT_FLAGS | {
-    "add-dir", "agent", "conversation", "effort", "input-format", "json-schema",
-    "log-file", "mode", "model", "output-format", "print-timeout", "project", "settings",
-}
+AGY_RESUME_BOOL_FLAGS = frozenset({"c", "continue"})
+AGY_RESUME_VALUE_FLAGS = frozenset({"conversation", "r", "resume"})
+AGY_BOOT_VALUE_FLAGS = (
+    AGY_PRINT_FLAGS | AGY_INTERACTIVE_PROMPT_FLAGS | AGY_RESUME_VALUE_FLAGS | {
+        "add-dir", "agent", "effort", "input-format", "json-schema",
+        "log-file", "mode", "model", "output-format", "print-timeout", "project", "settings",
+    }
+)
 AGY_NON_SESSION_FLAGS = AGY_PRINT_FLAGS | {"h", "help", "v", "version"}
 AGY_MANAGEMENT_COMMANDS = frozenset({
     "acp", "agent", "agents", "changelog", "help", "install", "mcp", "mic-serve",
@@ -1217,7 +1221,9 @@ def _has_worker_preamble(text: str) -> bool:
     for line in text.splitlines():
         key, colon, value = line.partition(":")
         token = value.strip()
-        if colon and key.strip().lower() in {"task id", "dispatch id"} and len(token) >= 6:
+        if colon and key.strip().lower() in {
+            "task id", "dispatch id", "your task id is", "your dispatch id is",
+        } and len(token) >= 6:
             if all(char.isascii() and (char.isalnum() or char in "_-") for char in token):
                 return True
     return False
@@ -2173,6 +2179,7 @@ def classify_agy_boot_args(args: Sequence[str]) -> str | None:
     tokens = iter(args)
     has_interactive_prompt = False
     has_positional_prompt = False
+    has_resume = False
     for token in tokens:
         if token == "--":
             has_positional_prompt = any(value.strip() for value in tokens)
@@ -2186,12 +2193,18 @@ def classify_agy_boot_args(args: Sequence[str]) -> str | None:
         name, separator, value = flag.partition("=")
         if name in AGY_NON_SESSION_FLAGS:
             return None
+        if name in AGY_RESUME_BOOL_FLAGS and value.lower() not in {"0", "f", "false"}:
+            has_resume = True
         if name in AGY_BOOT_VALUE_FLAGS:
             if not separator:
                 value = next(tokens, "")
             if name in AGY_INTERACTIVE_PROMPT_FLAGS and value.strip():
                 has_interactive_prompt = True
-    return OSC_7501_WORKING if has_interactive_prompt or has_positional_prompt else OSC_7501_DONE
+            if name in AGY_RESUME_VALUE_FLAGS and value:
+                has_resume = True
+    if has_interactive_prompt or has_positional_prompt:
+        return OSC_7501_WORKING
+    return OSC_7501_DONE if has_resume else None
 
 
 def command_announce_boot(agy_args: Sequence[str]) -> int:

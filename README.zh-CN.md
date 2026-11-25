@@ -173,8 +173,10 @@ pilot status --json
 
 使用默认的 `$HOME/.gemini` 安装时，`pilot apply` 和升级会在 `~/.zshenv` 及已存在的
 `~/.bash_profile`、`~/.bashrc`、`~/.profile` 中维护托管启动块。启动块将
-`AGY_CLI_OSC7501` 默认为 `off`，并在交互式 `agy` 新开或恢复会话前宣告初始状态。
-显式设为 `on` 时跳过启动宣告。`SessionStart` 钩子也会宣告新会话状态，无需等待项目同步。
+`AGY_CLI_OSC7501` 默认为 `off`。交互式 `agy` 启动前，带初始提示词时宣告 `working`，
+显式恢复会话且无初始提示词时宣告 `done`。无提示词的新会话不发送启动帧，Orca 等到
+`agy` 进入前台后再投递输入。显式设为 `on` 时跳过启动宣告。`SessionStart` 钩子宣告
+新会话状态，无需等待项目同步。
 Pilot 在同一帧中先写 OSC 7501 活动状态，再写 OSC 2 标题，使 Orca 能在终端输出丢失后
 恢复就绪状态。等待回答或保留草稿时使用中性标题，防止投递覆盖输入。
 

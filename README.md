@@ -177,12 +177,14 @@ pilot status --json
 For the default `$HOME/.gemini` installation, `pilot apply` and upgrades manage
 the shell startup block in `~/.zshenv` and any existing `~/.bash_profile`,
 `~/.bashrc`, and `~/.profile`. The block defaults `AGY_CLI_OSC7501` to `off`
-and wraps interactive `agy` launches to announce their initial state before
-starting or resuming a session. An explicit `on` skips the boot announcement.
-The `SessionStart` hook also announces new sessions without waiting for project
-sync. Pilot writes OSC 7501 activity followed by the OSC 2 title in one frame
-so Orca can retain readiness across terminal output gaps. A pending question
-or draft uses a neutral title to protect the input from delivery.
+and wraps interactive `agy` launches. Before launch, it announces `working`
+for an initial prompt and `done` for an explicit resume without a prompt. A
+fresh launch without a prompt emits no boot frame, so Orca can wait for `agy`
+to take the foreground before delivering input. An explicit `on` skips the
+boot announcement. The `SessionStart` hook announces new sessions without
+waiting for project sync. Pilot writes OSC 7501 activity followed by the OSC 2
+title in one frame so Orca can retain readiness across terminal output gaps.
+A pending question or draft uses a neutral title to protect the input from delivery.
 
 ---
 

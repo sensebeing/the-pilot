@@ -91,6 +91,10 @@ For the default Gemini root, the compiler renders the managed shell startup
 block and the installer owns startup file selection. The block defaults
 `AGY_CLI_OSC7501` to `off` and forwards interactive `agy` arguments to the
 installed runtime's internal `announce-boot` entry point before launching it.
+An initial prompt emits `working`, an explicit resume without a prompt emits
+`done`, and a fresh promptless launch emits no frame. Orca can then wait for
+`agy` to take the foreground before delivering the initial input for a fresh
+session. One-shot commands and `AGY_CLI_OSC7501=on` skip the boot announcement.
 Account-switch recovery can call the same entry point before invoking `env agy`.
 `apply` (including `self-update`'s upgrade) manages `~/.zshenv` and any
 existing `~/.bash_profile`, `~/.bashrc`, or `~/.profile`. `status` reports
