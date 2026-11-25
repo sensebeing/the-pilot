@@ -63,7 +63,7 @@ Type short aliases directly into the chat input box; the `PreInvocation` hook ex
 | `d [requirement]` | Designs a root-cause architecture plan and dispatches an isolated Orca worker. |
 | `pull` | Fast-forwards local `main` safely without touching dirty worktrees. |
 | `,mode gate\|confirm\|off` | Switches between auto-submit (`gate`), prefill-only (`confirm`), and disabled (`off`). |
-| `,worker codex\|claude` | Switches Orca child-worker priority (`Codex > Claude Code` or `Claude Code > Codex`) and hot-reloads on the next turn. |
+| `,worker agy\|codex\|claude` | Promotes the selected Orca worker to first in the order and hot-reloads its launch options on the next turn. |
 
 ---
 

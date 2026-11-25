@@ -9,7 +9,7 @@ Run `pilot status --json` first. If absent, use the sibling `the-pilot-setup`
 skill. Inspect `pilot --help` and subcommand help for current argument syntax.
 
 - `,mode status|gate|confirm|off` or `pilot mode <mode>` controls automatic turns.
-- `,worker [codex|claude|cc|status]` (alias `,agent`) or `pilot worker <target>`
+- `,worker [agy|codex|claude|cc|status]` (alias `,agent`) or `pilot worker <target>`
   changes durable executor priority. Existing sessions load it on the next turn.
 - `,1`, `,2`, `,3 [context]` select the visible next-step candidates.
 - `pilot sync` refreshes scene guidance after editing installed scene files.

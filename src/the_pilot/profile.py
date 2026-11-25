@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from typing import Any
 
 from .assets.runtime import (
     RESERVED_COMMA_ALIASES,
+    WORKER_AGENT_ORDER,
+    WORKER_EFFORT_LEVELS,
     is_comma_alias,
     is_entry_key,
+    normalize_worker_agent,
     shortcut_override_name,
     shortcut_override_owners,
 )
@@ -20,7 +24,6 @@ from .defaults import (
     PROFILE_SCHEMA,
     REVIEW_AGENT_ORDER,
     SCENE_ORDER,
-    WORKER_AGENT_ORDER,
 )
 from .project import ProfileError, project_specs
 
@@ -35,15 +38,15 @@ def resolve_profile(
     """Merge a base profile with one preset and the caller's overrides."""
     specs = project_specs(project)
     presets = specs["presets"]
-    merged = _normalize_pilot_section(_copy_mapping(base, "base profile"))
+    merged = _profile_for_merge(base, "base profile")
     if preset is not None:
         if preset not in presets:
             raise ProfileError(f"未知预设 {preset!r}；允许的预设为 {sorted(presets)}")
-        merged = _deep_merge(merged, presets[preset])
+        merged = _deep_merge(merged, _profile_for_merge(presets[preset], f"preset {preset}"))
     if overrides:
         merged = _deep_merge(
             merged,
-            _normalize_pilot_section(_copy_mapping(overrides, "profile overrides")),
+            _profile_for_merge(overrides, "profile overrides"),
         )
     return validate_profile(merged, project=project)
 
@@ -111,7 +114,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     shortcuts = _require_mapping(profile.get("shortcuts"), "shortcuts")
     _reject_unknown(
         orchestration,
-        ("coordinator_agent", "worker_agents", "review_agents"),
+        ("coordinator_agent", "worker_agents", "worker_models", "review_agents"),
         "orchestration",
     )
     _reject_unknown(pilot, ("mode", "max_consecutive_auto_turns"), "pilot")
@@ -151,7 +154,9 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         orchestration.get("worker_agents"),
         "orchestration.worker_agents",
         allowed=WORKER_AGENT_ORDER,
+        normalize=normalize_worker_agent,
     )
+    worker_models = _normalize_worker_models(orchestration.get("worker_models"))
     coordinator_agent = _coordinator_agent(orchestration.get("coordinator_agent"))
     review_agents = _string_list(
         orchestration.get("review_agents"),
@@ -198,6 +203,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             "coordinator_agent": coordinator_agent,
             "worker_agents": worker_agents,
             "review_agents": review_agents,
+            **({"worker_models": worker_models} if worker_models else {}),
         },
         "pilot": {"mode": mode, "max_consecutive_auto_turns": max_turns},
         "scenes": {
@@ -214,6 +220,63 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             },
         },
     }
+
+
+def _profile_for_merge(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    profile = _normalize_pilot_section(_copy_mapping(raw, where))
+    orchestration = profile.get("orchestration")
+    if isinstance(orchestration, dict) and orchestration.get("worker_models") is not None:
+        orchestration["worker_models"] = _normalize_worker_models(
+            orchestration["worker_models"], preserve_clears=True,
+        )
+    return profile
+
+
+def canonical_worker_model_keys(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    where = "orchestration.worker_models"
+    models = {}
+    for key, spec in _require_mapping(raw, where).items():
+        agent = normalize_worker_agent(key) if isinstance(key, str) else None
+        if agent is None or agent not in WORKER_AGENT_ORDER:
+            raise ProfileError(f"{where} 含未知执行器 {key!r}")
+        if agent in models:
+            raise ProfileError(f"{where} 重复指定执行器 {agent!r}")
+        models[agent] = spec
+    return models
+
+
+def normalize_worker_effort(value: Any, where: str) -> str:
+    effort = value.strip().lower() if isinstance(value, str) else None
+    if effort not in WORKER_EFFORT_LEVELS:
+        raise ProfileError(f"{where} 必须是 {WORKER_EFFORT_LEVELS} 之一，实际为 {value!r}")
+    return effort
+
+
+def _normalize_worker_models(
+    raw: Any, *, preserve_clears: bool = False,
+) -> dict[str, dict[str, str | None] | None]:
+    models: dict[str, dict[str, str | None] | None] = {}
+    for agent, spec in canonical_worker_model_keys(raw).items():
+        if spec is None:
+            if preserve_clears:
+                models[agent] = None
+            continue
+        where = f"orchestration.worker_models.{agent}"
+        spec = _require_mapping(spec, where)
+        _reject_unknown(spec, ("model", "effort"), where)
+        model = spec.get("model")
+        if (not isinstance(model, str) or not model or not model.isprintable()
+                or any(char.isspace() for char in model) or "`" in model):
+            raise ProfileError(f"{where}.model 必须是无空白、控制字符或反引号的非空字符串")
+        config: dict[str, str | None] = {"model": model}
+        if spec.get("effort") is not None:
+            config["effort"] = normalize_worker_effort(spec["effort"], f"{where}.effort")
+        elif preserve_clears and "effort" in spec:
+            config["effort"] = None
+        models[agent] = config
+    return models
 
 
 def _coordinator_agent(value: Any) -> str:
@@ -460,12 +523,15 @@ def _string_list(
     *,
     allowed: tuple[str, ...] | None = None,
     allow_empty: bool = False,
+    normalize: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     if not isinstance(value, list) or any(
         not isinstance(item, str) or not item.strip() for item in value
     ):
         raise ProfileError(f"{where} 必须是非空字符串数组")
     items = [item.strip() for item in value]
+    if normalize is not None:
+        items = [normalize(item) or item for item in items]
     if len(set(items)) != len(items):
         raise ProfileError(f"{where} 不能包含重复项")
     if allowed is not None:
