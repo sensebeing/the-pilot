@@ -2,7 +2,15 @@
 
 from pathlib import Path
 
-from .assets.runtime import UNIVERSAL_ENTRY_KEYS, UNIVERSAL_ENTRY_SPECS
+from .assets.runtime import (
+    AGENT_LABELS,
+    ORCA_AGENT_IDS,
+    UNIVERSAL_ENTRY_KEYS,
+    UNIVERSAL_ENTRY_SPECS,
+    WORKER_AGENT_ALIASES,
+    WORKER_AGENT_ORDER,
+    WORKER_EFFORT_LEVELS,
+)
 
 PROFILE_SCHEMA = "the-pilot-profile/v1"
 
@@ -26,15 +34,13 @@ LEGACY_HOOK_GROUP = "orca-agy-autopilot"
 
 MODES = ("gate", "confirm", "off")
 
-WORKER_AGENT_ORDER = ("claude", "codex")
-
 REVIEW_AGENT_ORDER = ("codex", "claude", "agy")
 
 COORDINATOR_AGENTS = ("agy",)
 
-COORDINATOR_AGENT_ALIASES = {"agy": "agy", "antigravity": "agy"}
-
-AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
+COORDINATOR_AGENT_ALIASES = {
+    alias: agent for alias, agent in WORKER_AGENT_ALIASES.items() if agent in COORDINATOR_AGENTS
+}
 
 SCENE_ORDER = (
     "plan-and-orchestrate",

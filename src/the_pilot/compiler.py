@@ -7,9 +7,15 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
-from .assets.runtime import entry_comma_command
-from .defaults import (
+from .assets.runtime import (
     AGENT_LABELS,
+    entry_comma_command,
+    format_agent_order,
+    format_worker_executor_clause,
+    format_worker_launch_flags,
+    format_worker_secondary_hint,
+)
+from .defaults import (
     COORDINATOR_AGENTS,
     GEMINI_BEGIN,
     GEMINI_END,
@@ -144,19 +150,17 @@ def render_gemini_block(profile: dict[str, Any], scenes: dict[str, str]) -> str:
 
 def render_orchestration_section(profile: dict[str, Any]) -> str:
     worker_agents = profile["orchestration"]["worker_agents"]
+    worker_models = profile["orchestration"].get("worker_models")
     review_agents = profile["orchestration"]["review_agents"]
     coordinator = (
         profile["orchestration"].get("coordinator_agent") or COORDINATOR_AGENTS[0]
     )
     coordinator_label = AGENT_LABELS[coordinator]
-    priority = " > ".join(AGENT_LABELS[item] for item in worker_agents)
-    primary = worker_agents[0]
-    secondary = worker_agents[1] if len(worker_agents) > 1 else ""
-    executor = f"优先使用 {AGENT_LABELS[primary]}（`--agent {primary}`）"
-    if secondary:
-        executor += f"，其次使用 {AGENT_LABELS[secondary]}（`--agent {secondary}`）"
-    secondary_hint = f"次选 `--agent {secondary}`；" if secondary else ""
-    review_priority = " > ".join(AGENT_LABELS[item] for item in review_agents)
+    priority = format_agent_order(worker_agents)
+    primary = format_worker_launch_flags(worker_agents[0], worker_models)
+    executor = format_worker_executor_clause(worker_agents, worker_models)
+    secondary_hint = format_worker_secondary_hint(worker_agents, worker_models)
+    review_priority = format_agent_order(review_agents)
     return f"""{LEGACY_ORCHESTRATION_HEADING}{priority}）
 
 编排前读 `orca skills get orchestration` 及按需 references。
@@ -166,9 +170,9 @@ def render_orchestration_section(profile: dict[str, Any]) -> str:
    - **Tier-2 子会话（Dispatched Worker，有 live Task ID / Dispatch ID preamble）**：除极简单改动，实施交 Orca worker。独立分支完成修改、定向测试与秒级本地静态门禁后报 `worker_done`，待主会话零基复审；通过后由 worker 执行模型级 `guard review`、仓库原子合入流程与长构建/部署/探测等待，再 `worker_done` 唤醒。禁止嵌套派工。
 2. **Orca 编排（执行器优先级：{priority}）**：禁用 `invoke_subagent` 和无监督裸终端。先 `orca status --json`，再 `orca orchestration run-create --objective "<目标>" --json` 绑定 Run。{executor}。Task spec 自包含 Target/Contracts/Files/Boundaries/Ownership/Acceptance、业务目标、Anchor 0、最简模型，载明「未经主会话 Review 不得合入或推送 `main`」。
 3. **工作区层级与回调**：
-   - 同工作区 `worker-start --spec "<任务契约>" --worktree current --agent {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）。
-   - 同仓子工作区 `worker-start --spec "<任务契约>" --worktree new-child --name <name> --agent {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须 `--parent-worktree active` 或 `path:<当前路径>`）。
-   - 跨仓回传 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> --agent {primary} --setup run --json`，`worker_done` 唤醒主会话。
+   - 同工作区 `worker-start --spec "<任务契约>" --worktree current {primary} --json`（{secondary_hint}或 `task-create` 后带 `--task <task_id>`）。
+   - 同仓子工作区 `worker-start --spec "<任务契约>" --worktree new-child --name <name> {primary} --setup run --json`（{secondary_hint}`orca worktree create` 预建须 `--parent-worktree active` 或 `path:<当前路径>`）。
+   - 跨仓回传 `worker-start --spec "<任务契约>" --worktree new-child --repo path:<目标仓库根> --name <name> {primary} --setup run --json`，`worker_done` 唤醒主会话。
    - 禁止平级 `--worktree new-top-level`/`--no-parent`。仅用户明确要求独立长期 Tier-1 可用 `--no-parent`，需回执绑定 Dealer thread 或 `orca orchestration send`。
    - 单段契约用 `--spec "<任务契约>"` 一轮发出；多段才用 `--spec-file <路径>`（与最终只读核查同轮写入，不单独起草）；纯文档/只读子任务可用 `--setup skip`。
 4. **交互与验收**：

@@ -22,9 +22,10 @@ import hashlib
 import json
 import os
 import select
+import shlex
 import signal
 import stat
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
@@ -32,7 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Literal, TypeGuard
 
 
 PILOT_SUBDIR = Path("config") / "the-pilot"
@@ -73,7 +74,15 @@ STOP_EXIT_TIMEOUT_SECONDS = 2.0
 CONFIRM_TIMEOUT_SECONDS = 2.0
 CONFIRM_DEADLINE_SECONDS = 5.0
 
+WORKER_AGENT_ORDER = ("claude", "codex", "agy")
+WORKER_AGENT_ALIASES = {
+    "claude": "claude", "claude-code": "claude", "cc": "claude",
+    "codex": "codex", "agy": "agy", "antigravity": "agy",
+}
+ORCA_AGENT_IDS = {"claude": "claude", "codex": "codex", "agy": "antigravity"}
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
+WORKER_EFFORT_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+WORKER_TARGETS = (*WORKER_AGENT_ALIASES, "status")
 MODES = ("gate", "confirm", "off")
 PROFILE_SCHEMA = "the-pilot-profile/v1"
 LEGACY_PROFILE_SCHEMA = "orca-autopilot-profile/v1"
@@ -204,12 +213,16 @@ def _command_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
     return (parts[0], parts[1].strip() if len(parts) == 2 else "") if parts else ("", "")
 
 
-def _named_command(text: str, names: set[str], targets: set[str], default: str = "") -> str:
+def _named_command(text: str, names: set[str], targets: Collection[str], default: str = "") -> str:
     name, arg = _command_parts(text, comma=True)
     if name.lower() not in names:
         return ""
     target = arg.lower() or default
     return target if target in targets else ""
+
+
+def worker_command_target(text: str) -> str:
+    return _named_command(text, {"worker", "agent"}, WORKER_TARGETS, "status")
 
 
 def is_comma_alias(value: str) -> bool:
@@ -500,6 +513,15 @@ def load_profile() -> tuple[dict[str, Any] | None, str, str]:
             "corrupt",
             f"{PROFILE_PATH}: profile contains both pilot and autopilot sections",
         )
+    orchestration = value.get("orchestration")
+    if isinstance(orchestration, dict) and orchestration.get("worker_models") is not None:
+        try:
+            orchestration["worker_models"] = normalize_worker_models(
+                orchestration["worker_models"], clears="reject",
+            )
+        except ValueError as exc:
+            log_event("profile_worker_models_invalid", error=str(exc))
+            return None, "corrupt", f"{PROFILE_PATH}: {exc}"
     return value, "ok", ""
 
 
@@ -707,93 +729,218 @@ def current_mode(profile: dict[str, Any]) -> str:
 
 
 def _current_agents(
-    profile: dict[str, Any], *, key: str, defaults: list[str]
+    profile: dict[str, Any], *, key: str, allowed: Sequence[str], defaults: list[str],
 ) -> list[str]:
     orchestration = profile.get("orchestration")
     agents = orchestration.get(key) if isinstance(orchestration, dict) else None
     if (isinstance(agents, list) and agents
-            and all(isinstance(agent, str) and agent in defaults for agent in agents)
+            and all(isinstance(agent, str) and agent in allowed for agent in agents)
             and len(set(agents)) == len(agents)):
         return agents.copy()
     return defaults
 
 
 def current_worker_agents(profile: dict[str, Any]) -> list[str]:
-    return _current_agents(profile, key="worker_agents", defaults=["claude", "codex"])
+    return _current_agents(
+        profile, key="worker_agents", allowed=WORKER_AGENT_ORDER, defaults=["claude", "codex"],
+    )
 
 
-def worker_priority(workers: list[str]) -> str:
-    order = " > ".join(AGENT_LABELS[agent] for agent in workers)
-    secondary = f", secondary: --agent {workers[1]}" if len(workers) > 1 else ""
-    return f"Orca Worker Priority: {order} (primary: --agent {workers[0]}{secondary})"
+def normalize_worker_agent(raw: str) -> str | None:
+    return WORKER_AGENT_ALIASES.get(raw.strip().lower())
 
 
-def compile_worker_hot_reload(workers: list[str]) -> str:
+def is_worker_model_id(value: Any) -> TypeGuard[str]:
+    return (
+        isinstance(value, str) and bool(value) and value.isprintable()
+        and not any(char.isspace() for char in value) and "`" not in value
+    )
+
+
+def normalize_worker_effort(value: Any, where: str) -> str:
+    effort = value.strip().lower() if isinstance(value, str) else None
+    if effort is None or effort not in WORKER_EFFORT_LEVELS:
+        raise ValueError(f"{where} 必须是 {WORKER_EFFORT_LEVELS} 之一，实际为 {value!r}")
+    return effort
+
+
+def canonical_worker_model_keys(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    where = "orchestration.worker_models"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} 必须是 JSON 对象")
+    models: dict[str, Any] = {}
+    for key, spec in raw.items():
+        agent = normalize_worker_agent(key) if isinstance(key, str) else None
+        if agent is None or agent not in WORKER_AGENT_ORDER:
+            raise ValueError(f"{where} 含未知执行器 {key!r}")
+        if agent in models:
+            raise ValueError(f"{where} 重复指定执行器 {agent!r}")
+        models[agent] = spec
+    return models
+
+
+def normalize_worker_models(
+    raw: Any, *, clears: Literal["keep", "drop", "reject"] = "drop",
+) -> dict[str, dict[str, str | None] | None]:
+    """Validate launch preferences, retaining null directives only while merging."""
+    models: dict[str, dict[str, str | None] | None] = {}
+    for agent, spec in canonical_worker_model_keys(raw).items():
+        if spec is None and clears != "reject":
+            if clears == "keep":
+                models[agent] = None
+            continue
+        where = f"orchestration.worker_models.{agent}"
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where} 必须是 JSON 对象")
+        unknown = spec.keys() - {"model", "effort"}
+        if unknown:
+            raise ValueError(f"{where} 含未知字段 {sorted(unknown, key=str)}")
+        model = spec.get("model")
+        if not is_worker_model_id(model):
+            raise ValueError(f"{where}.model 必须是无空白、控制字符或反引号的非空字符串")
+        config: dict[str, str | None] = {"model": model}
+        if spec.get("effort") is not None:
+            config["effort"] = normalize_worker_effort(spec["effort"], f"{where}.effort")
+        elif clears == "keep" and "effort" in spec:
+            config["effort"] = None
+        models[agent] = config
+    return models
+
+
+def current_worker_models(profile: dict[str, Any]) -> dict[str, dict[str, str]]:
+    orchestration = profile.get("orchestration")
+    return (orchestration.get("worker_models") or {}) if isinstance(orchestration, dict) else {}
+
+
+def format_agent_order(agents: Sequence[str]) -> str:
+    return " > ".join(AGENT_LABELS[agent] for agent in agents)
+
+
+def format_worker_launch_flags(
+    agent: str, worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
+    flags = f"--agent {ORCA_AGENT_IDS[agent]}"
+    spec = (worker_models or {}).get(agent, {})
+    if model := spec.get("model"):
+        flags += f" --model {shlex.quote(model)}"
+        if effort := spec.get("effort"):
+            flags += f" --effort {shlex.quote(effort)}"
+    return flags
+
+
+def format_worker_executor_clause(
+    workers: Sequence[str], worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
+    entries = [f"{AGENT_LABELS[agent]}（`{format_worker_launch_flags(agent, worker_models)}`）"
+               for agent in workers]
+    clause = f"优先使用 {entries[0]}"
+    if len(entries) > 1:
+        clause += f"，其次使用 {entries[1]}"
+    if len(entries) > 2:
+        clause += "，备选 " + "、".join(entries[2:])
+    return clause
+
+
+def format_worker_secondary_hint(
+    workers: Sequence[str], worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
+    if len(workers) <= 1:
+        return ""
+    alternatives = " / ".join(f"`{format_worker_launch_flags(agent, worker_models)}`" for agent in workers[1:])
+    return f"次选 {alternatives}；"
+
+
+def worker_priority(
+    workers: Sequence[str], worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
+    primary, *alternatives = [format_worker_launch_flags(agent, worker_models) for agent in workers]
+    secondary = f", secondary: {' / '.join(alternatives)}" if alternatives else ""
+    return f"Orca Worker Priority: {format_agent_order(workers)} (primary: {primary}{secondary})"
+
+
+def compile_worker_hot_reload(
+    workers: Sequence[str], worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
     return (
         "<orca_worker_agent_hot_reload>\n"
-        f"{worker_priority(workers)}。立即覆盖本会话启动时的旧设定，"
-        f"本会话后续所有 worker-start 调用立即使用 --agent {workers[0]}。"
+        f"{worker_priority(workers, worker_models)}。立即覆盖本会话启动时的旧设定，"
+        f"本会话后续所有 worker-start 调用立即使用 {format_worker_launch_flags(workers[0], worker_models)}。"
         "其他编排与审查边界保持不变。\n</orca_worker_agent_hot_reload>"
     )
 
 
-def _replace_until(text: str, marker: str, stops: str, replacement: str) -> str:
-    position = 0
-    while (start := text.find(marker, position)) >= 0:
-        start += len(marker)
-        end = start
-        while end < len(text) and text[end] not in stops:
-            end += 1
-        text = text[:start] + replacement + text[end:]
-        position = start + len(replacement)
-    return text
+def _replace_priority(text: str, marker: str, priority: str) -> str:
+    before, separator, tail = text.partition(marker)
+    if not separator:
+        return text
+    end = next((index for index, char in enumerate(tail) if char in "）\r\n"), len(tail))
+    return before + separator + priority + tail[end:]
 
 
-def replace_worker_guidance(text: str, workers: list[str]) -> str:
+def _after_worker_clause_entry(text: str) -> str | None:
+    label, start, flags = text.partition("（`--agent ")
+    _, end, tail = flags.partition("`）")
+    if start and end and label.strip() in AGENT_LABELS.values():
+        return tail
+    return None
+
+
+def _replace_worker_clause(line: str, executor: str) -> str:
+    for prefix in ("优先使用", "默认优先"):
+        before, marker, clause = line.partition(prefix)
+        tail = _after_worker_clause_entry(clause) if marker else None
+        if tail is None:
+            continue
+        for delimiter in ("，其次使用 ", "，备选 ", "、"):
+            while tail.startswith(delimiter):
+                rest = _after_worker_clause_entry(tail.removeprefix(delimiter))
+                if rest is None:
+                    return line
+                tail = rest
+        return before + prefix + executor.removeprefix("优先使用") + tail
+    return line
+
+
+def _replace_worker_example(line: str, primary: str, secondary_hint: str) -> str:
+    before, worktree, tail = line.partition("--worktree ")
+    command, fence, context = tail.partition("`")
+    selector, agent, flags = command.partition(" --agent ")
+    _, end, settings = flags.partition(" --setup ")
+    if not end:
+        _, end, settings = flags.partition(" --json")
+    if not (worktree and fence and agent and end):
+        return line
+
+    if context.startswith("（"):
+        choices = context[1:]
+        if choices.startswith("次选 "):
+            _, _, choices = choices.partition("`；")
+        if choices.startswith(("或 `task-create`", "`orca worktree create`")):
+            context = "（" + secondary_hint + choices
+    return before + worktree + selector + " " + primary + end + settings + fence + context
+
+
+def replace_worker_guidance(
+    text: str, workers: Sequence[str], worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str:
     """Replace executor slots without owning or reproducing orchestration rules."""
-    priority = " > ".join(AGENT_LABELS[agent] for agent in workers)
-    primary, secondary = workers
+    priority = format_agent_order(workers)
+    executor = format_worker_executor_clause(workers, worker_models)
+    primary = format_worker_launch_flags(workers[0], worker_models)
+    secondary_hint = format_worker_secondary_hint(workers, worker_models)
     for marker in ("Orca Orchestration：", "执行器优先级："):
-        text = _replace_until(text, marker, "）\n", priority)
-    for old_agent, label in (("codex", "Codex"), ("claude", "Claude Code")):
-        old = f"{label}（`--agent {old_agent}`）"
-        # Only the explicitly labelled default slot is executable guidance.
-        for prefix in ("默认优先使用 ", "默认优先使用", "默认优先 ", "优先使用 ", "优先使用"):
-            start = 0
-            while (index := text.find(prefix + old, start)) >= 0:
-                end = index + len(prefix + old)
-                for other, other_label in (("codex", "Codex"), ("claude", "Claude Code")):
-                    suffix = f"，其次使用 {other_label}（`--agent {other}`）"
-                    if text.startswith(suffix, end):
-                        end += len(suffix)
-                        break
-                replacement = f"{prefix}{AGENT_LABELS[primary]}（`--agent {primary}`），其次使用 {AGENT_LABELS[secondary]}（`--agent {secondary}`）"
-                text = text[:index] + replacement + text[end:]
-                start = index + len(replacement)
-    lines = []
-    for line in text.splitlines(keepends=True):
-        position = 0
-        while (start := line.find("--worktree ", position)) >= 0:
-            end = start
-            while end < len(line) and line[end] not in "`\n":
-                end += 1
-            segment = line[start:end]
-            before, marker, after = segment.partition("--agent ")
-            token = after.split(maxsplit=1)[0] if after else ""
-            if marker and token in {"codex", "claude"}:
-                segment = before + marker + primary + after[len(token):]
-                line = line[:start] + segment + line[end:]
-            position = start + len(segment)
-        lines.append(line)
-    text = "".join(lines)
-    for old_agent in ("codex", "claude"):
-        text = text.replace(f"次选 `--agent {old_agent}`", f"次选 `--agent {secondary}`")
-    for marker in ("（或 `task-create`", "（`orca worktree create`"):
-        text = text.replace(marker, f"（次选 `--agent {secondary}`；" + marker[1:])
-    return text
+        text = _replace_priority(text, marker, priority)
+    return "".join(
+        _replace_worker_example(_replace_worker_clause(line, executor), primary, secondary_hint)
+        for line in text.splitlines(keepends=True)
+    )
 
 
-def update_orchestration_guidance(text: str, workers: list[str]) -> str | None:
+def update_orchestration_guidance(
+    text: str, workers: Sequence[str], worker_models: Mapping[str, Mapping[str, str]] | None = None,
+) -> str | None:
     """Refresh worker slots inside the single managed orchestration block.
 
     A single valid marker pair scopes the rewrite so unrelated user prose is
@@ -812,7 +959,7 @@ def update_orchestration_guidance(text: str, workers: list[str]) -> str | None:
     end = ends[0]
     return (
         text[:start]
-        + replace_worker_guidance(text[start:end], workers)
+        + replace_worker_guidance(text[start:end], workers, worker_models)
         + text[end:]
     )
 
@@ -841,26 +988,22 @@ def _profile_block_bounds(text: str) -> tuple[int, int] | None:
     return blocks[0] if blocks else None
 
 
-def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
-    primary = "claude" if target.lower() in {"claude", "claude-code", "cc"} else target.lower()
-    new_workers = (
-        ["codex", "claude"]
-        if primary == "codex"
-        else ["claude", "codex"]
-        if primary == "claude"
-        else None
-    )
-    if new_workers is None:
-        return False, [], []
+def set_worker_agents(target: str) -> tuple[bool, list[str], list[str], dict[str, dict[str, str]]]:
+    primary = normalize_worker_agent(target)
+    if primary is None:
+        return False, [], [], {}
     updated: list[str] = []
     with _file_lock(PILOT_DIR / ".pilot.lock"):
         profile, profile_status, profile_err = load_profile()
         if profile_status != "ok" or profile is None:
             log_event(f"worker_write_profile_{profile_status}", error=profile_err)
-            return False, [], updated
-        if not profile or not _prepare_profile_for_write(profile):
-            return False, current_worker_agents(profile), updated
+            return False, [], updated, {}
         old_workers = current_worker_agents(profile)
+        models = current_worker_models(profile)
+        failure = False, old_workers, updated, models
+        if not profile or not _prepare_profile_for_write(profile):
+            return failure
+        new_workers = [primary, *(agent for agent in old_workers if agent != primary)]
         prepared: list[tuple[Path, str]] = []
         user_prepared: list[tuple[Path, str]] = []
         try:
@@ -868,33 +1011,34 @@ def set_worker_agents(target: str) -> tuple[bool, list[str], list[str]]:
                 text = GEMINI_MD_PATH.read_text(encoding="utf-8")
                 bounds = _profile_block_bounds(text)
                 if bounds is None:
-                    return False, old_workers, updated
-                content_start, end = bounds
-                text = text[:content_start] + replace_worker_guidance(text[content_start:end], new_workers) + text[end:]
+                    return failure
+                start, end = bounds
+                guidance = replace_worker_guidance(text[start:end], new_workers, models)
+                text = text[:start] + guidance + text[end:]
                 prepared.append((GEMINI_MD_PATH, text))
             if GEMINI_DIR.resolve() == (Path.home() / ".gemini").resolve():
                 for path in (Path.home() / ".claude/CLAUDE.md", Path.home() / ".codex/AGENTS.md"):
                     if path.is_file():
                         text = path.read_text(encoding="utf-8")
-                        guidance = update_orchestration_guidance(text, new_workers)
+                        guidance = update_orchestration_guidance(text, new_workers, models)
                         if guidance is None:
-                            return False, old_workers, updated
+                            return failure
                         if guidance != text:
                             user_prepared.append((path, guidance))
         except (OSError, UnicodeError) as exc:
             log_event("worker_guidance_read_failed", error=str(exc))
-            return False, old_workers, updated
+            return failure
         profile.setdefault("orchestration", {})["worker_agents"] = new_workers
         prepared.insert(0, (PROFILE_PATH, json.dumps(profile, ensure_ascii=False, indent=2) + "\n"))
         for path, text in prepared:
             if not save_text(path, text):
-                return False, old_workers, updated
+                return failure
             updated.append(str(path))
         for path, text in user_prepared:
             if not save_user_text(path, text):
-                return False, old_workers, updated
+                return failure
             updated.append(str(path))
-    return True, new_workers, updated
+    return True, new_workers, updated, models
 
 
 def max_consecutive_turns(profile: dict[str, Any]) -> int:
@@ -2127,7 +2271,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     reexec_output = _sync_and_maybe_reexec("PreInvocation", payload)
     if reexec_output is not None:
         return reexec_output
-    worker_target = _named_command(text, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status")
+    worker_target = worker_command_target(text)
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
     config, config_status, config_err = load_config()
     profile, profile_status, profile_err = load_profile()
@@ -2184,23 +2328,28 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             )
         worker_reload_msg = ""
         prev_workers = state.get("loaded_worker_agents")
+        prev_models = state.get("loaded_worker_models", {})
         cur_workers = current_worker_agents(profile)
+        cur_models = current_worker_models(profile)
         unversioned_existing = bool(state) and not isinstance(prev_workers, list)
         if not state:
-            state["initial_worker_agents"] = cur_workers
+            state.update(initial_worker_agents=cur_workers, initial_worker_models=cur_models)
         else:
             state.setdefault("initial_worker_agents", [])
+            state.setdefault("initial_worker_models", {})
         last_checkpoint = max(
             (index for index, step in enumerate(steps) if step.get("type") == "CHECKPOINT"),
             default=-1,
         )
+        initial_worker_config = state["initial_worker_agents"], state["initial_worker_models"]
+        worker_config = cur_workers, cur_models
         if (unversioned_existing
-                or isinstance(prev_workers, list) and prev_workers and prev_workers != cur_workers
-                or state["initial_worker_agents"] != cur_workers
+                or isinstance(prev_workers, list) and (prev_workers, prev_models) != worker_config
+                or initial_worker_config != worker_config
                 and last_checkpoint > state.get("worker_reload_checkpoint", -1)):
-            worker_reload_msg = compile_worker_hot_reload(cur_workers)
+            worker_reload_msg = compile_worker_hot_reload(cur_workers, cur_models)
             state["worker_reload_checkpoint"] = last_checkpoint
-        state["loaded_worker_agents"] = cur_workers
+        state.update(loaded_worker_agents=cur_workers, loaded_worker_models=cur_models)
         state["current_user_turn_id"] = user_turn or "missing"
         auto_text = str(state.get("auto_submitted_text") or "")
         manual_input = not auto_text or text != auto_text
@@ -2235,19 +2384,19 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["candidate_turn_id"] = ""
 
         if worker_target:
-            target = worker_target
-            workers = current_worker_agents(profile)
-            if target == "status":
-                message = worker_priority(workers)
+            if worker_target == "status":
+                message = worker_priority(cur_workers, cur_models)
             else:
-                success, workers, _ = set_worker_agents(target)
+                success, workers, _, models = set_worker_agents(worker_target)
                 if success:
-                    message = compile_worker_hot_reload(workers)
+                    message = compile_worker_hot_reload(workers, models)
                     worker_reload_msg = ""
-                    state["worker_reload_checkpoint"] = last_checkpoint
+                    state.update(
+                        loaded_worker_agents=workers, loaded_worker_models=models,
+                        worker_reload_checkpoint=last_checkpoint,
+                    )
                 else:
                     message = "Worker 切换失败，请检查 profile.json 与派生规则文件。"
-            state["loaded_worker_agents"] = workers
             if not save_state(conversation_id, state):
                 log_event("pre_state_save_failed", cid=conversation_id)
             message = "\n\n".join(p for p in (worker_reload_msg, message) if p)
@@ -2259,7 +2408,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 scene_count = len(scenes)
                 message = (
                     f"【Pilot 状态】当前模式为 `{current_mode(profile)}`，"
-                    f"已加载 {scene_count} 个场景文件。{worker_priority(cur_workers)}。请用一句话告知用户，无需调用工具。"
+                    f"已加载 {scene_count} 个场景文件。{worker_priority(cur_workers, cur_models)}。请用一句话告知用户，无需调用工具。"
                 )
             elif not set_mode(target):
                 message = "【Pilot】模式切换失败：profile.json 不可读或不可写。"
@@ -3060,6 +3209,8 @@ def command_status(as_json: bool) -> int:
         "engine": str(Path(__file__).resolve()),
         "profile": str(PROFILE_PATH),
     }
+    if models := current_worker_models(profile_data):
+        report["worker_models"] = models
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -3276,15 +3427,19 @@ def command_worker(target: str, as_json: bool) -> int:
         return 2
     if target == "status":
         success, workers, updated = True, current_worker_agents(profile), []
+        models = current_worker_models(profile)
     else:
-        success, workers, updated = set_worker_agents(target)
+        success, workers, updated, models = set_worker_agents(target)
         if success:
             request_background_update()
     report = {"ok": success, "worker_agents": workers, "updated_files": updated}
+    if models:
+        report["worker_models"] = models
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print(worker_priority(workers))
+        if workers:
+            print(worker_priority(workers, models))
         if not success:
             print("Worker switch failed: check profile.json and derived guidance files.", file=sys.stderr)
         for path in updated:
@@ -3317,7 +3472,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="runtime.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
     worker = subparsers.add_parser("worker", help="切换或查看 Worker 执行器优先级")
-    worker.add_argument("target", nargs="?", default="status", choices=("codex", "claude", "claude-code", "cc", "status"))
+    worker.add_argument("target", nargs="?", default="status", choices=WORKER_TARGETS)
     worker.add_argument("--json", action="store_true")
     mode = subparsers.add_parser("mode", help="切换或查看 Pilot 模式")
     mode.add_argument("target", nargs="?", default="status", choices=(*MODES, "status"))

@@ -599,6 +599,62 @@ class CompilerTest(unittest.TestCase):
                         overrides={"orchestration": {"coordinator_agent": value}},
                     )
 
+    def test_worker_model_preferences_normalize_and_clear_by_agent(self) -> None:
+        """Aliases must share one preference, even when the agent leaves the active order."""
+        profile = resolve_profile(self.base, preset=None, overrides={"orchestration": {
+            "worker_agents": ["codex", "cc"],
+            "worker_models": {"antigravity": {"model": "gemini-4-neon-high", "effort": " HIGH "}},
+        }})
+        self.assertEqual(profile["orchestration"]["worker_agents"], ["codex", "claude"])
+        self.assertEqual(profile["orchestration"]["worker_models"], {
+            "agy": {"model": "gemini-4-neon-high", "effort": "high"},
+        })
+        cleared = resolve_profile(profile, preset=None, overrides={"orchestration": {
+            "worker_agents": ["antigravity", "codex"],
+            "worker_models": {"antigravity": None},
+        }})
+        self.assertEqual(cleared["orchestration"]["worker_agents"], ["agy", "codex"])
+        self.assertNotIn("worker_models", cleared["orchestration"])
+
+    def test_invalid_worker_preferences_are_rejected(self) -> None:
+        """Invalid identities or flag values must fail before they become guidance."""
+        valid = {"model": "gemini-4-neon-high"}
+        invalid = [
+            {"worker_agents": ["agy", "antigravity"]},
+            {"worker_agents": ["unknown"]},
+            {"worker_models": {"agy": valid, "antigravity": None}},
+            {"worker_models": {"unknown": valid}},
+            *({"worker_models": {"agy": spec}} for spec in (
+                {"effort": "high"}, {**valid, "effort": "extreme"}, {**valid, "extra": True},
+                *({"model": model} for model in ("", "two words", "line\nbreak", "back`tick", "control\x00")),
+            )),
+        ]
+        for orchestration in invalid:
+            with self.subTest(orchestration=orchestration), self.assertRaises(ProfileError):
+                resolve_profile(self.base, preset=None, overrides={"orchestration": orchestration})
+
+    def test_worker_launch_guidance_matches_for_each_order_size(self) -> None:
+        """Each dispatch example and fallback hint must carry the selected agent's flags."""
+        model = {"agy": {"model": "gemini-4-neon-high", "effort": "high"}}
+        flags = "--agent antigravity --model gemini-4-neon-high --effort high"
+        claude = profile_compiler.render_orchestration_block(resolve_profile(self.base, preset=None))
+        for workers, hint, suffix in (
+            (["agy"], "", ""),
+            (["agy", "codex"], "次选 `--agent codex`；", "，其次使用 Codex（`--agent codex`）"),
+            (["agy", "codex", "claude"], "次选 `--agent codex` / `--agent claude`；",
+             "，其次使用 Codex（`--agent codex`），备选 Claude Code（`--agent claude`）"),
+        ):
+            with self.subTest(workers=workers):
+                profile = resolve_profile(self.base, preset=None, overrides={"orchestration": {
+                    "worker_agents": workers, "worker_models": model,
+                }})
+                block = profile_compiler.render_orchestration_block(profile)
+                self.assertIn(f"优先使用 AGY（`{flags}`）{suffix}。", block)
+                self.assertIn(f"--worktree current {flags} --json`（{hint}或 `task-create`", block)
+                self.assertEqual(block.count(f"{flags} --setup run --json"), 2)
+                self.assertEqual(runtime.update_orchestration_guidance(claude, workers, model), block)
+                self.assertEqual(runtime.update_orchestration_guidance(block, ["claude", "codex"]), claude)
+
     def test_two_tier_guidance_survives_worker_hot_switch(self) -> None:
         # Failure means generated guidance can send coordinators down an invalid
         # dispatch path, take mail before Orca wakes them, or drift on `,worker`.
@@ -2591,6 +2647,71 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(mode.returncode, 0, mode.stderr)
         self.assertEqual(mode.stdout.strip(), "Pilot mode: confirm")
         self.assertEqual(read_json(self.gemini / PROFILE_REL)["pilot"]["mode"], "confirm")
+
+    def test_agy_worker_launch_flags_follow_priority_without_drift(self) -> None:
+        """Switching and upgrading must preserve agent-specific flags and canonical artifacts."""
+        model = "gemini-4-neon-high"
+        expected = {"agy": {"model": model, "effort": "high"}}
+        applied = apply_profile(self.root, self.gemini, "--worker-agents", "agy,codex,claude",
+                                "--worker-model", f"agy={model}:high")
+        self.assertEqual(applied["worker_models"], expected)
+        for target, order, primary in (
+            ("status", ["agy", "codex", "claude"], f"--agent antigravity --model {model} --effort high"),
+            ("codex", ["codex", "agy", "claude"], "--agent codex"),
+            ("agy", ["agy", "codex", "claude"], f"--agent antigravity --model {model} --effort high"),
+        ):
+            result = run_engine(self.root, self.gemini, self.state, "worker", target, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["worker_agents"], order)
+            self.assertIn(f"--worktree current {primary} --json", (self.gemini / GEMINI_REL).read_text())
+            self.assertEqual(json.loads(run_setup(self.root, self.gemini, "status").stdout)["drift"], [])
+        self.assertEqual(apply_profile(self.root, self.gemini, "--upgrade")["worker_models"], expected)
+        self.assertEqual(read_json(self.gemini / PROFILE_REL)["orchestration"]["worker_agents"],
+                         ["agy", "codex", "claude"])
+        self.assertEqual(json.loads(run_setup(self.root, self.gemini, "status").stdout)["drift"], [])
+
+    def test_worker_model_cli_replaces_effort_and_clears_preference(self) -> None:
+        """Changing a model must clear omitted effort and accept an explicit removal."""
+        apply_profile(self.root, self.gemini, "--worker-model", "agy=original:high",
+                      "--worker-model", "codex=provider:other:medium")
+        for invalid in ("agy", "agy=model:", "agy=model:unknown", "unknown=model", "agy=:high"):
+            with self.subTest(invalid=invalid):
+                result = run_setup(self.root, self.gemini, "apply", "--worker-model", invalid)
+                self.assertNotEqual(result.returncode, 0)
+        replaced = apply_profile(self.root, self.gemini, "--worker-model", "antigravity=replacement")
+        self.assertEqual(replaced["worker_models"], {
+            "agy": {"model": "replacement"}, "codex": {"model": "provider:other", "effort": "medium"},
+        })
+        cleared = apply_profile(self.root, self.gemini, "--worker-model", "agy=", "--worker-model", "codex=none")
+        self.assertEqual(cleared["worker_models"], {})
+        self.assertNotIn("worker_models", read_json(self.gemini / PROFILE_REL)["orchestration"])
+
+    def test_agy_worker_switch_and_model_change_reload_active_sessions(self) -> None:
+        """Live coordinators must receive new flags once, while dispatched workers stay silent."""
+        apply_profile(self.root, self.gemini, "--worker-model", "agy=gemini-4-neon-high:high")
+        session = "agy-worker-reload"
+        self.pre(session, "开始")
+        switched = self.injection(self.pre(session, ",worker agy"))
+        self.assertIn("<orca_worker_agent_hot_reload>", switched)
+        self.assertIn("--agent antigravity --model gemini-4-neon-high --effort high", switched)
+        self.assertEqual(read_json(self.gemini / PROFILE_REL)["orchestration"]["worker_agents"],
+                         ["agy", "claude", "codex"])
+        session = "agy-model-reload"
+        self.pre(session, "开始")
+        apply_profile(self.root, self.gemini, "--worker-model", "antigravity=gemini-4-neon-high:low")
+        reloaded = self.injection(self.pre(session, "继续"))
+        self.assertIn("<orca_worker_agent_hot_reload>", reloaded)
+        self.assertIn("--agent antigravity --model gemini-4-neon-high --effort low", reloaded)
+        self.assertEqual(json.loads(self.pre(session, "再继续").stdout), {})
+        compacted = self.injection(self.pre(session, "整理后继续", steps=[
+            {"type": "CHECKPOINT", "content": "摘要"},
+            {"type": "USER_INPUT", "content": "整理后继续"},
+        ]))
+        self.assertIn("--agent antigravity --model gemini-4-neon-high --effort low", compacted)
+        self.assertEqual(json.loads(self.pre(session, "下一轮").stdout), {})
+        preamble = "Task ID: task_abc123\nDispatch ID: disp_abc123\n\n,agent antigravity"
+        self.assertEqual(json.loads(self.pre("agy-dispatched-worker", preamble).stdout), {})
+        self.assertFalse(state_path(self.state, "agy-dispatched-worker").exists())
 
     def test_worker_chat_switch_and_reserved_aliases(self) -> None:
         for target in ("codex", "claude"):
@@ -5990,6 +6111,44 @@ class GlobalGuidanceTest(unittest.TestCase):
             )
         report = json.loads(run_setup_default(self.root, "status").stdout)
         self.assertEqual(report["drift"], [], report["drift"])
+
+    def test_invalid_installed_worker_models_block_hooks_and_guidance_writes(self) -> None:
+        """Corrupt launch preferences must be reported without publishing fallback guidance."""
+        self.seed_guidance()
+        self.default_apply("--worker-agents", "agy,codex", "--worker-model", "agy=neon:high")
+        guidance = {path: path.read_bytes() for path in (self.gemini / GEMINI_REL, *self.guidance)}
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        command = ",worker codex"
+        transcript = write_transcript(self.root, "invalid-worker-models.jsonl", [
+            {"type": "USER_INPUT", "content": command},
+        ])
+        hook_payload = payload("invalid-worker-models", lastUserInput=command, transcriptPath=str(transcript))
+        invalid = (
+            [], {"agy": None}, {"agy": "bad"}, {"agy": {"model": 123}},
+            {"agy": {"model": "bad\nvalue"}}, {"agy": {"model": "neon", "effort": "extreme"}},
+            {"agy": {"model": "neon", "extra": True}}, {"unknown": {"model": "neon"}},
+            {"agy": {"model": "neon"}, "antigravity": {"model": "neon"}},
+        )
+        for models in invalid:
+            with self.subTest(models=models):
+                profile["orchestration"]["worker_models"] = models
+                write_json(profile_path, profile)
+                profile_before = profile_path.read_bytes()
+                hook = run_engine(self.root, self.gemini, self.state, "hook", "--event",
+                                  "PreInvocation", stdin=hook_payload)
+                self.assertEqual(hook.returncode, 2, hook.stdout)
+                self.assertEqual(hook.stdout, "")
+                self.assertEqual(json.loads(hook.stderr)["error"], "config_corrupt")
+                for target in ("status", "codex"):
+                    worker = run_engine(self.root, self.gemini, self.state, "worker", target, "--json")
+                    self.assertEqual(worker.returncode, 2, worker.stdout)
+                    report = json.loads(worker.stdout)
+                    self.assertEqual(report["status"], "corrupt")
+                    self.assertIn("orchestration.worker_models", report["error"])
+                self.assertEqual(profile_path.read_bytes(), profile_before)
+                self.assertEqual({path: path.read_bytes() for path in guidance}, guidance)
+        self.assertIn("profile_worker_models_invalid", (self.state / "pilot.log").read_text())
 
     def test_explicit_gemini_dir_leaves_global_guidance_untouched(self) -> None:
         # Failure means a sandboxed apply, uninstall, or status reads or edits

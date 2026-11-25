@@ -18,7 +18,11 @@ The project overlay stays in the repository.
 ## Profile dimensions
 
 - `orchestration`: Tier-1 `coordinator_agent` (fixed to native `agy`, accepting
-  the `antigravity` alias) plus ordered `worker_agents` and `review_agents`.
+  the `antigravity` alias), ordered `worker_agents` and `review_agents`, and
+  optional `worker_models`. Tier-2 `worker_agents` accepts `agy` (alias
+  `antigravity`), `codex`, and `claude`. Orca launches AGY with `--agent antigravity`.
+  `worker_models` stores a `model` and optional `effort` by agent, including
+  agents outside the active order.
 - `pilot`: `mode` (`gate`, `confirm`, `off`) and `max_consecutive_auto_turns` (`1..50`).
 - `scenes`: enabled scenes, delivery strategy, and additional guardrails.
   Repository runbooks and current authorization govern external sends.
@@ -40,6 +44,13 @@ applies when the workspace supplies the shortcut. Use
 `pilot distill --days 7 --json` (see [distillation-guide.md](distillation-guide.md))
 to discover repeated user prompt patterns across local coding agents before
 proposing custom shortcuts or scene guardrails.
+
+Set worker launch preferences with repeatable `--worker-model` flags. For example,
+`pilot apply --worker-agents agy,codex,claude --worker-model agy=gemini-4-neon-high:high`
+sets AGY first and selects its model and effort. Use `<agent>=<model>` to set a
+model and clear its saved effort. Use `<agent>=` or `<agent>=none` to remove the
+agent's model override. The JSON `worker_models` form accepts model IDs with
+colons and uses `null` to clear an agent's override.
 
 ## Safety and repair
 

@@ -28,7 +28,7 @@ from typing import Any
 from . import compiler as profile_compiler
 from . import packaging
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
-from .assets.runtime import append_log_event
+from .assets.runtime import append_log_event, canonical_worker_model_keys, normalize_worker_effort
 from .profile import (
     has_shortcut_override_aliases,
     migrate_installed_shortcut_overrides,
@@ -183,6 +183,10 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--mode", choices=MODES)
     apply_parser.add_argument("--max-turns", type=int)
     apply_parser.add_argument("--worker-agents")
+    apply_parser.add_argument(
+        "--worker-model", dest="worker_models", action="append", metavar="AGENT=MODEL[:EFFORT]",
+        help="配置执行器模型，可重复指定。使用 AGENT= 或 AGENT=none 清除覆盖。",
+    )
     apply_parser.add_argument("--review-agents")
     apply_parser.add_argument("--scenes")
     apply_parser.add_argument("--deliver-strategy", choices=DELIVER_STRATEGIES)
@@ -370,6 +374,7 @@ def _apply_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         "max_consecutive_auto_turns": bundle.profile_json["pilot"]["max_consecutive_auto_turns"],
         "deliver_strategy": bundle.profile_json["scenes"]["deliver_strategy"],
         "worker_agents": bundle.profile_json["orchestration"]["worker_agents"],
+        "worker_models": bundle.profile_json["orchestration"].get("worker_models", {}),
         "review_agents": bundle.profile_json["orchestration"]["review_agents"],
         "scenes": sorted(bundle.scenes),
         "removed_scenes": sorted(stale_scenes),
@@ -1247,6 +1252,7 @@ def self_update(args: argparse.Namespace) -> dict[str, Any]:
                 apply_args.profile = None
                 apply_args.preset = apply_args.mode = apply_args.max_turns = None
                 apply_args.worker_agents = apply_args.review_agents = apply_args.scenes = None
+                apply_args.worker_models = None
                 apply_args.deliver_strategy = apply_args.entry_shortcuts = None
                 apply_args.guardrail = None
                 if checkout is not None and (checkout / "bin" / "pilot").is_file():
@@ -1415,6 +1421,11 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         overrides.setdefault("pilot", {})["max_consecutive_auto_turns"] = args.max_turns
     if args.worker_agents is not None:
         overrides.setdefault("orchestration", {})["worker_agents"] = split_list(args.worker_agents)
+    if args.worker_models:
+        orchestration = overrides.setdefault("orchestration", {})
+        models = canonical_worker_model_keys(orchestration.get("worker_models"))
+        models.update(parse_worker_model_overrides(args.worker_models))
+        orchestration["worker_models"] = models
     if args.review_agents is not None:
         overrides.setdefault("orchestration", {})["review_agents"] = split_list(args.review_agents)
     if args.scenes is not None:
@@ -1430,6 +1441,25 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.guardrail:
         overrides.setdefault("scenes", {})["guardrails"] = list(args.guardrail)
     return overrides
+
+
+def parse_worker_model_overrides(values: list[str]) -> dict[str, Any]:
+    models: dict[str, Any] = {}
+    for value in values:
+        agent, equals, spec = value.partition("=")
+        if not equals or not agent:
+            raise SetupError(f"--worker-model 必须是 AGENT=MODEL[:EFFORT]，实际为 {value!r}")
+        if agent in models:
+            raise SetupError(f"--worker-model 重复指定执行器 {agent!r}")
+        if spec in {"", "none"}:
+            models[agent] = None
+            continue
+        model, colon, effort = spec.rpartition(":")
+        models[agent] = {
+            "model": model if colon else spec,
+            "effort": normalize_worker_effort(effort, f"--worker-model {agent} effort") if colon else None,
+        }
+    return canonical_worker_model_keys(models)
 
 
 def read_profile_argument(raw: str) -> dict[str, Any]:

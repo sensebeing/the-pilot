@@ -63,7 +63,7 @@
 | `d [需求]` | 先做根因与最简架构方案设计，再派发隔离的 Orca 子工作区实施并严格复审。 |
 | `pull` | 安全快进同步本地 `main` 分支，不破坏脏工作区。 |
 | `,mode gate\|confirm\|off` | 随时切换自动回车模式（`gate`）、仅预填确认模式（`confirm`）或关闭（`off`）。 |
-| `,worker codex\|claude` | 切换 Orca 子工作区执行器优先级（`Codex > Claude Code` 或 `Claude Code > Codex`），下一轮自动生效。 |
+| `,worker agy\|codex\|claude` | 将选定的 Orca 子会话执行器移至首位，启动参数在下一轮自动生效。 |
 
 ---
 

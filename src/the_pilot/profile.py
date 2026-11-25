@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from typing import Any
 
 from .assets.runtime import (
     RESERVED_COMMA_ALIASES,
+    WORKER_AGENT_ORDER,
     is_comma_alias,
     is_entry_key,
+    normalize_worker_agent,
+    normalize_worker_models,
     shortcut_override_name,
     shortcut_override_owners,
 )
@@ -20,7 +24,6 @@ from .defaults import (
     PROFILE_SCHEMA,
     REVIEW_AGENT_ORDER,
     SCENE_ORDER,
-    WORKER_AGENT_ORDER,
 )
 from .project import ProfileError, project_specs
 
@@ -35,15 +38,15 @@ def resolve_profile(
     """Merge a base profile with one preset and the caller's overrides."""
     specs = project_specs(project)
     presets = specs["presets"]
-    merged = _normalize_pilot_section(_copy_mapping(base, "base profile"))
+    merged = _profile_for_merge(base, "base profile")
     if preset is not None:
         if preset not in presets:
             raise ProfileError(f"未知预设 {preset!r}；允许的预设为 {sorted(presets)}")
-        merged = _deep_merge(merged, presets[preset])
+        merged = _deep_merge(merged, _profile_for_merge(presets[preset], f"preset {preset}"))
     if overrides:
         merged = _deep_merge(
             merged,
-            _normalize_pilot_section(_copy_mapping(overrides, "profile overrides")),
+            _profile_for_merge(overrides, "profile overrides"),
         )
     return validate_profile(merged, project=project)
 
@@ -111,7 +114,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
     shortcuts = _require_mapping(profile.get("shortcuts"), "shortcuts")
     _reject_unknown(
         orchestration,
-        ("coordinator_agent", "worker_agents", "review_agents"),
+        ("coordinator_agent", "worker_agents", "worker_models", "review_agents"),
         "orchestration",
     )
     _reject_unknown(pilot, ("mode", "max_consecutive_auto_turns"), "pilot")
@@ -151,7 +154,9 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
         orchestration.get("worker_agents"),
         "orchestration.worker_agents",
         allowed=WORKER_AGENT_ORDER,
+        normalize=normalize_worker_agent,
     )
+    worker_models = _normalize_worker_models(orchestration.get("worker_models"))
     coordinator_agent = _coordinator_agent(orchestration.get("coordinator_agent"))
     review_agents = _string_list(
         orchestration.get("review_agents"),
@@ -198,6 +203,7 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             "coordinator_agent": coordinator_agent,
             "worker_agents": worker_agents,
             "review_agents": review_agents,
+            **({"worker_models": worker_models} if worker_models else {}),
         },
         "pilot": {"mode": mode, "max_consecutive_auto_turns": max_turns},
         "scenes": {
@@ -214,6 +220,25 @@ def validate_profile(raw: Any, *, project: dict[str, Any] | None = None) -> dict
             },
         },
     }
+
+
+def _profile_for_merge(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    profile = _normalize_pilot_section(_copy_mapping(raw, where))
+    orchestration = profile.get("orchestration")
+    if isinstance(orchestration, dict) and orchestration.get("worker_models") is not None:
+        orchestration["worker_models"] = _normalize_worker_models(
+            orchestration["worker_models"], preserve_clears=True,
+        )
+    return profile
+
+
+def _normalize_worker_models(
+    raw: Any, *, preserve_clears: bool = False,
+) -> dict[str, dict[str, str | None] | None]:
+    try:
+        return normalize_worker_models(raw, clears="keep" if preserve_clears else "drop")
+    except ValueError as exc:
+        raise ProfileError(str(exc)) from exc
 
 
 def _coordinator_agent(value: Any) -> str:
@@ -460,12 +485,15 @@ def _string_list(
     *,
     allowed: tuple[str, ...] | None = None,
     allow_empty: bool = False,
+    normalize: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     if not isinstance(value, list) or any(
         not isinstance(item, str) or not item.strip() for item in value
     ):
         raise ProfileError(f"{where} 必须是非空字符串数组")
     items = [item.strip() for item in value]
+    if normalize is not None:
+        items = [normalize(item) or item for item in items]
     if len(set(items)) != len(items):
         raise ProfileError(f"{where} 不能包含重复项")
     if allowed is not None:

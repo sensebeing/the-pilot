@@ -16,6 +16,7 @@ from pathlib import Path
 import time
 from typing import Any
 
+from .assets.runtime import worker_command_target
 from .compiler import split_frontmatter
 from .defaults import (
     DEFAULT_SPECS,
@@ -1353,9 +1354,7 @@ def _shortcut_parts(text: str, *, comma: bool = False) -> tuple[str, str]:
 
 def _match_installed_pilot(text: str, shortcuts: list[dict[str, Any]]) -> str | None:
     stripped = text.strip()
-    if _named_command(
-        stripped, {"worker", "agent"}, {"codex", "claude", "claude-code", "cc", "status"}, "status"
-    ):
+    if worker_command_target(stripped):
         return "command:,worker"
     if _named_command(stripped, {"mode"}, {"gate", "confirm", "off", "status"}):
         return "command:,mode"
