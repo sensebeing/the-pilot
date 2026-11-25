@@ -28,12 +28,10 @@ from typing import Any
 from . import compiler as profile_compiler
 from . import packaging
 from .distill import DEFAULT_DAYS, DEFAULT_MAX_SESSIONS, distill_chat_history
-from .assets.runtime import append_log_event
+from .assets.runtime import append_log_event, canonical_worker_model_keys, normalize_worker_effort
 from .profile import (
-    canonical_worker_model_keys,
     has_shortcut_override_aliases,
     migrate_installed_shortcut_overrides,
-    normalize_worker_effort,
     resolve_profile,
     validate_profile,
 )

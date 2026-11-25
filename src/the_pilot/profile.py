@@ -8,12 +8,10 @@ from typing import Any
 from .assets.runtime import (
     RESERVED_COMMA_ALIASES,
     WORKER_AGENT_ORDER,
-    WORKER_EFFORT_LEVELS,
     is_comma_alias,
     is_entry_key,
-    is_worker_model_id,
     normalize_worker_agent,
-    parse_worker_effort,
+    normalize_worker_models,
     shortcut_override_name,
     shortcut_override_owners,
 )
@@ -234,50 +232,13 @@ def _profile_for_merge(raw: dict[str, Any], where: str) -> dict[str, Any]:
     return profile
 
 
-def canonical_worker_model_keys(raw: Any) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    where = "orchestration.worker_models"
-    models = {}
-    for key, spec in _require_mapping(raw, where).items():
-        agent = normalize_worker_agent(key) if isinstance(key, str) else None
-        if agent is None or agent not in WORKER_AGENT_ORDER:
-            raise ProfileError(f"{where} 含未知执行器 {key!r}")
-        if agent in models:
-            raise ProfileError(f"{where} 重复指定执行器 {agent!r}")
-        models[agent] = spec
-    return models
-
-
-def normalize_worker_effort(value: Any, where: str) -> str:
-    effort = parse_worker_effort(value)
-    if effort is None:
-        raise ProfileError(f"{where} 必须是 {WORKER_EFFORT_LEVELS} 之一，实际为 {value!r}")
-    return effort
-
-
 def _normalize_worker_models(
     raw: Any, *, preserve_clears: bool = False,
 ) -> dict[str, dict[str, str | None] | None]:
-    models: dict[str, dict[str, str | None] | None] = {}
-    for agent, spec in canonical_worker_model_keys(raw).items():
-        if spec is None:
-            if preserve_clears:
-                models[agent] = None
-            continue
-        where = f"orchestration.worker_models.{agent}"
-        spec = _require_mapping(spec, where)
-        _reject_unknown(spec, ("model", "effort"), where)
-        model = spec.get("model")
-        if not is_worker_model_id(model):
-            raise ProfileError(f"{where}.model 必须是无空白、控制字符或反引号的非空字符串")
-        config: dict[str, str | None] = {"model": model}
-        if spec.get("effort") is not None:
-            config["effort"] = normalize_worker_effort(spec["effort"], f"{where}.effort")
-        elif preserve_clears and "effort" in spec:
-            config["effort"] = None
-        models[agent] = config
-    return models
+    try:
+        return normalize_worker_models(raw, clears="keep" if preserve_clears else "drop")
+    except ValueError as exc:
+        raise ProfileError(str(exc)) from exc
 
 
 def _coordinator_agent(value: Any) -> str:

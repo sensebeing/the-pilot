@@ -2713,32 +2713,6 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(json.loads(self.pre("agy-dispatched-worker", preamble).stdout), {})
         self.assertFalse(state_path(self.state, "agy-dispatched-worker").exists())
 
-    def test_worker_hook_ignores_invalid_model_entries_in_installed_profile(self) -> None:
-        """An invalid launch preference must not crash the hook or suppress valid entries."""
-        apply_profile(self.root, self.gemini, "--worker-agents", "agy,codex,claude")
-        path = self.gemini / PROFILE_REL
-        profile = read_json(path)
-        for agy_spec in (None, "bad", {"model": 123}, {"model": "bad\nvalue"}):
-            with self.subTest(agy_spec=agy_spec):
-                profile["orchestration"]["worker_models"] = {
-                    "agy": agy_spec,
-                    "claude": {"model": "wrong", "effort": "extreme"},
-                    "codex": {"model": "valid", "effort": " HIGH "},
-                    "unknown": {"model": "unrecognized"},
-                }
-                write_json(path, profile)
-                result = self.pre("worker-invalid-model", ",worker status")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                message = self.injection(result)
-                self.assertNotIn("--agent antigravity --model", message)
-                self.assertNotIn("--agent claude --model", message)
-                self.assertIn("--agent codex --model valid --effort high", message)
-        report = run_engine(self.root, self.gemini, self.state, "worker", "status", "--json")
-        self.assertEqual(report.returncode, 0, report.stderr)
-        self.assertEqual(json.loads(report.stdout)["worker_models"], {
-            "codex": {"model": "valid", "effort": "high"},
-        })
-
     def test_worker_chat_switch_and_reserved_aliases(self) -> None:
         for target in ("codex", "claude"):
             message = self.injection(self.pre("worker-chat", f",worker {target}"))
@@ -6137,6 +6111,44 @@ class GlobalGuidanceTest(unittest.TestCase):
             )
         report = json.loads(run_setup_default(self.root, "status").stdout)
         self.assertEqual(report["drift"], [], report["drift"])
+
+    def test_invalid_installed_worker_models_block_hooks_and_guidance_writes(self) -> None:
+        """Corrupt launch preferences must be reported without publishing fallback guidance."""
+        self.seed_guidance()
+        self.default_apply("--worker-agents", "agy,codex", "--worker-model", "agy=neon:high")
+        guidance = {path: path.read_bytes() for path in (self.gemini / GEMINI_REL, *self.guidance)}
+        profile_path = self.gemini / PROFILE_REL
+        profile = read_json(profile_path)
+        command = ",worker codex"
+        transcript = write_transcript(self.root, "invalid-worker-models.jsonl", [
+            {"type": "USER_INPUT", "content": command},
+        ])
+        hook_payload = payload("invalid-worker-models", lastUserInput=command, transcriptPath=str(transcript))
+        invalid = (
+            [], {"agy": None}, {"agy": "bad"}, {"agy": {"model": 123}},
+            {"agy": {"model": "bad\nvalue"}}, {"agy": {"model": "neon", "effort": "extreme"}},
+            {"agy": {"model": "neon", "extra": True}}, {"unknown": {"model": "neon"}},
+            {"agy": {"model": "neon"}, "antigravity": {"model": "neon"}},
+        )
+        for models in invalid:
+            with self.subTest(models=models):
+                profile["orchestration"]["worker_models"] = models
+                write_json(profile_path, profile)
+                profile_before = profile_path.read_bytes()
+                hook = run_engine(self.root, self.gemini, self.state, "hook", "--event",
+                                  "PreInvocation", stdin=hook_payload)
+                self.assertEqual(hook.returncode, 2, hook.stdout)
+                self.assertEqual(hook.stdout, "")
+                self.assertEqual(json.loads(hook.stderr)["error"], "config_corrupt")
+                for target in ("status", "codex"):
+                    worker = run_engine(self.root, self.gemini, self.state, "worker", target, "--json")
+                    self.assertEqual(worker.returncode, 2, worker.stdout)
+                    report = json.loads(worker.stdout)
+                    self.assertEqual(report["status"], "corrupt")
+                    self.assertIn("orchestration.worker_models", report["error"])
+                self.assertEqual(profile_path.read_bytes(), profile_before)
+                self.assertEqual({path: path.read_bytes() for path in guidance}, guidance)
+        self.assertIn("profile_worker_models_invalid", (self.state / "pilot.log").read_text())
 
     def test_explicit_gemini_dir_leaves_global_guidance_untouched(self) -> None:
         # Failure means a sandboxed apply, uninstall, or status reads or edits

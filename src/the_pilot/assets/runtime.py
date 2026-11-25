@@ -33,7 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, TypeGuard
+from typing import Any, Literal, TypeGuard
 
 
 PILOT_SUBDIR = Path("config") / "the-pilot"
@@ -513,6 +513,15 @@ def load_profile() -> tuple[dict[str, Any] | None, str, str]:
             "corrupt",
             f"{PROFILE_PATH}: profile contains both pilot and autopilot sections",
         )
+    orchestration = value.get("orchestration")
+    if isinstance(orchestration, dict) and orchestration.get("worker_models") is not None:
+        try:
+            orchestration["worker_models"] = normalize_worker_models(
+                orchestration["worker_models"], clears="reject",
+            )
+        except ValueError as exc:
+            log_event("profile_worker_models_invalid", error=str(exc))
+            return None, "corrupt", f"{PROFILE_PATH}: {exc}"
     return value, "ok", ""
 
 
@@ -748,33 +757,61 @@ def is_worker_model_id(value: Any) -> TypeGuard[str]:
     )
 
 
-def parse_worker_effort(value: Any) -> str | None:
+def normalize_worker_effort(value: Any, where: str) -> str:
     effort = value.strip().lower() if isinstance(value, str) else None
-    return effort if effort in WORKER_EFFORT_LEVELS else None
+    if effort is None or effort not in WORKER_EFFORT_LEVELS:
+        raise ValueError(f"{where} 必须是 {WORKER_EFFORT_LEVELS} 之一，实际为 {value!r}")
+    return effort
+
+
+def canonical_worker_model_keys(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    where = "orchestration.worker_models"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} 必须是 JSON 对象")
+    models: dict[str, Any] = {}
+    for key, spec in raw.items():
+        agent = normalize_worker_agent(key) if isinstance(key, str) else None
+        if agent is None or agent not in WORKER_AGENT_ORDER:
+            raise ValueError(f"{where} 含未知执行器 {key!r}")
+        if agent in models:
+            raise ValueError(f"{where} 重复指定执行器 {agent!r}")
+        models[agent] = spec
+    return models
+
+
+def normalize_worker_models(
+    raw: Any, *, clears: Literal["keep", "drop", "reject"] = "drop",
+) -> dict[str, dict[str, str | None] | None]:
+    """Validate launch preferences, retaining null directives only while merging."""
+    models: dict[str, dict[str, str | None] | None] = {}
+    for agent, spec in canonical_worker_model_keys(raw).items():
+        if spec is None and clears != "reject":
+            if clears == "keep":
+                models[agent] = None
+            continue
+        where = f"orchestration.worker_models.{agent}"
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where} 必须是 JSON 对象")
+        unknown = spec.keys() - {"model", "effort"}
+        if unknown:
+            raise ValueError(f"{where} 含未知字段 {sorted(unknown, key=str)}")
+        model = spec.get("model")
+        if not is_worker_model_id(model):
+            raise ValueError(f"{where}.model 必须是无空白、控制字符或反引号的非空字符串")
+        config: dict[str, str | None] = {"model": model}
+        if spec.get("effort") is not None:
+            config["effort"] = normalize_worker_effort(spec["effort"], f"{where}.effort")
+        elif clears == "keep" and "effort" in spec:
+            config["effort"] = None
+        models[agent] = config
+    return models
 
 
 def current_worker_models(profile: dict[str, Any]) -> dict[str, dict[str, str]]:
     orchestration = profile.get("orchestration")
-    models = orchestration.get("worker_models") if isinstance(orchestration, dict) else None
-    if not isinstance(models, dict):
-        return {}
-
-    valid: dict[str, dict[str, str]] = {}
-    for agent, spec in models.items():
-        if agent not in WORKER_AGENT_ORDER or not isinstance(spec, dict):
-            continue
-        model = spec.get("model")
-        if not is_worker_model_id(model):
-            continue
-        raw_effort = spec.get("effort")
-        effort = parse_worker_effort(raw_effort)
-        if raw_effort is not None and effort is None:
-            continue
-        config = {"model": model}
-        if effort is not None:
-            config["effort"] = effort
-        valid[agent] = config
-    return valid
+    return (orchestration.get("worker_models") or {}) if isinstance(orchestration, dict) else {}
 
 
 def format_agent_order(agents: Sequence[str]) -> str:
