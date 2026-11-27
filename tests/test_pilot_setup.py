@@ -7074,6 +7074,137 @@ class LoopAndReReviewTest(unittest.TestCase):
         self.assertIn('`"loop":"next"`', closeout)
         self.assertIn('`"scene":"NONE","loop":"done"`', closeout)
 
+    def test_loop_next_alternatives_advance_wave_on_comma_selection_and_text_submission(self) -> None:
+        # Failure means selecting `,2`/`,3` or submitting an alternative's text on
+        # a `"loop": "next"` tag executes a next wave without advancing the counter,
+        # bypassing the declared wave budget.
+        cid = "loop-next-alts"
+        self.assertEqual(
+            run_engine(self.root, self.gemini, self.state, "mode", "confirm").returncode, 0
+        )
+        self.injection(self.pre(cid, ",loop 3 验证备选推进"))
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+
+        tag_three = (
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", '
+            '"1": "第 2 波主推", "2": "第 2 波备选二", "3": "第 2 波备选三"} -->'
+        )
+        self.assertEqual(self.stop(cid, tag_three).returncode, 0)
+        candidates = read_state(self.state, cid)["candidates"]
+        self.assertEqual(len(candidates), 3)
+        self.assertTrue(all(item.get("loop_next") is True for item in candidates))
+
+        # Selecting `,2` advances wave 1 -> 2 and injects loop context + candidate 2.
+        alt2_msg = self.injection(self.pre(cid, ",2 聚焦核心"))
+        self.assertIn("<pilot_loop_context>", alt2_msg)
+        self.assertIn("第 2/3 波", alt2_msg)
+        self.assertIn("候选指令 #2 展开", alt2_msg)
+        self.assertIn("第 2 波备选二", alt2_msg)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+
+        # Two-candidate tag: selecting absent `,3` must NOT advance the wave.
+        tag_two = (
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", '
+            '"1": "第 3 波主推", "2": "第 3 波备选二"} -->'
+        )
+        self.assertEqual(self.stop(cid, tag_two).returncode, 0)
+        self.assertEqual(self.injection(self.pre(cid, ",3")), "")
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+
+        # Submitting alternative 3's exact text advances wave 2 -> 3.
+        self.assertEqual(self.stop(cid, tag_three).returncode, 0)
+        alt3_submit = self.injection(self.pre(cid, "第 2 波备选三"))
+        self.assertIn("<pilot_loop_context>", alt3_submit)
+        self.assertIn("第 3/3 波", alt3_submit)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 3)
+
+    def test_loop_state_write_failures_fail_closed_without_announcing_success(self) -> None:
+        # Failure means a failed session-state write silently announces `,loop`
+        # arming/off/rr clearing, wave advancement, completion, or budget exhaustion
+        # while the persisted loop state on disk disagrees.
+        cid = "loop-write-fail"
+        self.addCleanup(lambda: os.chmod(self.state, 0o700) if self.state.exists() else None)
+        # Seed session + lock file so `flock` still opens existing `.lock` while
+        # creating temp files in `self.state` fails once the directory is 0o500.
+        self.injection(self.pre(cid, "初始化会话"))
+        self.assertTrue(state_path(self.state, cid).is_file())
+
+        def assert_write_failure(res: subprocess.CompletedProcess) -> None:
+            self.assertEqual(res.returncode, 2, res.stdout)
+            self.assertEqual(res.stdout, "")
+            err = json.loads(res.stderr)
+            self.assertFalse(err["ok"])
+            self.assertEqual(err["error"], "loop_state_save_failed")
+
+        # 1. `,loop` arming fails closed when state cannot be written.
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(self.pre(cid, ",loop 2 瘦身"))
+            self.assertNotIn("loop", read_state(self.state, cid))
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # Arm cleanly while writable.
+        self.assertIn("第 1/2 波", self.injection(self.pre(cid, ",loop 2 瘦身")))
+        armed = read_state(self.state, cid)["loop"]
+        self.assertEqual(armed["wave"], 1)
+
+        # 2. `,loop off` and 3. `,rr` clearing fail closed and preserve persisted loop.
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(self.pre(cid, ",loop off"))
+            self.assertEqual(read_state(self.state, cid)["loop"], armed)
+
+            assert_write_failure(self.pre(cid, ",rr"))
+            self.assertEqual(read_state(self.state, cid)["loop"], armed)
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # 4. Stop `"loop": "done"` fails closed and preserves persisted loop.
+        self.assertEqual(self.injection(self.pre(cid, "确认已收敛")), "")
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(
+                self.stop(cid, '<!-- pilot: {"scene": "NONE", "loop": "done"} -->')
+            )
+            self.assertEqual(read_state(self.state, cid)["loop"], armed)
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # 5. Wave advancement in PreInvocation fails closed without announcing Wave 2.
+        self.assertEqual(self.injection(self.pre(cid, "准备推进第 2 波")), "")
+        next_prompt = "开启第 2 波复审"
+        self.assertEqual(
+            self.stop(
+                cid,
+                f'<!-- pilot: {{"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "{next_prompt}"}} -->',
+            ).returncode,
+            0,
+        )
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(self.pre(cid, next_prompt))
+            self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # Advance cleanly to Wave 2/2, then verify Stop budget exhaustion fails closed.
+        self.assertIn("第 2/2 波", self.injection(self.pre(cid, next_prompt)))
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+        sends_before = len(send_calls(self.root))
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(
+                self.stop(
+                    cid,
+                    '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "第 3 波"} -->',
+                )
+            )
+            self.assertEqual(len(send_calls(self.root)), sends_before)
+            self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+        finally:
+            os.chmod(self.state, 0o700)
+
 
 if __name__ == "__main__":
     unittest.main()

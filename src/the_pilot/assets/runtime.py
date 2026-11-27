@@ -307,6 +307,50 @@ def _active_loop(state: dict[str, Any]) -> dict[str, Any] | None:
     return loop
 
 
+def _commit_loop_state(conversation_id: str, state: dict[str, Any], action: str) -> None:
+    """Persist a loop lifecycle change or fail the hook closed."""
+    if not save_state(conversation_id, state):
+        log_event("loop_state_save_failed", cid=conversation_id, action=action)
+        raise HookExecutionError(
+            "loop_state_save_failed",
+            f"{session_path(conversation_id)}: failed to persist loop state ({action})",
+        )
+
+
+def _matched_loop_next_candidate(
+    candidates: list[Any],
+    *,
+    text: str,
+    manual_input: bool,
+    candidate_index: str,
+) -> dict[str, Any] | None:
+    """Return the selected or submitted candidate when it carries a `loop_next` transition."""
+    items = [item for item in candidates if isinstance(item, dict)]
+    if not items:
+        return None
+    chosen: dict[str, Any] | None = None
+    if not manual_input:
+        chosen = next(
+            (item for item in items if str(item.get("prompt") or "") == text),
+            items[0],
+        )
+    elif candidate_index in {"1", "2", "3"}:
+        selected = int(candidate_index)
+        chosen = next((item for item in items if item.get("index") == selected), None)
+    else:
+        chosen = next(
+            (
+                item
+                for item in items
+                if item.get("prompt") and text == str(item.get("prompt") or "")
+            ),
+            None,
+        )
+    if chosen is None or chosen.get("loop_next") is not True or not chosen.get("prompt"):
+        return None
+    return chosen
+
+
 def _render_re_review_prompt(focus: str) -> str:
     focus_clause = f"\n- 补充聚焦：{focus}" if focus else ""
     return (
@@ -2535,29 +2579,23 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["candidate_turn_id"] = ""
 
         candidate, note = _command_parts(text, comma=True)
-        first_candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else None
+        advanced_wave: tuple[int, int] | None = None
+        loop_mutated = False
         if (
             not is_control_cmd
-            and first_candidate is not None
-            and first_candidate.get("loop_next") is True
-            and (
-                not manual_input
-                or candidate == "1"
-                or (
-                    bool(first_candidate.get("prompt"))
-                    and text == str(first_candidate.get("prompt") or "")
-                )
+            and _matched_loop_next_candidate(
+                candidates,
+                text=text,
+                manual_input=manual_input,
+                candidate_index=candidate,
             )
+            is not None
         ):
             active_loop = _active_loop(state)
             if active_loop is not None and active_loop["wave"] < active_loop["max_waves"]:
                 active_loop["wave"] += 1
-                log_event(
-                    "loop_wave_advanced",
-                    cid=conversation_id,
-                    wave=active_loop["wave"],
-                    max_waves=active_loop["max_waves"],
-                )
+                advanced_wave = (active_loop["wave"], active_loop["max_waves"])
+                loop_mutated = True
 
         if worker_target:
             if worker_target == "status":
@@ -2598,16 +2636,19 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
 
         if is_rr:
-            if state.pop("loop", None) is not None:
+            had_loop = state.pop("loop", None) is not None
+            if had_loop:
+                _commit_loop_state(conversation_id, state, "rr_clear")
                 log_event("loop_cleared_by_rr", cid=conversation_id)
-            message = _render_re_review_prompt(rr_focus)
-            if not save_state(conversation_id, state):
+            elif not save_state(conversation_id, state):
                 log_event("pre_state_save_failed", cid=conversation_id)
+            message = _render_re_review_prompt(rr_focus)
             log_event("rr_expanded", cid=conversation_id, has_focus=bool(rr_focus))
             return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
 
         if loop_cmd is not None:
             action = loop_cmd["action"]
+            committed = False
             if action == "invalid":
                 message = (
                     f"【Pilot 循环命令无效】{loop_cmd['error']}"
@@ -2635,6 +2676,9 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             elif action == "off":
                 had_loop = state.pop("loop", None) is not None
+                if had_loop:
+                    _commit_loop_state(conversation_id, state, "loop_off")
+                    committed = True
                 log_event("loop_stopped", cid=conversation_id, had_loop=had_loop)
                 status_text = (
                     "已关闭当前会话的多波收敛循环。"
@@ -2673,6 +2717,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                         "announced_wave": 1,
                         "context_checkpoint": last_checkpoint,
                     }
+                    _commit_loop_state(conversation_id, state, "loop_start")
+                    committed = True
                     log_event(
                         "loop_started",
                         cid=conversation_id,
@@ -2680,7 +2726,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                         has_goal=bool(goal),
                     )
                     message = _render_loop_start_prompt(max_waves, goal)
-            if not save_state(conversation_id, state):
+            if not committed and not save_state(conversation_id, state):
                 log_event("pre_state_save_failed", cid=conversation_id)
             return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
 
@@ -2695,6 +2741,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 loop_context_msg = _render_loop_context(active_loop)
                 active_loop["announced_wave"] = active_loop["wave"]
                 active_loop["context_checkpoint"] = last_checkpoint
+                loop_mutated = True
 
         message = ""
         if candidate in {"1", "2", "3"}:
@@ -2751,7 +2798,20 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                                 f"请严格按以下完整要求执行：\n\n{expanded}"
                             )
 
-        if not save_state(conversation_id, state):
+        if loop_mutated:
+            _commit_loop_state(
+                conversation_id,
+                state,
+                "loop_advance" if advanced_wave is not None else "loop_context",
+            )
+            if advanced_wave is not None:
+                log_event(
+                    "loop_wave_advanced",
+                    cid=conversation_id,
+                    wave=advanced_wave[0],
+                    max_waves=advanced_wave[1],
+                )
+        elif not save_state(conversation_id, state):
             log_event("pre_state_save_failed", cid=conversation_id)
         message = "\n\n".join(p for p in (worker_reload_msg, loop_context_msg, message) if p)
         return injection(message) if message else {}
@@ -3110,7 +3170,10 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         if loop_signal == "done":
             had_loop = state.pop("loop", None) is not None
             clear_suggestion(state)
-            save_state(conversation_id, state)
+            if had_loop:
+                _commit_loop_state(conversation_id, state, "loop_done")
+            elif not save_state(conversation_id, state):
+                log_event("stop_state_save_failed", cid=conversation_id, action="loop_done")
             log_event("loop_completed", cid=conversation_id, had_loop=had_loop)
             return {"decision": "allow"}, OSC_7501_DONE
         if not primary or scene == "NONE":
@@ -3137,9 +3200,12 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         if loop_signal == "next":
             active_loop = _active_loop(state)
             if active_loop is None:
-                state.pop("loop", None)
+                had_corrupt_loop = state.pop("loop", None) is not None
                 clear_suggestion(state)
-                save_state(conversation_id, state)
+                if had_corrupt_loop:
+                    _commit_loop_state(conversation_id, state, "loop_inactive")
+                else:
+                    save_state(conversation_id, state)
                 log_event("loop_inactive", cid=conversation_id, scene=scene)
                 return {"decision": "allow"}, OSC_7501_DONE
             if active_loop["wave"] >= active_loop["max_waves"]:
@@ -3147,7 +3213,7 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                 max_waves = active_loop["max_waves"]
                 state.pop("loop", None)
                 clear_suggestion(state)
-                save_state(conversation_id, state)
+                _commit_loop_state(conversation_id, state, "loop_budget_exhausted")
                 log_event(
                     "loop_budget_exhausted",
                     cid=conversation_id,
@@ -3159,14 +3225,19 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
 
         handle = resolve_terminal(workspace_path, explicit_handle)
 
-        primary_candidate: dict[str, Any] = {"index": 1, "scene": scene, "prompt": primary}
-        if loop_signal == "next":
-            primary_candidate["loop_next"] = True
-        candidates = [primary_candidate]
-        candidates.extend(
-            {"index": int(item["index"]), "scene": scene, "prompt": item["prompt"]}
-            for item in parsed["alternatives"]
-        )
+        loop_flag = {"loop_next": True} if loop_signal == "next" else {}
+        candidates = [
+            {"index": 1, "scene": scene, "prompt": primary, **loop_flag},
+            *(
+                {
+                    "index": int(item["index"]),
+                    "scene": scene,
+                    "prompt": item["prompt"],
+                    **loop_flag,
+                }
+                for item in parsed["alternatives"]
+            ),
+        ]
         state.update(
             {
                 "scene": scene,
@@ -3204,9 +3275,13 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
                             last_settled_turn_id=turn_id,
                             delivery_status="pending",
                         )
-                        if not save_state(conversation_id, state):
+                        if loop_signal == "next":
+                            _commit_loop_state(conversation_id, state, "loop_next_auto_submit")
+                        elif not save_state(conversation_id, state):
                             log_event("auto_submit_state_failed", cid=conversation_id, scene=scene)
                             return {"decision": "allow"}, OSC_7501_DONE
+                    elif loop_signal == "next":
+                        _commit_loop_state(conversation_id, state, "loop_next_prefill")
                     try:
                         process = _start_terminal_send(handle, primary, enter=auto_submit)
                     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -3265,7 +3340,10 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             }[outcome]
             event = "prefilled_only"
             details = {"gate": gate, "mode": mode}
-        save_state(conversation_id, state)
+        if loop_signal == "next":
+            _commit_loop_state(conversation_id, state, "loop_next_settle")
+        else:
+            save_state(conversation_id, state)
         log_event(event, cid=conversation_id, scene=scene, **details)
         return (
             {"decision": "allow"},
