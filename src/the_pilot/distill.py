@@ -16,7 +16,11 @@ from pathlib import Path
 import time
 from typing import Any
 
-from .assets.runtime import worker_command_target
+from .assets.runtime import (
+    parse_loop_command,
+    parse_re_review_command,
+    worker_command_target,
+)
 from .compiler import split_frontmatter
 from .defaults import (
     DEFAULT_SPECS,
@@ -61,6 +65,7 @@ MACHINE_PREFIXES = (
     "<local-command-caveat>",
     "<command-name>",
     "<command-message>",
+    "刚才因本机切换 Antigravity 账号重启了 CLI",
 )
 
 CONTINUE_NUDGES = frozenset({
@@ -995,6 +1000,10 @@ def _is_machine_message(text: str) -> bool:
         return True
     if stripped.startswith("You have ") and "orchestration message" in stripped:
         return True
+    if "orchestration message" in stripped and "orca orchestration check" in stripped:
+        return True
+    if stripped.startswith("You have ") and "Dealer message(s) in " in stripped[:120]:
+        return True
     if "Task ID:" in stripped and "Dispatch ID:" in stripped:
         return True
     return False
@@ -1360,6 +1369,10 @@ def _match_installed_pilot(text: str, shortcuts: list[dict[str, Any]]) -> str | 
         return "command:,mode"
     if _named_command(stripped, {"pilot", "autopilot"}, {"recover"}):
         return "command:,pilot"
+    if parse_re_review_command(stripped)[0]:
+        return "command:,rr"
+    if parse_loop_command(stripped) is not None:
+        return "command:,loop"
     candidate, _ = _command_parts(stripped, comma=True)
     if candidate in {"1", "2", "3"}:
         return f"candidate:,{candidate}"

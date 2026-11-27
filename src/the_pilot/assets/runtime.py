@@ -121,7 +121,12 @@ UNIVERSAL_ENTRY_SPECS = {
     },
 }
 UNIVERSAL_ENTRY_KEYS = tuple(UNIVERSAL_ENTRY_SPECS)
-RESERVED_COMMA_ALIASES = frozenset({"1", "2", "3", "mode", "worker", "agent", "pilot", "autopilot"})
+RESERVED_COMMA_ALIASES = frozenset(
+    {"1", "2", "3", "mode", "worker", "agent", "pilot", "autopilot", "rr", "loop"}
+)
+DEFAULT_LOOP_WAVES = 3
+MAX_LOOP_WAVES = 5
+LOOP_TAG_VALUES = frozenset({"next", "done"})
 LEGACY_PROJECT_FIELDS = frozenset({"presets", "scene_specs", "deliver_content", "feedback_closeout"})
 RECOVERY_FAILED_MESSAGE = (
     "【Pilot 恢复失败】状态文件未能安全重建，自动投递保持暂停；"
@@ -157,6 +162,7 @@ TAG_FIELDS = frozenset(
         "gate",
         "action",
         "next",
+        "loop",
         "1",
         "2",
         "3",
@@ -227,6 +233,125 @@ def _named_command(text: str, names: set[str], targets: Collection[str], default
 
 def worker_command_target(text: str) -> str:
     return _named_command(text, {"worker", "agent"}, WORKER_TARGETS, "status")
+
+
+def _is_ascii_int_literal(token: str) -> bool:
+    digits = token[1:] if token[:1] in {"+", "-"} else token
+    return bool(digits) and digits.isascii() and digits.isdigit()
+
+
+def parse_re_review_command(text: str) -> tuple[bool, str]:
+    name, arg = _command_parts(text.strip(), comma=True)
+    if name.lower() != "rr":
+        return False, ""
+    return True, arg
+
+
+def parse_loop_command(text: str) -> dict[str, Any] | None:
+    name, arg = _command_parts(text.strip(), comma=True)
+    if name.lower() != "loop":
+        return None
+    if not arg:
+        return {"action": "start", "max_waves": DEFAULT_LOOP_WAVES, "goal": ""}
+    first, rest = _command_parts(arg)
+    lower_first = first.lower()
+    if lower_first == "status":
+        if rest:
+            return {
+                "action": "invalid",
+                "error": (
+                    "`,loop status` 不接受额外参数；用法：`,loop status` / "
+                    "`,loop off` / `,loop [1-5] [目标]`。"
+                ),
+            }
+        return {"action": "status"}
+    if lower_first in {"off", "stop", "cancel"}:
+        if rest:
+            return {
+                "action": "invalid",
+                "error": (
+                    f"`,loop {lower_first}` 不接受额外参数；关闭请仅输入 `,loop off`，"
+                    f"启动请用 `,loop [1-{MAX_LOOP_WAVES}] [目标]`。"
+                ),
+            }
+        return {"action": "off"}
+    if _is_ascii_int_literal(first):
+        waves = int(first)
+        if 1 <= waves <= MAX_LOOP_WAVES:
+            return {"action": "start", "max_waves": waves, "goal": rest}
+        return {
+            "action": "invalid",
+            "error": (
+                f"波次上限必须在 1..{MAX_LOOP_WAVES} 之间（收到 `{first}`）；"
+                f"用法：`,loop [1-{MAX_LOOP_WAVES}] [目标]`。"
+            ),
+        }
+    return {"action": "start", "max_waves": DEFAULT_LOOP_WAVES, "goal": arg}
+
+
+def _active_loop(state: dict[str, Any]) -> dict[str, Any] | None:
+    loop = state.get("loop")
+    if not isinstance(loop, dict):
+        return None
+    wave = loop.get("wave")
+    max_waves = loop.get("max_waves")
+    if (
+        isinstance(wave, bool)
+        or not isinstance(wave, int)
+        or wave < 1
+        or isinstance(max_waves, bool)
+        or not isinstance(max_waves, int)
+        or not 1 <= max_waves <= MAX_LOOP_WAVES
+    ):
+        return None
+    return loop
+
+
+def _render_re_review_prompt(focus: str) -> str:
+    focus_clause = f"\n- 补充聚焦：{focus}" if focus else ""
+    return (
+        "【Pilot 单波次主题复审 `,rr` 展开】\n"
+        "请立即锚定本会话最初的核心主题与 Anchor 0，基于当前最新代码或运行态做一轮完整穿透复审（不要复述历史流水账）："
+        f"{focus_clause}\n"
+        "1. 对照 Anchor 0、改动后模块全貌与实际行为，逐项核查是否仍存在实质架构、边界、状态机、契约或工程质量问题。\n"
+        "2. 若发现实质问题：按既有四阶段流程推进（通过 `plan-and-orchestrate`、`gate=auto` 完成本单波次方案、实施、复审、交付与收尾），本波次结束后停下汇报。\n"
+        '3. 若确认无实质问题或仅剩极轻边角微瑕：列出具体核验依据，直接以 `<!-- pilot: {"scene": "NONE"} -->` 结案。'
+    )
+
+
+def _render_loop_start_prompt(max_waves: int, goal: str) -> str:
+    goal_text = goal or "沿用本会话原始主题与 Anchor 0"
+    return (
+        f"【Pilot 多波收敛 `,loop` 已启动 — 第 1/{max_waves} 波】\n"
+        f"- 锚定目标：{goal_text}\n"
+        "请基于当前最新代码或运行态开启第 1 波完整穿透审查与收敛（不要复述历史流水账）：\n"
+        '1. 派发 Orca 子工作区等待唤醒或等待外部回复时，照常输出 `<!-- pilot: {"scene": "NONE"} -->`（保留循环状态）；遇需用户拍板的 B 类决策时主动调用 `ask_question`。\n'
+        '2. 确认已无实质问题或仅剩极轻边角微瑕，或本波已达末波完成收尾时，列出依据并输出 `<!-- pilot: {"scene": "NONE", "loop": "done"} -->` 结束循环。\n'
+        '3. 本波确有实质改动并完成四阶段收尾且仍有剩余波次时，输出 `<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "开启下一波全量复审与收敛"} -->` 推进下一波。'
+    )
+
+
+def _render_loop_context(loop: dict[str, Any]) -> str:
+    wave = int(loop["wave"])
+    max_waves = int(loop["max_waves"])
+    goal = str(loop.get("goal") or "").strip() or "沿用本会话原始主题与 Anchor 0"
+    if wave >= max_waves:
+        exit_rule = (
+            "本波为最终波次：完成收尾或确认无实质问题/仅剩极轻边角微瑕时，"
+            '必须输出 `{"scene": "NONE", "loop": "done"}` 结束循环。'
+        )
+    else:
+        exit_rule = (
+            '确认无实质问题或仅剩极轻边角微瑕时输出 `{"scene": "NONE", "loop": "done"}`；'
+            "本波有实质改动并完成收尾且仍有剩余波次时输出 "
+            '`{"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "..."}` 推进下一波。'
+        )
+    return (
+        "<pilot_loop_context>\n"
+        f"多波收敛进行中：第 {wave}/{max_waves} 波；锚定目标：{goal}。\n"
+        f'等待子会话唤醒或外部回复照常输出 `{{"scene": "NONE"}}`（保留循环状态）；{exit_rule}\n'
+        "</pilot_loop_context>"
+    )
 
 
 def is_comma_alias(value: str) -> bool:
@@ -1394,6 +1519,9 @@ def parse_suggestion(text: str) -> dict[str, Any]:
     scene = values.get("scene") or values.get("stage") or ""
     gate = (values.get("gate") or values.get("action") or "").lower()
     next_value = (values.get("next") or "").upper()
+    loop_value = (values.get("loop") or "").lower()
+    if loop_value and loop_value not in LOOP_TAG_VALUES:
+        return _invalid_suggestion("invalid_loop")
     if scene.upper() in {"NONE", "SKIP", "WAIT", "WAITING_USER", "ASK_QUESTION"}:
         scene = "NONE"
     elif next_value in {"NONE", "SKIP", "WAIT", "ASK_QUESTION"}:
@@ -1402,12 +1530,17 @@ def parse_suggestion(text: str) -> dict[str, Any]:
         return _invalid_suggestion("missing_scene")
     elif gate not in {"auto", "pause"}:
         return _invalid_suggestion("invalid_gate")
+    if loop_value == "done" and scene != "NONE":
+        return _invalid_suggestion("conflicting_loop")
+    if loop_value == "next" and scene != "plan-and-orchestrate":
+        return _invalid_suggestion("conflicting_loop")
     if scene == "NONE":
         return {
             "scene": scene,
             "prompt": "",
             "alternatives": [],
             "gate": gate,
+            "loop": loop_value,
             "invalid": "",
         }
 
@@ -1430,6 +1563,7 @@ def parse_suggestion(text: str) -> dict[str, Any]:
         "prompt": primary,
         "alternatives": alternatives,
         "gate": gate,
+        "loop": loop_value,
         "invalid": "",
     }
 
@@ -1440,6 +1574,7 @@ def _invalid_suggestion(reason: str) -> dict[str, Any]:
         "prompt": "",
         "alternatives": [],
         "gate": "",
+        "loop": "",
         "invalid": reason,
     }
 
@@ -2286,6 +2421,9 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         return reexec_output
     worker_target = worker_command_target(text)
     mode_target = _named_command(text, {"mode"}, {"gate", "confirm", "off", "status"})
+    is_rr, rr_focus = parse_re_review_command(text)
+    loop_cmd = parse_loop_command(text)
+    is_control_cmd = bool(worker_target or mode_target or is_rr or loop_cmd is not None)
     config, config_status, config_err = load_config()
     profile, profile_status, profile_err = load_profile()
     if config is not None and profile is not None:
@@ -2396,6 +2534,31 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["candidates"] = []
         state["candidate_turn_id"] = ""
 
+        candidate, note = _command_parts(text, comma=True)
+        first_candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else None
+        if (
+            not is_control_cmd
+            and first_candidate is not None
+            and first_candidate.get("loop_next") is True
+            and (
+                not manual_input
+                or candidate == "1"
+                or (
+                    bool(first_candidate.get("prompt"))
+                    and text == str(first_candidate.get("prompt") or "")
+                )
+            )
+        ):
+            active_loop = _active_loop(state)
+            if active_loop is not None and active_loop["wave"] < active_loop["max_waves"]:
+                active_loop["wave"] += 1
+                log_event(
+                    "loop_wave_advanced",
+                    cid=conversation_id,
+                    wave=active_loop["wave"],
+                    max_waves=active_loop["max_waves"],
+                )
+
         if worker_target:
             if worker_target == "status":
                 message = worker_priority(cur_workers, cur_models)
@@ -2434,8 +2597,106 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
                 log_event("pre_state_save_failed", cid=conversation_id)
             return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
 
+        if is_rr:
+            if state.pop("loop", None) is not None:
+                log_event("loop_cleared_by_rr", cid=conversation_id)
+            message = _render_re_review_prompt(rr_focus)
+            if not save_state(conversation_id, state):
+                log_event("pre_state_save_failed", cid=conversation_id)
+            log_event("rr_expanded", cid=conversation_id, has_focus=bool(rr_focus))
+            return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
+
+        if loop_cmd is not None:
+            action = loop_cmd["action"]
+            if action == "invalid":
+                message = (
+                    f"【Pilot 循环命令无效】{loop_cmd['error']}"
+                    ' 请仅用一句话告知用户，无需调用工具，并以 <!-- pilot: {"scene": "NONE"} --> 结尾。'
+                )
+            elif action == "status":
+                active_loop = _active_loop(state)
+                mode_now = current_mode(profile)
+                if active_loop is None:
+                    status_text = f"当前会话未开启多波收敛循环（可用 `,loop [1-{MAX_LOOP_WAVES}] [目标]` 启动）。"
+                else:
+                    goal_text = str(active_loop.get("goal") or "").strip() or "沿用本会话原始主题与 Anchor 0"
+                    paused_note = (
+                        "；当前 Pilot 模式为 `off`，循环已暂停（请先 `,mode gate` 或 `,mode confirm`）"
+                        if mode_now == "off"
+                        else ""
+                    )
+                    status_text = (
+                        f"当前处于第 {active_loop['wave']}/{active_loop['max_waves']} 波，"
+                        f"锚定目标：{goal_text}{paused_note}。"
+                    )
+                message = (
+                    f"【Pilot 多波收敛状态】{status_text}"
+                    ' 请仅用一句话告知用户，无需调用工具，并以 <!-- pilot: {"scene": "NONE"} --> 结尾。'
+                )
+            elif action == "off":
+                had_loop = state.pop("loop", None) is not None
+                log_event("loop_stopped", cid=conversation_id, had_loop=had_loop)
+                status_text = (
+                    "已关闭当前会话的多波收敛循环。"
+                    if had_loop
+                    else "当前会话原本未开启多波收敛循环。"
+                )
+                message = (
+                    f"【Pilot 多波收敛已关闭】{status_text}"
+                    ' 请仅用一句话告知用户，无需调用工具，并以 <!-- pilot: {"scene": "NONE"} --> 结尾。'
+                )
+            else:
+                mode_now = current_mode(profile)
+                if mode_now == "off" or "plan-and-orchestrate" not in scenes:
+                    reasons: list[str] = []
+                    if mode_now == "off":
+                        reasons.append("当前模式为 `off`（请先执行 `,mode gate` 或 `,mode confirm`）")
+                    if "plan-and-orchestrate" not in scenes:
+                        reasons.append("未启用 `plan-and-orchestrate` 场景")
+                    log_event(
+                        "loop_start_rejected",
+                        cid=conversation_id,
+                        mode=mode_now,
+                        has_plan_scene="plan-and-orchestrate" in scenes,
+                    )
+                    message = (
+                        f"【Pilot 多波收敛未启动】{'且'.join(reasons)}，已拒绝武装循环。"
+                        ' 请仅用一句话告知用户，无需调用工具，并以 <!-- pilot: {"scene": "NONE"} --> 结尾。'
+                    )
+                else:
+                    max_waves = int(loop_cmd["max_waves"])
+                    goal = str(loop_cmd["goal"] or "")
+                    state["loop"] = {
+                        "wave": 1,
+                        "max_waves": max_waves,
+                        "goal": goal,
+                        "announced_wave": 1,
+                        "context_checkpoint": last_checkpoint,
+                    }
+                    log_event(
+                        "loop_started",
+                        cid=conversation_id,
+                        max_waves=max_waves,
+                        has_goal=bool(goal),
+                    )
+                    message = _render_loop_start_prompt(max_waves, goal)
+            if not save_state(conversation_id, state):
+                log_event("pre_state_save_failed", cid=conversation_id)
+            return injection("\n\n".join(p for p in (worker_reload_msg, message) if p))
+
+        loop_context_msg = ""
+        active_loop = _active_loop(state)
+        if active_loop is not None:
+            announced_wave = active_loop.get("announced_wave")
+            context_checkpoint = active_loop.get("context_checkpoint", -1)
+            if not isinstance(context_checkpoint, int) or isinstance(context_checkpoint, bool):
+                context_checkpoint = -1
+            if active_loop["wave"] != announced_wave or last_checkpoint > context_checkpoint:
+                loop_context_msg = _render_loop_context(active_loop)
+                active_loop["announced_wave"] = active_loop["wave"]
+                active_loop["context_checkpoint"] = last_checkpoint
+
         message = ""
-        candidate, note = _command_parts(text, comma=True)
         if candidate in {"1", "2", "3"}:
             selected = int(candidate)
             chosen = next(
@@ -2492,7 +2753,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
 
         if not save_state(conversation_id, state):
             log_event("pre_state_save_failed", cid=conversation_id)
-        message = "\n\n".join(p for p in (worker_reload_msg, message) if p)
+        message = "\n\n".join(p for p in (worker_reload_msg, loop_context_msg, message) if p)
         return injection(message) if message else {}
 
 
@@ -2845,6 +3106,13 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
 
         scene = str(parsed["scene"])
         primary = str(parsed["prompt"])
+        loop_signal = str(parsed.get("loop") or "")
+        if loop_signal == "done":
+            had_loop = state.pop("loop", None) is not None
+            clear_suggestion(state)
+            save_state(conversation_id, state)
+            log_event("loop_completed", cid=conversation_id, had_loop=had_loop)
+            return {"decision": "allow"}, OSC_7501_DONE
         if not primary or scene == "NONE":
             clear_suggestion(state)
             save_state(conversation_id, state)
@@ -2859,9 +3127,42 @@ def _evaluate_stop(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         mode, gate, auto_submit = _admit_auto_submit_policy(
             profile, scenes, scene=scene, gate_action=gate_action, previous_count=previous_count,
         )
-        handle = resolve_terminal(workspace_path, explicit_handle) if scene in scenes and mode != "off" else ""
+        if scene not in scenes or mode == "off":
+            clear_suggestion(state)
+            save_state(conversation_id, state)
+            event = "stop_without_suggestion" if scene not in scenes else "stop_mode_off"
+            log_event(event, cid=conversation_id, scene=scene)
+            return {"decision": "allow"}, OSC_7501_DONE
 
-        candidates = [{"index": 1, "scene": scene, "prompt": primary}]
+        if loop_signal == "next":
+            active_loop = _active_loop(state)
+            if active_loop is None:
+                state.pop("loop", None)
+                clear_suggestion(state)
+                save_state(conversation_id, state)
+                log_event("loop_inactive", cid=conversation_id, scene=scene)
+                return {"decision": "allow"}, OSC_7501_DONE
+            if active_loop["wave"] >= active_loop["max_waves"]:
+                wave = active_loop["wave"]
+                max_waves = active_loop["max_waves"]
+                state.pop("loop", None)
+                clear_suggestion(state)
+                save_state(conversation_id, state)
+                log_event(
+                    "loop_budget_exhausted",
+                    cid=conversation_id,
+                    scene=scene,
+                    wave=wave,
+                    max_waves=max_waves,
+                )
+                return {"decision": "allow"}, OSC_7501_DONE
+
+        handle = resolve_terminal(workspace_path, explicit_handle)
+
+        primary_candidate: dict[str, Any] = {"index": 1, "scene": scene, "prompt": primary}
+        if loop_signal == "next":
+            primary_candidate["loop_next"] = True
+        candidates = [primary_candidate]
         candidates.extend(
             {"index": int(item["index"]), "scene": scene, "prompt": item["prompt"]}
             for item in parsed["alternatives"]

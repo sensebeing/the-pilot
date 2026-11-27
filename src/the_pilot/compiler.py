@@ -359,10 +359,9 @@ def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
     max_turns = profile["pilot"]["max_consecutive_auto_turns"]
     if scene_count:
         routing = (
-            f"回合结束按下方 {scene_count} 个场景路由"
-            "（需等外部输入或已结案则输出 `scene=NONE`），构造"
-            "**一句自然、贴合上下文、不重复已完成动作**的下一步指令"
-            "（展示与预填同源）。"
+            f"按下方 {scene_count} 个场景路由"
+            "（等外部输入或结案输出 `scene=NONE`），构造"
+            "**一句贴合上下文、不重复已完成动作**的下一步指令。"
         )
     else:
         routing = (
@@ -371,20 +370,19 @@ def render_pilot_section(profile: dict[str, Any], scene_count: int) -> str:
         )
     return f"""## 个人研发状态机与 Turn Pilot 规范（Agent 单一语义 Owner 三步判断模型）
 
-仅对**主会话（Coordinator，无 Orca Task ID / Dispatch ID preamble）**生效，子会话忽略。模式真源 `profile.json`，用 `,mode status|gate|confirm|off` 切换；`gate` 连续自动推进上限 {max_turns} 轮。引擎仅预填与回车，**主会话裁决意图、场景与 `gate=auto|pause`**：
+仅对**主会话（无 Orca Task/Dispatch ID preamble）**生效，子会话忽略。模式真源 `profile.json`（`,mode status|gate|confirm|off`，`gate` 上限 {max_turns} 轮）；**主会话裁决意图、场景与 `gate=auto|pause`**：
 
 1. **第一步：任务性质二分类**：
-   - **前置铁律**：先查同链路近 7~14 天修复史与端到端拓扑，判断唯一 owner 和最简根治路径；复发不得叠黑白名单、局部重试或表象补丁。
-   - **A 类 — 确定性收敛**：正确行为与边界已由产品设计、模块契约、仓库工程门禁、事实或当前明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界；含内部根因修复、授权内冗余清理、工具回执、并发/超时及质量收敛。`gate=auto` 按实际进度逐步推进（定位 → 出详细方案 → 方案级架构 review → 编排实施），不得跳过方案设计或方案复审，不重复提问。
-   - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按当前仓库的 AGENTS.md 与最简架构规则说明不变量与替代保护，最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；所有进度均沿用此边界：B 类方案/裁决未确认标 `gate=pause`，已确认边界内 `gate=auto` 单步递进，prod 发布、未授权真实 E2E 除外。
-   - **简化边界**：历史提交/合同不能豁免最简架构；说明不变量、复发成因及唯一 owner 的替代保护，授权边界按 A/B 分类，不重复裁决。
-2. **第二步：场景与 Prompt（真源 `~/.gemini/config/the-pilot/scenes/*.md`）**：{routing}
-3. **第三步：正文可见建议与唯一隐藏标签**：正文必须显示 `- **,1（主推）**：<主推文本>`，可选 `- **,2（备选）**：<备选文本>`、`- **,3（备选）**：<备选文本>`，不可只藏在注释里。
-   - 正文仅供阅读；回复末尾唯一 JSON 标签是执行真源，由 `json.loads` 解析：`<!-- pilot: {{"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"}} -->`（无备选时省略 "2"）。主推非空；候选只读标签，不解析或交叉校验 Markdown；文本须合法 JSON 转义。
-   - 场景缺失/未知/多标签或 gate 缺失/非法则暂停；标签非法、重复或字段冲突则清空建议。`gate=auto` 仅在场景默认 auto 且为 A 类或已确认边界内的 B 类时使用；B 类方案未确认或需人工确认时标 `gate=pause`。异步提问未答或结案输出 `<!-- pilot: {{"scene": "NONE"}} -->`（兼容 `<!-- pilot: scene=NONE -->`）。
-   - 暂停/确认时可输入 `,1 [补充说明]` 触发主推，与 `,2 [补充说明]` 对称。
+   - **前置铁律**：先查同链路近 7~14 天修复史与端到端拓扑，定位唯一 owner 与最简根治；复发禁叠黑白名单、局部重试或补丁。
+   - **A 类 — 确定性收敛**：行为边界已由设计、契约、工程门禁、事实或明确授权唯一决定，不改变未获授权的安全门禁或跨模块/外部合同边界（含根因修复、冗余清理、回执/并发/超时及质量收敛）。`gate=auto` 逐步推进（定位 → 出详细方案 → 方案级架构 review → 编排实施），不得跳过方案设计或方案复审，不重复提问。
+   - **B 类 — 方案与设计裁决**：0→1 新功能/机制/工作流、未定义产品/交互取舍，或未经确认改变安全门禁、内部跨模块/外部合同及状态机边界。按当前仓库 AGENTS.md 与最简架构规则主动澄清：讲清背景、利弊对比、不变量、替代保护与推荐理由（禁纯文本列选项停在 `gate=pause` 等催促），最简方案置首标 `(Recommended)`，同步澄清直接调 `ask_question`（同一步不写标签，禁止停在悬空 `：`），异步`提问未答`输出 `scene=NONE`；所有进度均沿用此边界：B 类方案/裁决未确认标 `gate=pause`，已确认边界内 `gate=auto` 单步递进，prod 发布、未授权真实 E2E 除外。
+   - **简化边界**：历史提交/合同不豁免最简架构；讲清不变量与唯一 owner 替代保护，授权按 A/B 分类不重复裁决。
+2. **第二步：场景与 Prompt（真源 `scenes/*.md`）**：{routing}
+3. **第三步：可见建议与唯一隐藏标签**：正文显示 `- **,1（主推）**：<主推>`，可选 `- **,2（备选）**：<备选>`/`- **,3（备选）**：<备选>`。
+   - 末尾唯一 JSON 标签是执行真源（`json.loads` 解析）：`<!-- pilot: {{"scene": "<场景>", "gate": "auto|pause", "1": "<主推>", "2": "<备选>"}} -->`（主推非空，无备选省 "2"，非法/多标签/冲突清空建议）。`gate=auto` 仅用于默认 auto 的 A 类或已确认 B 类；未确认 B 类标 `gate=pause`。异步提问未答或结案输出 `<!-- pilot: {{"scene": "NONE"}} -->`（兼容 `scene=NONE`）；暂停时 `,1`/`,2 [补充]` 触发候选。
+   - `,rr [聚焦]` 单波次复审并清循环；`,loop [1-5] [目标]`（默认 3，含 `status`/`off`）有界多波收敛，标签可附 `"loop": "next"|"done"`（等唤醒 `scene=NONE` 保留循环；清零/微瑕/末波 `"scene":"NONE","loop":"done"`；有实质改动收尾且有余波 `plan-and-orchestrate`+`"loop":"next"`，运行时硬限）。
 
-场景全文真源 `scenes/*.md`；改动后 `pilot sync`。"""
+场景真源 `scenes/*.md`；改动后 `pilot sync`。"""
 
 
 def render_scenes_block(scenes: dict[str, str]) -> str:

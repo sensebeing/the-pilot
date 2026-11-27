@@ -27,7 +27,11 @@ The project overlay stays in the repository.
 - `scenes`: enabled scenes, delivery strategy, and additional guardrails.
   Repository runbooks and current authorization govern external sends.
 - `shortcuts`: enabled built-in entries, custom entries, custom comma commands,
-  template overrides keyed by entry, alias or command identity.
+  template overrides keyed by entry, alias or command identity. Reserved built-in
+  comma commands (`,1`–`,3`, `,mode`, `,worker`, `,agent`, `,pilot`, `,autopilot`,
+  `,rr`, `,loop`) cannot be overridden by personal profiles or `.pilot/project.json`.
+  `,rr [focus]` runs a single-wave Anchor 0 re-review; `,loop [1-5] [goal]` arms
+  bounded multi-wave convergence (default `3`, controlled via `,loop status` / `,loop off`).
 
 The recommended preset enables gate mode, eight turns, four scenes, and four
 universal entries. The conservative preset uses confirm mode and four turns.
@@ -40,10 +44,11 @@ JSON, a file, or `@file`, and explicitly replaces installed preferences;
 installed `profile.json`. `--upgrade` requires an installed `profile.json` and
 cannot be combined with `--preset` or `--profile`. Run `pilot set` inside the
 workspace to change a repository shortcut's personal template. That preference
-applies when the workspace supplies the shortcut. Use
-`pilot distill --days 7 --json` (see [distillation-guide.md](distillation-guide.md))
+applies when the workspace supplies the shortcut. Use `pilot distill --days 7 --json` (see [distillation-guide.md](distillation-guide.md))
 to discover repeated user prompt patterns across local coding agents before
-proposing custom shortcuts or scene guardrails.
+proposing custom shortcuts or scene guardrails; distillation filters machine-generated
+orchestration, account-switch recovery, and Dealer inbox messages and counts built-in
+`,rr` / `,loop` usage under `pilot_activity`.
 
 Set worker launch preferences with repeatable `--worker-model` flags. For example,
 `pilot apply --worker-agents agy,codex,claude --worker-model agy=gemini-4-neon-high:high`
