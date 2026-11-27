@@ -12,6 +12,8 @@ skill. Inspect `pilot --help` and subcommand help for current argument syntax.
 - `,worker [agy|codex|claude|cc|status]` (alias `,agent`) or `pilot worker <target>`
   changes durable executor priority. Existing sessions load it on the next turn.
 - `,1`, `,2`, `,3 [context]` select the visible next-step candidates.
+- `,rr [focus]` runs a single-wave Anchor 0 re-review in the active main session and clears any active `,loop` state.
+- `,loop [1-5] [goal]` arms bounded multi-wave convergence (default `3` waves, max `5`); `,loop status` inspects progress and `,loop off` (aliases `stop`, `cancel`) disarms it. Loop state persists across ordinary `{"scene": "NONE"}` worker waits and re-injects `<pilot_loop_context>` on wave entry or compaction.
 - `pilot sync` refreshes scene guidance after editing installed scene files.
 - `pilot set <shortcut> <template>` persists a shortcut template preference.
 - `pilot distill [--days 7] [--max-sessions 80] --json` scans the last 7 days of
@@ -30,10 +32,16 @@ question settlement, turn limits and session locking. Visible `,1` / `,2` lines
 are human display only. The single trailing structured JSON comment is the sole
 execution source, parsed with `json.loads`:
 `<!-- pilot: {"scene": "<场景名>", "gate": "auto|pause", "1": "<主推文本>", "2": "<备选文本>"} -->`.
-Omit optional alternatives when absent. For no next step, use
+Omit optional alternatives when absent. When `,loop` is active, the tag may include
+`"loop": "next"` (only with `"scene": "plan-and-orchestrate"`) to advance to the
+next wave under the runtime's hard wave cap, or `"loop": "done"` (only with
+`"scene": "NONE"`) to finish convergence and clear loop state. For no next step, use
 `<!-- pilot: {"scene": "NONE"} -->` (the `scene=NONE` shorthand and
 pre-rename `<!-- autopilot: ... -->` tags are also accepted). Earlier prose
 and code examples are not candidates.
+When a Class B design or boundary choice needs user approval, proactively call
+`ask_question` with clear context, option trade-offs, and recommendation rationale
+instead of listing options in plain text behind `gate=pause`.
 Do not invent authorization from a scene or change existing write safety gates.
 
 Runtime commands select the installation with `THE_PILOT_GEMINI_DIR`.

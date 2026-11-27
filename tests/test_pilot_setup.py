@@ -31,6 +31,7 @@ from unittest import mock
 from the_pilot import compiler as profile_compiler
 from the_pilot import installer
 from the_pilot.assets import runtime
+from the_pilot.distill import distill_chat_history
 from the_pilot.profile import resolve_profile as resolve_user_profile, normalize_comma_alias
 from the_pilot.defaults import DEFAULT_SPECS, DELIVER_STRATEGIES, HARNESS_ORCHESTRATION_SENTENCE
 from the_pilot.project import ProfileError
@@ -6484,6 +6485,726 @@ class GlobalGuidanceTest(unittest.TestCase):
             )
         report = json.loads(run_setup_default(self.root, "status").stdout)
         self.assertEqual(report["drift"], [], report["drift"])
+
+
+class LoopAndReReviewTest(unittest.TestCase):
+    """Contracts for `,rr`, bounded `,loop`, proactive B-class guidance, and distill filtering."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+        self.gemini = self.root / "gemini"
+        self.state = self.root / "state"
+        self.workspace = self.root / "ws"
+        write_json(self.workspace / ".pilot/project.json", PROJECT)
+        fake_orca(self.root)
+        apply_profile(self.root, self.gemini, "--preset", "recommended")
+
+    def pre(
+        self,
+        conversation_id: str,
+        text: str,
+        *,
+        steps: list[dict] | None = None,
+        extra_env: dict | None = None,
+    ) -> subprocess.CompletedProcess:
+        transcript = write_transcript(
+            self.root,
+            f"transcript-{conversation_id}.jsonl",
+            steps or [{"type": "USER_INPUT", "content": text}],
+            append=True,
+        )
+        return run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "PreInvocation",
+            stdin=payload(
+                conversation_id,
+                lastUserInput=text,
+                transcriptPath=str(transcript),
+                workspacePaths=[str(self.workspace)],
+            ),
+            extra_env=extra_env,
+        )
+
+    def stop(
+        self,
+        conversation_id: str,
+        text: str,
+        *,
+        extra_env: dict | None = None,
+    ) -> subprocess.CompletedProcess:
+        transcript = write_transcript(
+            self.root,
+            f"transcript-{conversation_id}.jsonl",
+            [{"type": "PLANNER_RESPONSE", "content": text}],
+            append=True,
+        )
+        return run_engine(
+            self.root,
+            self.gemini,
+            self.state,
+            "hook",
+            "--event",
+            "Stop",
+            stdin=payload(
+                conversation_id,
+                transcriptPath=str(transcript),
+                terminationReason="NO_TOOL_CALL",
+                fullyIdle=True,
+                workspacePaths=[str(self.workspace)],
+            ),
+            extra_env=extra_env,
+        )
+
+    def injection(self, result: subprocess.CompletedProcess) -> str:
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(result.stdout or "{}")
+        steps = body.get("injectSteps") or []
+        return steps[0].get("ephemeralMessage", "") if steps else ""
+
+    def log_events(self) -> list[dict]:
+        log_file = self.state / "pilot.log"
+        if not log_file.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def test_rr_expands_single_wave_clears_loop_and_reserves_aliases(self) -> None:
+        # Failure means `,rr` stops anchoring single-wave re-review, leaves a
+        # stale loop armed, or allows profiles/overlays to hijack `,rr`/`,loop`.
+        cid = "rr-clear-loop"
+        arm = self.injection(self.pre(cid, ",loop 3 瘦身"))
+        self.assertIn("第 1/3 波", arm)
+        self.assertEqual(read_state(self.state, cid)["loop"]["max_waves"], 3)
+
+        bare = self.injection(self.pre(cid, ",rr"))
+        self.assertIn("单波次主题复审", bare)
+        self.assertIn("Anchor 0", bare)
+        self.assertNotIn("补充聚焦", bare)
+        self.assertNotIn("loop", read_state(self.state, cid))
+
+        focused = self.injection(self.pre(cid, ",RR 聚焦 schema 边界"))
+        self.assertIn("单波次主题复审", focused)
+        self.assertIn("补充聚焦：聚焦 schema 边界", focused)
+        events = [item["event"] for item in self.log_events() if item.get("cid") == cid]
+        self.assertIn("loop_cleared_by_rr", events)
+        self.assertEqual(events.count("rr_expanded"), 2)
+
+        base = load_default_profile()
+        for reserved in ("rr", "loop"):
+            with self.subTest(reserved=reserved):
+                with self.assertRaises(ProfileError):
+                    resolve_user_profile(
+                        base,
+                        overrides={"shortcuts": {"enabled_entry": [reserved]}},
+                    )
+                with self.assertRaises(ProfileError):
+                    resolve_user_profile(
+                        base,
+                        overrides={
+                            "shortcuts": {
+                                "custom_entry": {
+                                    reserved: {
+                                        "command_id": f"CMD_TEST_{reserved.upper()}",
+                                        "description": "bad",
+                                        "requires_arg": False,
+                                        "usage": reserved,
+                                        "template": "bad",
+                                    }
+                                }
+                            }
+                        },
+                    )
+                with self.assertRaises(ProfileError):
+                    resolve_user_profile(
+                        base,
+                        overrides={
+                            "shortcuts": {
+                                "custom_comma": {
+                                    reserved: {
+                                        "command_id": f"CMD_COMMA_{reserved.upper()}",
+                                        "aliases": [f",{reserved}"],
+                                        "scene": "",
+                                        "title": "bad",
+                                        "template": "bad",
+                                    }
+                                }
+                            }
+                        },
+                    )
+                with self.assertRaises(ValueError):
+                    runtime.validate_project_entries(
+                        {
+                            "schema": runtime.PROJECT_SCHEMA,
+                            "projectId": "demo",
+                            "entry_order": [reserved],
+                            "entry_specs": {
+                                reserved: {
+                                    "command_id": f"CMD_PROJ_{reserved.upper()}",
+                                    "description": "bad",
+                                    "requires_arg": False,
+                                    "usage": reserved,
+                                    "template": "bad",
+                                }
+                            },
+                        }
+                    )
+
+    def test_loop_command_parsing_and_fail_closed_boundaries(self) -> None:
+        # Failure means out-of-range wave counts, trailing garbage on control
+        # verbs, or disabled mode/scene silently arm an unbounded or broken loop.
+        self.assertEqual(runtime.parse_re_review_command(",rr"), (True, ""))
+        self.assertEqual(runtime.parse_re_review_command(",RR 查锁"), (True, "查锁"))
+        self.assertEqual(runtime.parse_re_review_command(",rr-x"), (False, ""))
+        self.assertEqual(runtime.parse_re_review_command("rr"), (False, ""))
+
+        self.assertEqual(
+            runtime.parse_loop_command(",loop"),
+            {"action": "start", "max_waves": 3, "goal": ""},
+        )
+        self.assertEqual(
+            runtime.parse_loop_command(",LOOP 5 清理旧概念"),
+            {"action": "start", "max_waves": 5, "goal": "清理旧概念"},
+        )
+        self.assertEqual(
+            runtime.parse_loop_command(",loop +2"),
+            {"action": "start", "max_waves": 2, "goal": ""},
+        )
+        self.assertEqual(
+            runtime.parse_loop_command(",loop 收敛状态机"),
+            {"action": "start", "max_waves": 3, "goal": "收敛状态机"},
+        )
+        self.assertEqual(runtime.parse_loop_command(",loop status"), {"action": "status"})
+        for verb in ("off", "stop", "cancel"):
+            self.assertEqual(runtime.parse_loop_command(f",loop {verb}"), {"action": "off"})
+        for bad in (
+            ",loop 0",
+            ",loop -1",
+            ",loop 6",
+            ",loop 99",
+            ",loop 0 目标",
+            ",loop status extra",
+            ",loop off extra",
+            ",loop stop now",
+            ",loop cancel all",
+        ):
+            parsed = runtime.parse_loop_command(bad)
+            self.assertIsNotNone(parsed, bad)
+            self.assertEqual(parsed["action"], "invalid", bad)
+        self.assertIsNone(runtime.parse_loop_command(",looping"))
+        self.assertIsNone(runtime.parse_loop_command("loop 2"))
+
+        cid = "loop-boundaries"
+        status_idle = self.injection(self.pre(cid, ",loop status"))
+        self.assertIn("未开启", status_idle)
+        self.assertNotIn("loop", read_state(self.state, cid))
+
+        arm = self.injection(self.pre(cid, ",loop 2 瘦身 prompts"))
+        self.assertIn("第 1/2 波", arm)
+        self.assertIn("瘦身 prompts", arm)
+        armed_loop = read_state(self.state, cid)["loop"]
+        self.assertEqual(armed_loop["wave"], 1)
+        self.assertEqual(armed_loop["max_waves"], 2)
+        self.assertEqual(armed_loop["goal"], "瘦身 prompts")
+
+        # Invalid commands must fail closed without mutating the armed loop.
+        for bad in (",loop 0", ",loop 6", ",loop off extra", ",loop status extra"):
+            msg = self.injection(self.pre(cid, bad))
+            self.assertIn("循环命令无效", msg)
+            self.assertEqual(read_state(self.state, cid)["loop"], armed_loop)
+
+        # In mode=off, status notes pause, Stop preserves loop, and new arm fails closed.
+        self.assertEqual(
+            run_engine(self.root, self.gemini, self.state, "mode", "off").returncode, 0
+        )
+        paused_status = self.injection(self.pre(cid, ",loop status"))
+        self.assertIn("第 1/2 波", paused_status)
+        self.assertIn("已暂停", paused_status)
+        stop_off = self.stop(
+            cid,
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "下一波"} -->',
+        )
+        self.assertEqual(stop_off.returncode, 0, stop_off.stderr)
+        self.assertEqual(read_state(self.state, cid)["loop"], armed_loop)
+        self.assertEqual(send_calls(self.root), [])
+
+        # Disarming works via stop/cancel/off.
+        off_msg = self.injection(self.pre(cid, ",loop cancel"))
+        self.assertIn("已关闭", off_msg)
+        self.assertNotIn("loop", read_state(self.state, cid))
+
+        # Arming while mode=off fails closed.
+        rejected_off = self.injection(self.pre(cid, ",loop 2"))
+        self.assertIn("未启动", rejected_off)
+        self.assertNotIn("loop", read_state(self.state, cid))
+
+        # Arming without `plan-and-orchestrate` scene fails closed.
+        self.assertEqual(
+            run_engine(self.root, self.gemini, self.state, "mode", "gate").returncode, 0
+        )
+        (self.gemini / SCENES_REL / "01-plan-and-orchestrate.md").unlink()
+        rejected_scene = self.injection(self.pre(cid, ",loop 2"))
+        self.assertIn("plan-and-orchestrate", rejected_scene)
+        self.assertNotIn("loop", read_state(self.state, cid))
+
+    def test_parse_suggestion_validates_loop_field_fail_closed(self) -> None:
+        # Failure means invalid or conflicting `"loop"` tag values can trigger
+        # unintended wave advancement or silent loop termination.
+        done = runtime.parse_suggestion('完成。\n<!-- pilot: {"scene": "NONE", "loop": "done"} -->')
+        self.assertEqual(done["invalid"], "")
+        self.assertEqual(done["scene"], "NONE")
+        self.assertEqual(done["loop"], "done")
+
+        nxt = runtime.parse_suggestion(
+            '下波。\n<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "1": "第 2 波", "loop": "next"} -->'
+        )
+        self.assertEqual(nxt["invalid"], "")
+        self.assertEqual(nxt["scene"], "plan-and-orchestrate")
+        self.assertEqual(nxt["loop"], "next")
+
+        empty_loop = runtime.parse_suggestion(
+            '常规。\n<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "1": "常规推进", "loop": ""} -->'
+        )
+        self.assertEqual(empty_loop["invalid"], "")
+        self.assertEqual(empty_loop["loop"], "")
+
+        for bad_val in ("bad", "continue", "stop"):
+            parsed = runtime.parse_suggestion(
+                f'<!-- pilot: {{"scene": "NONE", "loop": "{bad_val}"}} -->'
+            )
+            self.assertEqual(parsed["invalid"], "invalid_loop", bad_val)
+
+        for tag, expected in (
+            ('{"scene": "NONE", "loop": "next"}', "conflicting_loop"),
+            (
+                '{"scene": "closeout-and-sync", "gate": "auto", "1": "x", "loop": "next"}',
+                "conflicting_loop",
+            ),
+            (
+                '{"scene": "architecture-re-review", "gate": "auto", "1": "x", "loop": "next"}',
+                "conflicting_loop",
+            ),
+            (
+                '{"scene": "plan-and-orchestrate", "gate": "auto", "1": "x", "loop": "done"}',
+                "conflicting_loop",
+            ),
+            (
+                '{"scene": "closeout-and-sync", "gate": "auto", "1": "x", "loop": "done"}',
+                "conflicting_loop",
+            ),
+        ):
+            parsed = runtime.parse_suggestion(f"<!-- pilot: {tag} -->")
+            self.assertEqual(parsed["invalid"], expected, tag)
+
+    def test_multi_wave_loop_lifecycle_hard_cap_compaction_and_early_done(self) -> None:
+        # Failure means Orca worker waits erase loop state, Stop burns waves
+        # before a turn starts, compaction loses loop context, or the hard cap
+        # fails to stop an over-budget `"loop": "next"`.
+        cid = "loop-lifecycle"
+        osc_log = self.root / "osc.log"
+        osc_env = {"THE_PILOT_OSC_TARGET": str(osc_log)}
+
+        # 1. Arm Wave 1/2.
+        start_msg = self.injection(self.pre(cid, ",loop 2 瘦身架构", extra_env=osc_env))
+        self.assertIn("第 1/2 波", start_msg)
+
+        # 2. Ordinary `scene=NONE` (e.g., waiting on Orca worker) preserves loop state.
+        res_wait = self.stop(cid, '已派发 worker。\n<!-- pilot: {"scene": "NONE"} -->', extra_env=osc_env)
+        self.assertEqual(res_wait.returncode, 0, res_wait.stderr)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+
+        # 3. Worker wake-up turn without compaction neither advances wave nor spams context.
+        wake_msg = self.injection(self.pre(cid, "worker 已回报，请评审", extra_env=osc_env))
+        self.assertEqual(wake_msg, "")
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+
+        # 4. Rejected `"loop": "next"` delivery must NOT burn a wave.
+        next_prompt = "开启第 2 波全量复审与收敛"
+        next_tag = (
+            f'波次 1 收尾完成。\n<!-- pilot: {{"scene": "plan-and-orchestrate", '
+            f'"gate": "auto", "loop": "next", "1": "{next_prompt}"}} -->'
+        )
+        res_refused = self.stop(
+            cid, next_tag, extra_env={**osc_env, "FAKE_SEND_RESULT": "refused"}
+        )
+        self.assertEqual(res_refused.returncode, 0, res_refused.stderr)
+        state_after_refusal = read_state(self.state, cid)
+        self.assertEqual(state_after_refusal["loop"]["wave"], 1)
+        self.assertTrue(state_after_refusal["candidates"][0]["loop_next"])
+
+        # 5. Accepted `"loop": "next"` in gate mode still does NOT increment wave in Stop.
+        self.pre(cid, "重试本轮收尾", extra_env=osc_env)
+        res_next = self.stop(cid, next_tag, extra_env=osc_env)
+        self.assertEqual(res_next.returncode, 0, res_next.stderr)
+        state_after_stop = read_state(self.state, cid)
+        self.assertEqual(state_after_stop["loop"]["wave"], 1)
+        self.assertTrue(state_after_stop["candidates"][0]["loop_next"])
+        sends_before_cap = len(send_calls(self.root))
+        self.assertEqual(sends_before_cap, 2)  # 1 refused + 1 accepted
+
+        # 6. Entering Wave 2 via PreInvocation atomically advances wave and injects context.
+        wave2_msg = self.injection(self.pre(cid, next_prompt, extra_env=osc_env))
+        self.assertIn("<pilot_loop_context>", wave2_msg)
+        self.assertIn("第 2/2 波", wave2_msg)
+        self.assertIn("瘦身架构", wave2_msg)
+        state_wave2 = read_state(self.state, cid)
+        self.assertEqual(state_wave2["loop"]["wave"], 2)
+        self.assertEqual(state_wave2["loop"]["announced_wave"], 2)
+
+        # 7. Compaction CHECKPOINT triggers `<pilot_loop_context>` re-injection.
+        compact_msg = self.injection(
+            self.pre(
+                cid,
+                "压缩后继续第 2 波",
+                steps=[
+                    {"type": "CHECKPOINT", "content": "compacted"},
+                    {"type": "USER_INPUT", "content": "压缩后继续第 2 波"},
+                ],
+                extra_env=osc_env,
+            )
+        )
+        self.assertIn("<pilot_loop_context>", compact_msg)
+        self.assertIn("第 2/2 波", compact_msg)
+        self.assertGreaterEqual(read_state(self.state, cid)["loop"]["context_checkpoint"], 0)
+
+        # 8. Over-budget `"loop": "next"` at Wave 2/2 is hard-blocked without sending.
+        osc_log.write_text("", encoding="utf-8")
+        res_cap = self.stop(
+            cid,
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "第 3 波"} -->',
+            extra_env=osc_env,
+        )
+        self.assertEqual(res_cap.returncode, 0, res_cap.stderr)
+        self.assertEqual(len(send_calls(self.root)), sends_before_cap)
+        self.assertNotIn("loop", read_state(self.state, cid))
+        self.assertEqual(read_state(self.state, cid)["candidates"], [])
+        self.assertIn(runtime.OSC_7501_DONE, osc_log.read_text(encoding="utf-8"))
+        events = [item["event"] for item in self.log_events() if item.get("cid") == cid]
+        self.assertIn("loop_wave_advanced", events)
+        self.assertIn("loop_budget_exhausted", events)
+
+        # 9. Unarmed `"loop": "next"` is also hard-blocked without sending.
+        self.pre(cid, "未开启循环的一轮", extra_env=osc_env)
+        res_inactive = self.stop(
+            cid,
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "越权推进"} -->',
+            extra_env=osc_env,
+        )
+        self.assertEqual(res_inactive.returncode, 0, res_inactive.stderr)
+        self.assertEqual(len(send_calls(self.root)), sends_before_cap)
+        events = [item["event"] for item in self.log_events() if item.get("cid") == cid]
+        self.assertIn("loop_inactive", events)
+
+        # 10. Early convergence `"loop": "done"` clears loop immediately in every mode.
+        for mode in ("gate", "confirm", "off"):
+            with self.subTest(mode=mode):
+                done_cid = f"loop-done-{mode}"
+                self.assertEqual(
+                    run_engine(self.root, self.gemini, self.state, "mode", "gate").returncode, 0
+                )
+                self.pre(done_cid, ",loop 3 提前收敛", extra_env=osc_env)
+                self.assertIn("loop", read_state(self.state, done_cid))
+                if mode != "gate":
+                    self.assertEqual(
+                        run_engine(self.root, self.gemini, self.state, "mode", mode).returncode, 0
+                    )
+                osc_log.write_text("", encoding="utf-8")
+                res_done = self.stop(
+                    done_cid,
+                    '确认已清零。\n<!-- pilot: {"scene": "NONE", "loop": "done"} -->',
+                    extra_env=osc_env,
+                )
+                self.assertEqual(res_done.returncode, 0, res_done.stderr)
+                self.assertNotIn("loop", read_state(self.state, done_cid))
+                self.assertIn(runtime.OSC_7501_DONE, osc_log.read_text(encoding="utf-8"))
+
+    def test_confirm_mode_loop_next_advances_only_on_selection_or_prefill_submit(self) -> None:
+        # Failure means confirm-mode prefill burns wave budget prematurely or
+        # fails to advance when the user selects `,1` or submits the draft.
+        cid = "loop-confirm"
+        self.assertEqual(
+            run_engine(self.root, self.gemini, self.state, "mode", "confirm").returncode, 0
+        )
+        self.injection(self.pre(cid, ",loop 3 验证 confirm"))
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+
+        draft_1 = "开启第 2 波复审"
+        res_prefill = self.stop(
+            cid,
+            f'<!-- pilot: {{"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "{draft_1}"}} -->',
+        )
+        self.assertEqual(res_prefill.returncode, 0, res_prefill.stderr)
+        self.assertEqual(len(send_calls(self.root)), 1)
+        self.assertNotIn("--enter", send_calls(self.root)[0])
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+        self.assertTrue(read_state(self.state, cid)["candidates"][0]["loop_next"])
+
+        # Unrelated manual input does not burn wave budget.
+        other_msg = self.injection(self.pre(cid, "先看看日志再决定"))
+        self.assertEqual(other_msg, "")
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+
+        # Prefill again, then select `,1` -> advances to Wave 2 and expands candidate.
+        self.stop(
+            cid,
+            f'<!-- pilot: {{"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "{draft_1}"}} -->',
+        )
+        select_msg = self.injection(self.pre(cid, ",1 重点查状态机"))
+        self.assertIn("<pilot_loop_context>", select_msg)
+        self.assertIn("第 2/3 波", select_msg)
+        self.assertIn("候选指令 #1 展开", select_msg)
+        self.assertIn("重点查状态机", select_msg)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+
+        # Prefill again, then submit exact prefilled draft text -> advances to Wave 3.
+        draft_2 = "开启第 3 波最终复审"
+        self.stop(
+            cid,
+            f'<!-- pilot: {{"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "{draft_2}"}} -->',
+        )
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+        submit_msg = self.injection(self.pre(cid, draft_2))
+        self.assertIn("<pilot_loop_context>", submit_msg)
+        self.assertIn("第 3/3 波", submit_msg)
+        self.assertIn("最终波次", submit_msg)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 3)
+
+    def test_distill_filters_account_switch_dealer_and_classifies_rr_loop_and_guidance_rules(self) -> None:
+        # Failure means account-switch recovery / Dealer inbox notices pollute
+        # manual distill patterns, `,rr`/`,loop` stop classifying under
+        # `pilot_activity`, or compiled guidance drops proactive B-class rules.
+        home = self.root / "distill-home"
+        brain = self.gemini / "antigravity-cli/brain/session-clean/.system_generated/logs"
+        brain.mkdir(parents=True, exist_ok=True)
+        now = 1_760_000_000.0
+        ts = "2025-10-09T12:00:00Z"
+        steps = [
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n刚才因本机切换 Antigravity 账号重启了 CLI，请继续刚才的任务。\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\nYou have 1 Dealer message(s) in thread peer-1. Please inspect.\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n[2] You have 1 orchestration message pending. Run orca orchestration check --environment local --json\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n,rr\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n,rr 聚焦状态机\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n,loop 3 瘦身提示词\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n,loop status\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n,loop off\n</USER_REQUEST>",
+            },
+            {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": "<USER_REQUEST>\n请帮我看下这个接口的超时逻辑\n</USER_REQUEST>",
+            },
+        ]
+        transcript_path = brain / "transcript.jsonl"
+        transcript_path.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in steps) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(transcript_path, (now, now))
+
+        report = distill_chat_history(home, self.gemini, days=7, max_sessions_per_agent=10, now_ts=now)
+        self.assertEqual(report["sources"]["antigravity"]["filtered_machine_messages"], 3)
+        self.assertEqual(report["pilot_activity"].get("command:,rr"), 2)
+        self.assertEqual(report["pilot_activity"].get("command:,loop"), 3)
+        self.assertEqual(report["totals"]["manual_messages"], 1)
+        self.assertEqual(report["totals"]["pilot_expanded_messages"], 5)
+
+        # Verify compiled guidance carries proactive B-class clarification and loop contracts.
+        universal = profile_compiler.compile_bundle(
+            resolve_user_profile(load_default_profile(), preset="recommended")
+        )
+        for phrase in (
+            "主动澄清",
+            "利弊对比",
+            "推荐理由",
+            "(Recommended)",
+            "`,rr [聚焦]`",
+            "`,loop [1-5] [目标]`",
+            '"loop": "next"|"done"',
+        ):
+            self.assertIn(phrase, universal.gemini_block)
+        closeout = universal.scenes["04-closeout-and-sync.md"]
+        self.assertIn('`"loop":"next"`', closeout)
+        self.assertIn('`"scene":"NONE","loop":"done"`', closeout)
+
+    def test_loop_next_alternatives_advance_wave_on_comma_selection_and_text_submission(self) -> None:
+        # Failure means selecting `,2`/`,3` or submitting an alternative's text on
+        # a `"loop": "next"` tag executes a next wave without advancing the counter,
+        # bypassing the declared wave budget.
+        cid = "loop-next-alts"
+        self.assertEqual(
+            run_engine(self.root, self.gemini, self.state, "mode", "confirm").returncode, 0
+        )
+        self.injection(self.pre(cid, ",loop 3 验证备选推进"))
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+
+        tag_three = (
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", '
+            '"1": "第 2 波主推", "2": "第 2 波备选二", "3": "第 2 波备选三"} -->'
+        )
+        self.assertEqual(self.stop(cid, tag_three).returncode, 0)
+        candidates = read_state(self.state, cid)["candidates"]
+        self.assertEqual(len(candidates), 3)
+        self.assertTrue(all(item.get("loop_next") is True for item in candidates))
+
+        # Selecting `,2` advances wave 1 -> 2 and injects loop context + candidate 2.
+        alt2_msg = self.injection(self.pre(cid, ",2 聚焦核心"))
+        self.assertIn("<pilot_loop_context>", alt2_msg)
+        self.assertIn("第 2/3 波", alt2_msg)
+        self.assertIn("候选指令 #2 展开", alt2_msg)
+        self.assertIn("第 2 波备选二", alt2_msg)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+
+        # Two-candidate tag: selecting absent `,3` must NOT advance the wave.
+        tag_two = (
+            '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", '
+            '"1": "第 3 波主推", "2": "第 3 波备选二"} -->'
+        )
+        self.assertEqual(self.stop(cid, tag_two).returncode, 0)
+        self.assertEqual(self.injection(self.pre(cid, ",3")), "")
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+
+        # Submitting alternative 3's exact text advances wave 2 -> 3.
+        self.assertEqual(self.stop(cid, tag_three).returncode, 0)
+        alt3_submit = self.injection(self.pre(cid, "第 2 波备选三"))
+        self.assertIn("<pilot_loop_context>", alt3_submit)
+        self.assertIn("第 3/3 波", alt3_submit)
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 3)
+
+    def test_loop_state_write_failures_fail_closed_without_announcing_success(self) -> None:
+        # Failure means a failed session-state write silently announces `,loop`
+        # arming/off/rr clearing, wave advancement, completion, or budget exhaustion
+        # while the persisted loop state on disk disagrees.
+        cid = "loop-write-fail"
+        self.addCleanup(lambda: os.chmod(self.state, 0o700) if self.state.exists() else None)
+        # Seed session + lock file so `flock` still opens existing `.lock` while
+        # creating temp files in `self.state` fails once the directory is 0o500.
+        self.injection(self.pre(cid, "初始化会话"))
+        self.assertTrue(state_path(self.state, cid).is_file())
+
+        def assert_write_failure(res: subprocess.CompletedProcess) -> None:
+            self.assertEqual(res.returncode, 2, res.stdout)
+            self.assertEqual(res.stdout, "")
+            err = json.loads(res.stderr)
+            self.assertFalse(err["ok"])
+            self.assertEqual(err["error"], "loop_state_save_failed")
+
+        # 1. `,loop` arming fails closed when state cannot be written.
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(self.pre(cid, ",loop 2 瘦身"))
+            self.assertNotIn("loop", read_state(self.state, cid))
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # Arm cleanly while writable.
+        self.assertIn("第 1/2 波", self.injection(self.pre(cid, ",loop 2 瘦身")))
+        armed = read_state(self.state, cid)["loop"]
+        self.assertEqual(armed["wave"], 1)
+
+        # 2. `,loop off` and 3. `,rr` clearing fail closed and preserve persisted loop.
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(self.pre(cid, ",loop off"))
+            self.assertEqual(read_state(self.state, cid)["loop"], armed)
+
+            assert_write_failure(self.pre(cid, ",rr"))
+            self.assertEqual(read_state(self.state, cid)["loop"], armed)
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # 4. Stop `"loop": "done"` fails closed and preserves persisted loop.
+        self.assertEqual(self.injection(self.pre(cid, "确认已收敛")), "")
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(
+                self.stop(cid, '<!-- pilot: {"scene": "NONE", "loop": "done"} -->')
+            )
+            self.assertEqual(read_state(self.state, cid)["loop"], armed)
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # 5. Wave advancement in PreInvocation fails closed without announcing Wave 2.
+        self.assertEqual(self.injection(self.pre(cid, "准备推进第 2 波")), "")
+        next_prompt = "开启第 2 波复审"
+        self.assertEqual(
+            self.stop(
+                cid,
+                f'<!-- pilot: {{"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "{next_prompt}"}} -->',
+            ).returncode,
+            0,
+        )
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(self.pre(cid, next_prompt))
+            self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 1)
+        finally:
+            os.chmod(self.state, 0o700)
+
+        # Advance cleanly to Wave 2/2, then verify Stop budget exhaustion fails closed.
+        self.assertIn("第 2/2 波", self.injection(self.pre(cid, next_prompt)))
+        self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+        sends_before = len(send_calls(self.root))
+        os.chmod(self.state, 0o500)
+        try:
+            assert_write_failure(
+                self.stop(
+                    cid,
+                    '<!-- pilot: {"scene": "plan-and-orchestrate", "gate": "auto", "loop": "next", "1": "第 3 波"} -->',
+                )
+            )
+            self.assertEqual(len(send_calls(self.root)), sends_before)
+            self.assertEqual(read_state(self.state, cid)["loop"]["wave"], 2)
+        finally:
+            os.chmod(self.state, 0o700)
+
 
 if __name__ == "__main__":
     unittest.main()
